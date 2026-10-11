@@ -403,7 +403,7 @@ fn index_loop_inner() -> Result<()> {
             // An indexed library still needs the CPU container for its next query.
             // Empty libraries wait for a write or explicit preparation instead of
             // starting an unsolicited model download during status/restart.
-            let cpu_upgrade = model == "m3" && store.count()? > 0
+            let cpu_upgrade = model == "m3" && respire::MemoryTransport::count(&store)? > 0
                 && respire::model_install::cpu_model_preparation_needed()?;
             if !pending && !prepare_requested && !cpu_upgrade {
                 return Ok(true);
