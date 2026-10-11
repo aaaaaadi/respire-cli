@@ -13,12 +13,14 @@ use crate::memory::MemoryEngine;
 use crate::service::App;
 use crate::transport::MemoryTransport;
 
-/// Seal every entry and batch-import, then auto-sync once.
+/// Seal each entry and import it (duplicates skipped), then auto-sync once.
 ///
 /// `parent_spec` (id / 8-char prefix / tree or anchor title) is an optional
 /// pre-attach: when non-empty it is resolved and applied to entries that have no
 /// parent. When empty, entries stay as-is (roots) for a later tidy.
-/// `progress(done, total)` runs after each entry is sealed.
+/// `progress(done, total)` runs after each entry is sealed. Returns the number
+/// actually written; a stable session id that already exists is skipped rather
+/// than failing the whole import.
 pub fn import_entries<F: FnMut(usize, usize)>(
     entries: &mut [MemoryEntry],
     parent_spec: &str,
@@ -39,13 +41,14 @@ pub fn import_entries<F: FnMut(usize, usize)>(
         }
     }
     let total = entries.len();
-    let mut stored = Vec::with_capacity(total);
+    let mut imported = 0usize;
     for (index, entry) in entries.iter().enumerate() {
         let sealed = MemoryEngine::seal(&app.keys, &app.embedder, entry, &entry.user)?;
-        stored.push(sealed);
+        if app.store.put(&sealed)? {
+            imported += 1;
+        }
         progress(index + 1, total);
     }
-    app.store.import_batch(&stored)?;
     app.auto_sync();
-    Ok(stored.len())
+    Ok(imported)
 }

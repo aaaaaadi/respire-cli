@@ -7,6 +7,7 @@
 
 use chrono::{SecondsFormat, Utc};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::memory::model::{Kind, MemoryEntry};
 
@@ -57,11 +58,11 @@ pub fn session_entry(session: &Session, opts: &ConvertOptions) -> MemoryEntry {
         supersedes: String::new(),
         superseded_by: String::new(),
         see_also: Vec::new(),
-        id: uuid::Uuid::new_v4().to_string(),
+        id: session_id(&session.key()),
         kind: opts.kind,
         tags: vec!["session-import".to_owned(), session.platform.clone()],
-        title: derive_title(session),
-        content: scrub(&build_body(session)),
+        title: scrub(&derive_title(session)),
+        content: build_body(session),
         user: opts.user.clone(),
         computer: opts.device.clone(),
         project: project_of(session, &opts.project),
@@ -122,21 +123,22 @@ pub fn build_body(session: &Session) -> String {
         "【前因】{} 会话 {}。起始 {}；工作目录 {}；模型 {}。",
         platform_label(&session.platform),
         short_id(&session.id),
-        created,
-        cwd,
-        model
+        scrub(created),
+        scrub(&cwd),
+        scrub(&model)
     ));
 
-    let first = truncate_chars(session.first_user_message.trim(), 600);
+    let first_raw = session.first_user_message.trim();
+    let first = truncate_chars(&scrub(first_raw), 600);
     body.push_str("\n【行为】");
     if first.is_empty() {
         body.push_str("（无用户消息记录）");
     } else {
         body.push_str(&first);
     }
-    let last = session.last_user_message.trim();
-    if !last.is_empty() && last != session.first_user_message.trim() {
-        body.push_str(&format!("\n末次请求：{}", truncate_chars(last, 400)));
+    let last_raw = session.last_user_message.trim();
+    if !last_raw.is_empty() && last_raw != first_raw {
+        body.push_str(&format!("\n末次请求：{}", truncate_chars(&scrub(last_raw), 400)));
     }
 
     body.push_str(&format!("\n【后果】会话更新于 {updated}。"));
@@ -224,6 +226,17 @@ fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
+/// Stable memory id for a session (UUIDv5-shaped from `platform:id`), so
+/// re-importing the same session maps to the same row instead of a duplicate.
+fn session_id(key: &str) -> String {
+    let digest = Sha256::digest(key.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes).to_string()
+}
+
 /// Best-effort credential scrub: PEM blocks, `key=value` secrets and known
 /// token prefixes are redacted so plaintext secrets are not stored.
 pub fn scrub(text: &str) -> String {
@@ -231,14 +244,14 @@ pub fn scrub(text: &str) -> String {
     let mut in_pem = false;
     for line in text.lines() {
         let lower = line.to_ascii_lowercase();
-        if lower.contains("begin") && lower.contains("private key") {
+        if line.contains("-----BEGIN") && lower.contains("private key") {
             in_pem = true;
             out.push_str("[已隐去私钥]");
             out.push('\n');
             continue;
         }
         if in_pem {
-            if lower.contains("end") && lower.contains("private key") {
+            if line.contains("-----END") && lower.contains("private key") {
                 in_pem = false;
             }
             continue;
@@ -252,7 +265,7 @@ pub fn scrub(text: &str) -> String {
     out
 }
 
-const SECRET_KEYS: [&str; 12] = [
+const SECRET_KEYS: [&str; 17] = [
     "password",
     "passwd",
     "secret",
@@ -265,26 +278,75 @@ const SECRET_KEYS: [&str; 12] = [
     "bearer",
     "credential",
     "client_secret",
+    "密码",
+    "口令",
+    "密钥",
+    "令牌",
+    "凭证",
 ];
 
 fn redact_line(line: &str) -> String {
-    let lower = line.to_ascii_lowercase();
-    let hit = SECRET_KEYS
-        .iter()
-        .filter_map(|key| lower.find(key).map(|pos| (pos, key.len())))
-        .min_by_key(|(pos, _)| *pos);
-    if let Some((pos, len)) = hit {
-        if let Some(separator) = line.find(['=', ':']) {
-            let (head, _) = line.split_at(separator + 1);
-            return format!("{head} ***");
-        }
-        let (head, _) = line.split_at(pos + len);
-        return format!("{head} ***");
+    if let Some(masked) = redact_key_value(line) {
+        return masked;
+    }
+    if let Some(masked) = redact_bearer(line) {
+        return masked;
     }
     redact_prefixed_tokens(line)
 }
 
-const TOKEN_PREFIXES: [&str; 9] = ["sk-", "ghp_", "gho_", "ghs_", "xoxb-", "xoxp-", "AKIA", "AIza", "eyJ"];
+/// Mask the value only when a secret keyword is immediately followed (allowing
+/// spaces/tabs) by `=`/`:` (ASCII or full-width), so prose that merely mentions
+/// "token" or a timestamp is not truncated.
+fn redact_key_value(line: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    let mut best: Option<usize> = None;
+    for key in SECRET_KEYS {
+        let mut from = 0;
+        while let Some(relative) = lower[from..].find(key) {
+            let pos = from + relative;
+            let after = &line[pos + key.len()..];
+            let trimmed = after.trim_start_matches([' ', '\t']);
+            let separator = trimmed.chars().next().filter(|c| matches!(*c, '=' | ':' | '：'));
+            if let Some(separator) = separator {
+                let index = line.len() - (trimmed.len() - separator.len_utf8());
+                best = Some(best.map_or(index, |current| current.min(index)));
+            }
+            from = pos + key.len();
+        }
+    }
+    best.map(|index| {
+        let (head, _) = line.split_at(index);
+        format!("{head} ***")
+    })
+}
+
+/// Mask the token in `Bearer <token>` even without a `=`/`:` separator.
+fn redact_bearer(line: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    let pos = lower.find("bearer")?;
+    let rest = &line[pos + "bearer".len()..];
+    let space = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+    if space == 0 {
+        return None;
+    }
+    let token = &rest[space..];
+    let token_len = token.find(char::is_whitespace).unwrap_or(token.len());
+    if token_len < 8 {
+        return None;
+    }
+    Some(format!(
+        "{}{}***{}",
+        &line[..pos + "bearer".len()],
+        &rest[..space],
+        &rest[space + token_len..]
+    ))
+}
+
+const TOKEN_PREFIXES: [&str; 14] = [
+    "sk-", "ghp_", "gho_", "ghs_", "ghu_", "ghr_", "github_pat_", "glpat-", "xoxa-", "xoxb-", "xoxp-",
+    "AKIA", "AIza", "eyJ",
+];
 
 fn redact_prefixed_tokens(line: &str) -> String {
     let mut result = String::new();
@@ -370,5 +432,42 @@ mod tests {
         let mut s = sample();
         s.first_user_message = String::new();
         assert_eq!(derive_title(&s), format!("Codex 会话 {}", "0199abcd"));
+    }
+
+    #[test]
+    fn redact_only_when_keyword_adjoins_separator() {
+        assert_eq!(scrub("会话更新于 2026-10-01T02:03:00Z"), "会话更新于 2026-10-01T02:03:00Z");
+        assert_eq!(scrub("fix the token refresh bug: now"), "fix the token refresh bug: now");
+        assert!(scrub("token=abcd1234").contains("***"));
+        assert!(scrub("api_key: abcd1234").contains("***"));
+        assert!(scrub("密码：hunter2").contains("***"));
+    }
+
+    #[test]
+    fn scrub_masks_bearer_without_separator() {
+        let masked = scrub("curl -H 'Authorization: Bearer abcdefghijklmnop'");
+        assert!(!masked.contains("abcdefghijklmnop"));
+        let bare = scrub("Bearer abcdefghijklmnop");
+        assert!(!bare.contains("abcdefghijklmnop"));
+    }
+
+    #[test]
+    fn private_key_detection_is_strict() {
+        let prose = "Let's begin by rotating the private key for the service";
+        assert_eq!(scrub(prose), prose);
+        let block = "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----";
+        assert!(scrub(block).contains("[已隐去私钥]"));
+    }
+
+    #[test]
+    fn stable_id_is_deterministic_and_title_is_scrubbed() {
+        let a = session_entry(&sample(), &ConvertOptions::default());
+        let b = session_entry(&sample(), &ConvertOptions::default());
+        assert_eq!(a.id, b.id);
+
+        let mut s = sample();
+        s.first_user_message = "password=hunter2 now continue".into();
+        let entry = session_entry(&s, &ConvertOptions::default());
+        assert!(!entry.title.contains("hunter2"));
     }
 }

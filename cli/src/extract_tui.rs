@@ -119,7 +119,18 @@ impl App {
         let Some(receiver) = self.receiver.as_ref() else {
             return;
         };
-        let messages: Vec<Work> = receiver.try_iter().collect();
+        let mut messages = Vec::new();
+        let mut disconnected = false;
+        loop {
+            match receiver.try_recv() {
+                Ok(message) => messages.push(message),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
         for message in messages {
             match message {
                 Work::Progress(phase, done, total) => {
@@ -136,6 +147,10 @@ impl App {
                     self.log_line(error, Color::Red);
                 }
             }
+        }
+        if disconnected && self.running {
+            self.running = false;
+            self.log_line("extraction worker stopped unexpectedly".to_owned(), Color::Red);
         }
         if !self.running {
             self.receiver = None;
@@ -249,7 +264,7 @@ fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
 ) -> Result<()> {
-    while !app.should_exit {
+    while !app.should_exit || app.running {
         app.drain();
         terminal.draw(|frame| ui(frame, app))?;
         if !event::poll(std::time::Duration::from_millis(100))? {
@@ -262,7 +277,15 @@ fn event_loop(
             continue;
         }
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => app.should_exit = true,
+            KeyCode::Char('q') | KeyCode::Esc => {
+                if app.running {
+                    app.log_line(
+                        "extraction in progress - waiting for it to finish before exit".to_owned(),
+                        Color::Yellow,
+                    );
+                }
+                app.should_exit = true;
+            }
             KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
                 app.should_exit = true;
             }

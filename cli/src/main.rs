@@ -1912,14 +1912,23 @@ fn run_extract_command(command: &Command) -> Result<()> {
     };
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin())
         && std::io::IsTerminal::is_terminal(&std::io::stdout());
-    let bare = !*targets && id.is_none() && !*all && !*dry_run;
+    let filters_absent = since.is_none()
+        && limit.is_none()
+        && cwd.is_none()
+        && model.is_none()
+        && session.is_none()
+        && kind.as_str() == "context"
+        && importance.as_str() == "important"
+        && parent.is_empty()
+        && !*include_subagents
+        && !*force;
+    let bare = !*targets && id.is_none() && !*all && !*dry_run && filters_absent && !json_mode();
     if *tui || (bare && interactive) {
         return respire::extract_tui::run();
     }
     run_extract(
         *targets,
         id.as_deref(),
-        *all,
         *dry_run,
         since.as_deref(),
         *limit,
@@ -1938,7 +1947,6 @@ fn run_extract_command(command: &Command) -> Result<()> {
 fn run_extract(
     targets_only: bool,
     id: Option<&str>,
-    _all: bool,
     dry_run: bool,
     since: Option<&str>,
     limit: Option<usize>,
@@ -1953,6 +1961,12 @@ fn run_extract(
 ) -> Result<()> {
     if !matches!(importance, "important" | "trivial") {
         anyhow::bail!("--importance must be important or trivial");
+    }
+    if !matches!(
+        kind,
+        "context" | "decision" | "preference" | "task" | "emotion" | "time" | "skill" | "knowledge"
+    ) {
+        anyhow::bail!("--kind must be context|decision|preference|task|emotion|time|skill|knowledge");
     }
     if targets_only {
         let sources = respire::session_import::source_list();

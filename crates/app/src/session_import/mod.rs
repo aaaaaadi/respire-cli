@@ -56,7 +56,8 @@ impl Session {
     /// Display/JSON projection, mirroring the finder's output contract.
     pub fn to_json(&self) -> Value {
         let preview = |text: &str| -> String {
-            text.chars().take(300).collect::<String>()
+            let truncated: String = text.chars().take(300).collect();
+            convert::scrub(&truncated)
         };
         let last = if self.last_user_message.is_empty() {
             self.first_user_message.clone()
