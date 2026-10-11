@@ -78,6 +78,12 @@ re-import updates that same row instead of creating a duplicate. A re-import onl
 refreshes the body and timestamp: an existing row keeps its tidy parent and any
 edited title, and a row the user deleted is skipped rather than resurrected.
 
+An existing row with pending local changes is protected from all import refreshes,
+including `--force` and SQLite content changes. The check runs inside the chunk
+write transaction; rejected refreshes do not advance the session cursor. After
+synchronization clears the pending changes, a refresh may replace the body with
+the source summary while continuing to preserve its edited title and parent.
+
 Import embeds every session first (that step holds no database lock), then writes
 in small committed chunks and persists the cursor after each chunk, so the write
 lock is never held across embedding and a failure resumes near where it stopped.

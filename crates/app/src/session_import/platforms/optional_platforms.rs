@@ -528,7 +528,7 @@ mod tests {
             let unchanged = scan()
                 .into_iter()
                 .find(|session| session.id == "fixture-session")
-                .unwrap();
+                .ok_or_else(|| anyhow::anyhow!("fixture session missing after checkpoint"))?;
             assert!(
                 cursor.is_imported(&unchanged),
                 "unrelated writes/checkpoint must not replay this session"

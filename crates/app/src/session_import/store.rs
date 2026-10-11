@@ -127,7 +127,7 @@ where
                 let mut flags = vec![false; end - start];
                 for (offset, plan) in sealed[start..end].iter().enumerate() {
                     if let Some(stored) = plan {
-                        flags[offset] = app.store.put(stored)?;
+                        flags[offset] = app.store.put_session_import(stored)?;
                     }
                 }
                 Ok(flags)
@@ -214,7 +214,10 @@ mod tests {
             },
             || syncs.set(syncs.get() + 1),
         );
-        let error = result.err().expect("second chunk should fail");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => anyhow::bail!("second chunk should fail"),
+        };
         assert!(
             error.downcast_ref::<rusqlite::Error>().is_some(),
             "original SQLite error retained"
@@ -301,10 +304,15 @@ mod tests {
             },
             || syncs.set(syncs.get() + 1),
         );
-        let error = result.err().expect("callback should fail");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => anyhow::bail!("callback should fail"),
+        };
         assert_eq!(
-            error.downcast_ref::<std::io::Error>().unwrap().kind(),
-            std::io::ErrorKind::PermissionDenied
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::PermissionDenied)
         );
         assert_eq!(callbacks.get(), 1);
         assert_eq!(app.store.all(true)?.len(), 25);
@@ -314,12 +322,19 @@ mod tests {
 
     #[test]
     fn empty_input_does_not_open_app_or_call_callbacks() -> Result<()> {
+        let progress_calls = Cell::new(0);
+        let commit_calls = Cell::new(0);
         let outcome = import_entries(
             &mut [],
             "",
-            |_, _| panic!("no progress"),
-            |_, _| panic!("no commit"),
+            |_, _| progress_calls.set(progress_calls.get() + 1),
+            |_, _| {
+                commit_calls.set(commit_calls.get() + 1);
+                Ok(())
+            },
         )?;
+        assert_eq!(progress_calls.get(), 0);
+        assert_eq!(commit_calls.get(), 0);
         assert_eq!(outcome.imported, 0);
         assert!(outcome.completed.is_empty());
         Ok(())
@@ -340,18 +355,18 @@ mod tests {
             &ConvertOptions::default(),
         );
         refresh.id = id.clone();
+        let mut deletion_result = Ok(());
         let outcome = import_entries_with_app(
             &app,
             &mut [refresh],
             "",
             |_, _| {
-                app.store
-                    .forget(&id)
-                    .expect("synthetic concurrent deletion");
+                deletion_result = app.store.forget(&id).map(|_| ());
             },
             |_, _| Ok(()),
             || {},
         )?;
+        deletion_result?;
         assert_eq!(outcome.imported, 0);
         assert_eq!(
             outcome.completed,
@@ -359,6 +374,113 @@ mod tests {
             "rejected refresh stays retryable"
         );
         assert!(app.store.all(true)?[0].deleted);
+        Ok(())
+    }
+
+    fn edit_fixture_body(app: &App, id: &str) -> Result<String> {
+        let stored = app
+            .store
+            .all(true)?
+            .into_iter()
+            .find(|row| row.id == id)
+            .ok_or_else(|| anyhow::anyhow!("fixture row missing"))?;
+        let mut entry = MemoryEngine::open(&app.keys, &stored)?;
+        entry.content = "synthetic unsynced user edit".into();
+        entry.updated_at = app.store.edit_stamp(id)?;
+        let edited = MemoryEngine::seal(&app.keys, &app.embedder, &entry, &entry.user)?;
+        assert!(app.store.put(&edited)?);
+        Ok(entry.updated_at)
+    }
+
+    #[test]
+    fn sqlite_refresh_preserves_existing_unsynced_body_for_force_and_source_change() -> Result<()> {
+        for changed in [false, true] {
+            let (_isolate, app, mut entries) = fixture(1)?;
+            import_entries_with_app(&app, &mut entries, "", |_, _| {}, |_, _| Ok(()), || {})?;
+            let id = entries[0].id.clone();
+            app.store.clear_dirty(&id)?;
+            let edited_stamp = edit_fixture_body(&app, &id)?;
+            let mut refresh = session_entry(
+                &Session {
+                    platform: "hermes".into(),
+                    id: "fixture".into(),
+                    first_user_message: if changed {
+                        "changed source"
+                    } else {
+                        "synthetic import regression"
+                    }
+                    .into(),
+                    ..Default::default()
+                },
+                &ConvertOptions::default(),
+            );
+            refresh.id = id.clone();
+            refresh.updated_at = crate::transport::timestamp_after(Some(&edited_stamp))?;
+            let mut flags = Vec::new();
+            let outcome = import_entries_with_app(
+                &app,
+                &mut [refresh],
+                "",
+                |_, _| {},
+                |_, completed| {
+                    flags.extend_from_slice(completed);
+                    Ok(())
+                },
+                || {},
+            )?;
+            assert_eq!(outcome.imported, 0);
+            assert_eq!(flags, vec![false]);
+            let stored = app.store.all(true)?;
+            assert_eq!(
+                MemoryEngine::open(&app.keys, &stored[0])?.content,
+                "synthetic unsynced user edit"
+            );
+            // After synchronization clears the pending edit, explicit/source
+            // refresh can replace the body while keeping edited title/parent.
+            app.store.clear_dirty(&id)?;
+            let mut retry = entries[0].clone();
+            retry.updated_at = crate::transport::timestamp_after(Some(&edited_stamp))?;
+            retry.content = "synthetic refreshed source body".into();
+            let accepted =
+                import_entries_with_app(&app, &mut [retry], "", |_, _| {}, |_, _| Ok(()), || {})?;
+            assert_eq!(accepted.imported, 1);
+            assert_eq!(accepted.completed, vec![true]);
+            let stored = app.store.all(true)?;
+            assert_eq!(
+                MemoryEngine::open(&app.keys, &stored[0])?.content,
+                "synthetic refreshed source body"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_refresh_rechecks_dirty_edit_inside_write_transaction() -> Result<()> {
+        let (_isolate, app, mut entries) = fixture(1)?;
+        import_entries_with_app(&app, &mut entries, "", |_, _| {}, |_, _| Ok(()), || {})?;
+        let id = entries[0].id.clone();
+        app.store.clear_dirty(&id)?;
+        let mut refresh = entries[0].clone();
+        refresh.updated_at = "2099-01-01T00:00:00.000Z".into();
+        let mut edit_result = Ok(String::new());
+        let outcome = import_entries_with_app(
+            &app,
+            &mut [refresh],
+            "",
+            |_, _| {
+                edit_result = edit_fixture_body(&app, &id);
+            },
+            |_, _| Ok(()),
+            || {},
+        )?;
+        edit_result?;
+        assert_eq!(outcome.imported, 0);
+        assert_eq!(outcome.completed, vec![false]);
+        let stored = app.store.all(true)?;
+        assert_eq!(
+            MemoryEngine::open(&app.keys, &stored[0])?.content,
+            "synthetic unsynced user edit"
+        );
         Ok(())
     }
 }

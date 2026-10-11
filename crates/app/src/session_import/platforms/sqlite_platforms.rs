@@ -375,7 +375,7 @@ mod tests {
     fn cursor_wal_append_and_edit_change_content_cursor() -> anyhow::Result<()> {
         let isolate = crate::test_lock::Isolate::new()?;
         let path = isolate.path().join("fixture-session").join("store.db");
-        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::create_dir_all(isolate.path().join("fixture-session"))?;
         let connection = Connection::open(&path)?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE blobs(data BLOB);",

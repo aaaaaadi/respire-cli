@@ -592,19 +592,20 @@ mod tests {
     }
 
     #[test]
-    fn content_versioned_sqlite_import_gets_fresh_write_timestamp() {
+    fn content_versioned_sqlite_import_gets_fresh_write_timestamp() -> anyhow::Result<()> {
         let mut session = sample();
         session.platform = "hermes".into();
         session.updated_at = Some("2020-01-01T00:00:00.000Z".into());
         let entry = session_entry(&session, &ConvertOptions::default());
-        assert!(
-            super::super::scan_util::parse_stamp(&entry.updated_at).unwrap()
-                > super::super::scan_util::parse_stamp(session.updated_at.as_deref().unwrap())
-                    .unwrap()
-        );
+        let imported = super::super::scan_util::parse_stamp(&entry.updated_at)
+            .ok_or_else(|| anyhow::anyhow!("invalid import timestamp"))?;
+        let source = super::super::scan_util::parse_stamp("2020-01-01T00:00:00.000Z")
+            .ok_or_else(|| anyhow::anyhow!("invalid fixture timestamp"))?;
+        assert!(imported > source);
         assert!(
             entry.content.contains("2020-01-01"),
             "source time remains in body"
         );
+        Ok(())
     }
 }

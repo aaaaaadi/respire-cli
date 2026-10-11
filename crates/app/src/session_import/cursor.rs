@@ -190,7 +190,7 @@ mod tests {
         cursor
             .data
             .entries
-            .insert(current.key(), current.updated_at.clone().unwrap());
+            .insert(current.key(), "2026-10-01T00:00:00Z".into());
         assert!(
             !cursor.is_imported(&current),
             "legacy mtime mark needs one refresh"
