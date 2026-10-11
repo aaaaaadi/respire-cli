@@ -29,6 +29,7 @@ pub struct FnScanner {
 }
 
 impl FnScanner {
+    /// Wrap a [`PlatformDef`] as a [`SessionScanner`].
     pub fn new(def: PlatformDef) -> Self {
         Self {
             id: def.id,
@@ -305,12 +306,14 @@ pub enum SqlVal {
 }
 
 impl SqlVal {
+    /// Text value, if this cell is text.
     pub fn as_text(&self) -> Option<&str> {
         match self {
             SqlVal::Text(text) => Some(text),
             _ => None,
         }
     }
+    /// Numeric value (integer or real) as `f64`, if numeric.
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             SqlVal::Int(value) => Some(*value as f64),
@@ -318,6 +321,7 @@ impl SqlVal {
             _ => None,
         }
     }
+    /// Value as `i64`, if numeric.
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             SqlVal::Int(value) => Some(*value),

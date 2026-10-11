@@ -12,6 +12,7 @@ use crate::session_import::{scan_util, ScanOptions, Session};
 /// Directory levels walked below `<root>/sessions` (reference uses `rglob`).
 const SESSIONS_DEPTH: usize = 12;
 
+/// pi-family scanner definitions (`senpi`, `oh-my-pi`, `gajae-code`).
 pub fn platforms() -> Vec<PlatformDef> {
     vec![
         PlatformDef {

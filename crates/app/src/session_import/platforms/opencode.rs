@@ -22,6 +22,7 @@ const LEGACY_SESSION_SQL: &str = "select id, title, directory, time_created, tim
      tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, model \
      from session where time_archived is null order by time_updated desc limit 2000";
 
+/// OpenCode scanner definition (`opencode`).
 pub fn platforms() -> Vec<PlatformDef> {
     vec![PlatformDef {
         id: "opencode",

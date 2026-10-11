@@ -19,6 +19,7 @@ const LEGACY_THREADS_SQL: &str = "SELECT id, rollout_path, cwd, created_at, upda
      model, first_user_message, tokens_used FROM threads";
 const SPAWN_EDGES_SQL: &str = "SELECT child_thread_id, parent_thread_id FROM thread_spawn_edges";
 
+/// Codex scanner definition (`codex`).
 pub fn platforms() -> Vec<PlatformDef> {
     vec![PlatformDef {
         id: "codex",

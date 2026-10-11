@@ -28,6 +28,7 @@ use crate::session_import::{scan_util, ScanOptions, Session};
 const ZED_SQL: &str =
     "select id, data_type, cast(data as text), updated_at, typeof(data) from threads";
 
+/// Optional SQLite scanner definitions (`kilo-cli`, `hermes`, `goose`, `crush`, `zed`).
 pub fn platforms() -> Vec<PlatformDef> {
     vec![
         PlatformDef {

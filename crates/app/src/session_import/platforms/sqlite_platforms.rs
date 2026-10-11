@@ -31,6 +31,7 @@ const KODU_MESSAGES_SQL: &str = "select role, content, model_id, started_at, fin
      tokens_out, cache_reads, cache_writes, cost from messages where task_id = ? order by started_at";
 const CURSOR_BLOBS_SQL: &str = "select data from blobs";
 
+/// SQLite scanner definitions (`kodu`, `cursor-cli`).
 pub fn platforms() -> Vec<PlatformDef> {
     vec![
         PlatformDef {

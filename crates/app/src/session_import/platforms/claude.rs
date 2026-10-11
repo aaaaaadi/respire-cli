@@ -12,6 +12,7 @@ use serde_json::Value;
 use super::common::{self, PlatformDef};
 use crate::session_import::{scan_util, ScanOptions, Session};
 
+/// Claude Code scanner definition (`claude`).
 pub fn platforms() -> Vec<PlatformDef> {
     vec![PlatformDef {
         id: "claude",

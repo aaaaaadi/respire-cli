@@ -13,6 +13,7 @@ use serde_json::{Map, Value};
 use super::common::PlatformDef;
 use crate::session_import::{scan_util, ScanOptions, Session};
 
+/// Kiro scanner definition (`kiro`).
 pub fn platforms() -> Vec<PlatformDef> {
     vec![PlatformDef {
         id: "kiro",

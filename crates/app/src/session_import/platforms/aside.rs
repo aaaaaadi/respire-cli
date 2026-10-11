@@ -30,6 +30,7 @@ struct StateRow {
     updated_at: Option<String>,
 }
 
+/// Aside browser-agent scanner definition (`aside`).
 pub fn platforms() -> Vec<PlatformDef> {
     vec![PlatformDef {
         id: "aside",

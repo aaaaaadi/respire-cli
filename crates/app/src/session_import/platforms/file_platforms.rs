@@ -15,6 +15,7 @@ use serde_json::{json, Map, Value};
 use super::common::{self, PlatformDef};
 use crate::session_import::{scan_util, ScanOptions, Session};
 
+/// File-based scanner definitions (openclaw, droid, amp, gemini, kimi, qwen, codebuff, roo/kilo-code, cline, aider).
 pub fn platforms() -> Vec<PlatformDef> {
     vec![
         PlatformDef {
