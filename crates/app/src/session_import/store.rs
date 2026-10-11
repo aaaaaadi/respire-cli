@@ -111,7 +111,12 @@ where
                 imported += 1;
             }
         }
-        on_commit(start, &completed[start..end])?;
+        if let Err(error) = on_commit(start, &completed[start..end]) {
+            // Committed chunks above still need a sync notification even if the
+            // caller's cursor write failed; mirrors the success path's auto_sync.
+            app.auto_sync();
+            return Err(error);
+        }
         start = end;
     }
     app.auto_sync();
