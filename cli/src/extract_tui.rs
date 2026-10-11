@@ -201,7 +201,7 @@ fn spawn_worker(ids: Vec<String>, sender: Sender<Work>) {
             .iter()
             .map(|session| session_import::session_entry(session, &convert))
             .collect();
-        let result = session_import::import_entries(&mut entries, "", false, |done, total| {
+        let result = session_import::import_entries(&mut entries, "", |done, total| {
             let _ = sender.send(Work::Progress("storing memories".to_owned(), done, total));
         });
         match result {

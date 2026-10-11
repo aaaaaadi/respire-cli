@@ -1923,7 +1923,17 @@ fn run_extract_command(command: &Command) -> Result<()> {
         && !*include_subagents
         && !*force;
     let bare = !*targets && id.is_none() && !*all && !*dry_run && filters_absent && !json_mode();
-    if *tui || (bare && interactive) {
+    if *tui {
+        if !bare {
+            anyhow::bail!(
+                "--tui opens the interactive picker and cannot be combined with extraction options \
+                 (--since/--limit/--cwd/--model/--session/--kind/--importance/--parent/--include-subagents/--force) \
+                 or --json; drop --tui to apply them."
+            );
+        }
+        return respire::extract_tui::run();
+    }
+    if bare && interactive {
         return respire::extract_tui::run();
     }
     run_extract(
@@ -2131,7 +2141,7 @@ fn run_extract(
     }
 
     progress::phase("Embedding and storing memories", "Embedding and storing memories");
-    let imported = respire::session_import::import_entries(&mut entries, parent, force, |done, total| {
+    let imported = respire::session_import::import_entries(&mut entries, parent, |done, total| {
         progress::phase_count("写入记忆", "Storing memories", done, total);
     })?;
     for session in &pending {

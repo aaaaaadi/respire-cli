@@ -219,12 +219,21 @@ pub fn date_bound(value: &str, end: bool) -> Option<DateTime<Utc>> {
     } else if text == "yesterday" {
         Utc.from_utc_datetime(&midnight.checked_sub_signed(Duration::try_days(1)?)?)
     } else if let Some(days) = text.strip_suffix('d').and_then(|n| n.parse::<i64>().ok()) {
+        if days < 0 {
+            return None;
+        }
         Utc.from_utc_datetime(&midnight.checked_sub_signed(Duration::try_days(days)?)?)
     } else {
-        let parts: Vec<i64> = text.split('-').filter_map(|p| p.parse().ok()).collect();
-        let year = i32::try_from(*parts.first()?).ok()?;
-        let month = u32::try_from(parts.get(1).copied().unwrap_or(1)).ok()?;
-        let day = u32::try_from(parts.get(2).copied().unwrap_or(1)).ok()?;
+        let parts: Vec<&str> = text.split('-').collect();
+        if parts.is_empty()
+            || parts.len() > 3
+            || parts.iter().any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return None;
+        }
+        let year = parts[0].parse::<i32>().ok()?;
+        let month = parts.get(1).map_or(Ok(1), |part| part.parse::<u32>()).ok()?;
+        let day = parts.get(2).map_or(Ok(1), |part| part.parse::<u32>()).ok()?;
         Utc.with_ymd_and_hms(year, month, day, 0, 0, 0).single()?
     };
     if !end {
@@ -317,6 +326,9 @@ mod tests {
         assert_eq!(month_only.month(), 10);
         assert!(date_bound("7d", false).is_some());
         assert!(date_bound("", false).is_none());
+        assert!(date_bound("-5d", false).is_none());
+        assert!(date_bound("2026-1x-01", false).is_none());
+        assert!(date_bound("2026-13-01", false).is_none());
         Ok(())
     }
 

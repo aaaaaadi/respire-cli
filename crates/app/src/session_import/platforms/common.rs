@@ -274,7 +274,7 @@ pub fn user_text(data: &Value, message: Option<&Map<String, Value>>) -> String {
 
 /// Prompt text from user content, skipping non-text parts (Claude emits
 /// `tool_result`/`tool_use` blocks under the user role).
-fn prompt_text(value: &Value) -> String {
+pub fn prompt_text(value: &Value) -> String {
     if let Some(text) = value.as_str() {
         return text.to_owned();
     }
@@ -289,7 +289,11 @@ fn prompt_text(value: &Value) -> String {
                 Some("tool_result") | Some("tool_use") | Some("image")
             )
         })
-        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .filter_map(|item| {
+            item.get("text")
+                .and_then(Value::as_str)
+                .or_else(|| item.get("content").and_then(Value::as_str))
+        })
         .filter(|part| !part.is_empty())
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>()
@@ -402,6 +406,24 @@ mod tests {
         assert_eq!(session.agent.as_deref(), Some("Tesla (explorer)"));
         assert!(session.usage.contains_key("total_tokens"));
         assert!(session.updated_at.as_deref().ok_or("updated_at")?.starts_with("2026-10-01"));
+        Ok(())
+    }
+
+    #[test]
+    fn claude_tool_result_line_does_not_replace_prompt() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("claude-session.jsonl");
+        let lines = [
+            r#"{"type":"user","timestamp":"2026-10-01T00:00:00Z","message":{"role":"user","content":"add the extract command"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-10-01T00:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}"#,
+            r#"{"type":"user","timestamp":"2026-10-01T00:02:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"tool output"}]}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, lines)?;
+
+        let session = jsonl_session("claude", &path, "fallback".to_owned());
+        assert_eq!(session.first_user_message, "add the extract command");
+        assert_eq!(session.last_user_message, "add the extract command");
         Ok(())
     }
 

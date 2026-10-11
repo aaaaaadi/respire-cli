@@ -6,6 +6,8 @@
 //! path (seal each entry with BGE, batch import, one auto-sync) with a per-entry
 //! progress callback.
 
+use std::collections::HashMap;
+
 use anyhow::Result;
 
 use crate::memory::model::MemoryEntry;
@@ -19,12 +21,15 @@ use crate::transport::MemoryTransport;
 /// pre-attach: when non-empty it is resolved and applied to entries that have no
 /// parent. When empty, entries stay as-is (roots) for a later tidy.
 /// `progress(done, total)` runs after each entry is sealed. Returns the number
-/// actually written; a stable session id that already exists is skipped rather
-/// than failing the whole import.
+/// actually written.
+///
+/// Re-import never clobbers user work: a session whose row was deleted is skipped
+/// (never resurrected), and an existing row keeps its tidy parent and any edited
+/// title — only the body and timestamp are refreshed. The ordinary last-write-wins
+/// path also refuses to overwrite a row that has unpushed local edits.
 pub fn import_entries<F: FnMut(usize, usize)>(
     entries: &mut [MemoryEntry],
     parent_spec: &str,
-    force: bool,
     mut progress: F,
 ) -> Result<usize> {
     if entries.is_empty() {
@@ -41,16 +46,23 @@ pub fn import_entries<F: FnMut(usize, usize)>(
             }
         }
     }
+    let existing: HashMap<String, crate::memory::model::StoredMemory> =
+        app.store.all(true)?.into_iter().map(|memory| (memory.id.clone(), memory)).collect();
     let total = entries.len();
     let mut imported = 0usize;
-    for (index, entry) in entries.iter().enumerate() {
+    for (index, entry) in entries.iter_mut().enumerate() {
+        if let Some(previous) = existing.get(&entry.id) {
+            if previous.deleted {
+                progress(index + 1, total);
+                continue;
+            }
+            if entry.parent_id.is_empty() {
+                entry.parent_id = previous.local_parent_id.clone();
+            }
+            entry.title = previous.local_title.clone();
+        }
         let sealed = MemoryEngine::seal(&app.keys, &app.embedder, entry, &entry.user)?;
-        let written = if force {
-            app.store.put_authoritative(&sealed)?
-        } else {
-            app.store.put(&sealed)?
-        };
-        if written {
+        if app.store.put(&sealed)? {
             imported += 1;
         }
         progress(index + 1, total);

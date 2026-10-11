@@ -55,10 +55,7 @@ impl Session {
 
     /// Display/JSON projection, mirroring the finder's output contract.
     pub fn to_json(&self) -> Value {
-        let preview = |text: &str| -> String {
-            let truncated: String = text.chars().take(300).collect();
-            convert::scrub(&truncated)
-        };
+        let preview = |text: &str| -> String { convert::scrub(text).chars().take(300).collect() };
         let last = if self.last_user_message.is_empty() {
             self.first_user_message.clone()
         } else {
@@ -67,17 +64,17 @@ impl Session {
         json!({
             "platform": self.platform,
             "id": self.id,
-            "path": self.path,
-            "cwd": self.cwd,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            "provider": self.provider,
-            "model": self.model,
+            "path": convert::scrub(&self.path),
+            "cwd": self.cwd.as_deref().map(convert::scrub),
+            "created_at": self.created_at.as_deref().map(convert::scrub),
+            "updated_at": self.updated_at.as_deref().map(convert::scrub),
+            "provider": self.provider.as_deref().map(convert::scrub),
+            "model": self.model.as_deref().map(convert::scrub),
             "first_user_message": preview(&self.first_user_message),
             "last_user_message": preview(&last),
             "usage": Value::Object(self.usage.clone()),
-            "parent_id": self.parent_id,
-            "agent": self.agent,
+            "parent_id": self.parent_id.as_deref().map(convert::scrub),
+            "agent": self.agent.as_deref().map(convert::scrub),
         })
     }
 }

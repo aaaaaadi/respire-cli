@@ -116,7 +116,7 @@ jobs:
       # Their own parallel-request checks still create concurrent client threads.
       RSRS_CORE_TEST_MODE: '1'
       RUST_TEST_THREADS: '1'
-      RUST_MIN_STACK: '33554432'
+      RUST_MIN_STACK: '16777216'
     steps:
       - uses: actions/checkout@v4
         with:

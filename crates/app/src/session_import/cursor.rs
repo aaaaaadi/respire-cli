@@ -54,7 +54,7 @@ impl Cursor {
             return false;
         };
         if stored == "*" {
-            return true;
+            return session.updated_at.as_deref().map_or(true, |stamp| stamp.is_empty());
         }
         let current = session.updated_at.clone().unwrap_or_default();
         if current.is_empty() {
@@ -83,7 +83,7 @@ impl Cursor {
                 .with_context(|| format!("create {}", parent.display()))?;
         }
         let json = serde_json::to_string_pretty(&self.data)?;
-        let temp = self.path.with_extension("json.tmp");
+        let temp = self.path.with_extension(format!("{}.tmp", std::process::id()));
         std::fs::write(&temp, json).with_context(|| format!("write {}", temp.display()))?;
         std::fs::rename(&temp, &self.path)
             .with_context(|| format!("replace {}", self.path.display()))?;
@@ -135,5 +135,19 @@ mod tests {
         cursor.mark(&s);
         assert!(cursor.is_imported(&s));
         assert_eq!(cursor.len(), 1);
+    }
+
+    #[test]
+    fn unknown_timestamp_reimports_once_a_stamp_appears() {
+        let mut cursor = Cursor {
+            path: PathBuf::from("ignored.json"),
+            data: CursorFile::default(),
+        };
+        let unknown = session("t3", None);
+        cursor.mark(&unknown);
+        assert!(cursor.is_imported(&unknown));
+
+        let stamped = session("t3", Some("2026-10-02T00:00:00Z"));
+        assert!(!cursor.is_imported(&stamped));
     }
 }

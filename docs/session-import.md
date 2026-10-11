@@ -39,8 +39,12 @@ rsrs extract --all --importance trivial --kind context --parent <id>
 
 Filters: `--cwd`, `--model`, `--session`, `--since`, `--limit`,
 `--include-subagents`. Conversion: `--kind` (default `context`),
-`--importance` (`important` default, or `trivial`), `--parent`. `--force`
-re-imports sessions already recorded in the cursor.
+`--importance` (`important` default, or `trivial`), `--parent`.
+
+`--force` only re-imports sessions already recorded in the cursor; it never
+overrides the store's protection of user edits. `--tui` runs the interactive
+picker and is mutually exclusive with every option above and with `--json`
+(combining them is an error). `--limit 0` imports nothing.
 
 ## What gets stored
 
@@ -58,11 +62,17 @@ One memory per session by default:
 
 Re-running skips unchanged sessions through a cursor at
 `<data-dir>/extract-state.json` (keyed by `platform:id` + `updated_at`). `--limit`
-caps **new** imports per source per run (newest first): when a source exceeds the
-limit, the overflow is deferred, so repeating the run (or raising `--limit`) pulls
-the older history next. Bodies
-are scrubbed best-effort for PEM private keys, `key=value` secrets and known
-token prefixes before storage, but this is a safety net, not a guarantee.
+caps **new** imports per source per run (newest first; `0` imports none): when a
+source exceeds the limit, the overflow is deferred, so repeating the run (or
+raising `--limit`) pulls the older history next.
+
+Each session maps to a stable id (UUIDv5-shaped from `platform:id`), so a
+re-import updates that same row instead of creating a duplicate. A re-import only
+refreshes the body and timestamp: an existing row keeps its tidy parent and any
+edited title, and a row the user deleted is skipped rather than resurrected.
+Bodies, titles and the `--json` preview are scrubbed best-effort for PEM private
+keys, `key[:=]value` (including quoted/JSON) secrets, `--flag value` secrets and
+known token prefixes before storage; this is a safety net, not a guarantee.
 
 ## Boundaries
 
@@ -72,8 +82,12 @@ token prefixes before storage, but this is a safety net, not a guarantee.
   and while memory is off.
 - Progress is a determinate stderr line (`done/total (pct%)`); `--json` keeps
   progress silent. The TUI shows a `Gauge` and runs extraction on a worker thread.
-- `extract --tui` needs a real TTY; bare `rsrs extract` opens it only on a TTY.
+- `extract --tui` needs a real TTY and rejects any extraction option (and
+  `--json`); bare `rsrs extract` opens it only on a TTY.
 - Deviation from the reference finder: `opencode` is read from its documented
   default database/file paths rather than by invoking the `opencode` CLI.
 
-MCP exposes the same capability as the `memory_extract` tool.
+MCP exposes the same capability as the `memory_extract` tool: a batch write that
+imports up to `limit` newest sessions per source and auto-syncs, so it requires
+`confirm: true` (or `dry_run: true` to preview), and `limit` must be a
+non-negative integer.

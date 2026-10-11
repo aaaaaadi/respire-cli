@@ -77,7 +77,7 @@ fn subagent_session(path: &Path) -> Option<Session> {
     let task = first
         .get("message")
         .and_then(Value::as_object)
-        .map(|message| scan_util::content_text(message.get("content").unwrap_or(&Value::Null)))
+        .map(|message| common::prompt_text(message.get("content").unwrap_or(&Value::Null)))
         .unwrap_or_default();
     let prompt = [description, task]
         .into_iter()

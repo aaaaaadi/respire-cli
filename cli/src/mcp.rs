@@ -123,13 +123,13 @@ fn tools() -> Vec<(&'static str, &'static str, serde_json::Value)> {
         ),
         (
             "memory_extract",
-            "Extract local coding-agent sessions (Codex, OpenCode, Claude Code, …) into rsrs memories",
+            "Import local coding-agent sessions (Codex, OpenCode, Claude Code, …) into rsrs memories. Batch write: imports up to `limit` newest sessions per source, seals each, then auto-syncs; pass confirm=true to write, or dry_run=true to preview",
             serde_json::json!({
                 "type":"object",
                 "properties":{
                     "id":{"type":"string","description":"One platform (codex/opencode/claude/…); omit for all detected"},
                     "dry_run":{"type":"boolean","description":"Scan and summarize without writing"},
-                    "limit":{"type":"integer","description":"Maximum sessions to import per source (newest first)"},
+                    "limit":{"type":"integer","minimum":0,"description":"Maximum sessions to import per source (newest first)"},
                     "since":{"type":"string","description":"today|yesterday|7d|YYYY-MM-DD"},
                     "importance":{"type":"string","enum":["important","trivial"]},
                     "parent":{"type":"string","description":"Attach imported memories under this parent (id / tree / anchor title)"},
@@ -327,7 +327,8 @@ fn tool_argv(name: &str, args: &serde_json::Value) -> Result<Vec<String>, String
             if opt_bool("dry_run") == Some(true) {
                 cmd.push("--dry-run".to_owned());
             }
-            if let Some(limit) = opt_u64("limit") {
+            if args.get("limit").is_some() {
+                let limit = opt_u64("limit").ok_or("limit must be a non-negative integer")?;
                 cmd.extend(["--limit".to_owned(), limit.to_string()]);
             }
             if let Some(since) = opt_str("since") {
@@ -843,6 +844,25 @@ mod tests {
         }
         if tool_argv("memory_attach", &serde_json::json!({"id":"c"})).is_ok() {
             return Err("attach without parent should fail".to_owned());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn memory_extract_requires_confirm_and_valid_limit() -> Result<(), String> {
+        if tool_argv("memory_extract", &serde_json::json!({})).is_ok() {
+            return Err("extract without confirm or dry_run should fail".to_owned());
+        }
+        if tool_argv("memory_extract", &serde_json::json!({"confirm":true,"limit":-1})).is_ok() {
+            return Err("a negative extract limit should fail".to_owned());
+        }
+        let write = tool_argv("memory_extract", &serde_json::json!({"confirm":true,"limit":5}))?;
+        if !write.contains(&"--limit".to_owned()) || write.contains(&"--dry-run".to_owned()) {
+            return Err(format!("extract write argv {write:?}"));
+        }
+        let preview = tool_argv("memory_extract", &serde_json::json!({"dry_run":true}))?;
+        if !preview.contains(&"--dry-run".to_owned()) {
+            return Err(format!("extract preview argv {preview:?}"));
         }
         Ok(())
     }

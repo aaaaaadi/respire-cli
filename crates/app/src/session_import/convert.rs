@@ -98,7 +98,7 @@ fn platform_label(platform: &str) -> String {
 /// Session title: `<Platform> 会话 <first request>` (concise, event-shaped).
 pub fn derive_title(session: &Session) -> String {
     let platform = platform_label(&session.platform);
-    let snippet = first_line(&session.first_user_message);
+    let snippet = first_line(&scrub(&session.first_user_message));
     if snippet.is_empty() {
         format!("{platform} 会话 {}", short_id(&session.id))
     } else {
@@ -295,9 +295,10 @@ fn redact_line(line: &str) -> String {
     redact_prefixed_tokens(line)
 }
 
-/// Mask the value only when a secret keyword is immediately followed (allowing
-/// spaces/tabs) by `=`/`:` (ASCII or full-width), so prose that merely mentions
-/// "token" or a timestamp is not truncated.
+/// Mask the value when a secret keyword is followed (after spaces/tabs and an
+/// optional opening quote) by `=`/`:` (ASCII or full-width), or when the keyword
+/// is a `--flag` whose value is whitespace-separated (`--password hunter2`). Prose
+/// that merely mentions "token" or a timestamp is not truncated.
 fn redact_key_value(line: &str) -> Option<String> {
     let lower = line.to_ascii_lowercase();
     let mut best: Option<usize> = None;
@@ -306,12 +307,23 @@ fn redact_key_value(line: &str) -> Option<String> {
         while let Some(relative) = lower[from..].find(key) {
             let pos = from + relative;
             let after = &line[pos + key.len()..];
-            let trimmed = after.trim_start_matches([' ', '\t']);
+            let trimmed = after.trim_start_matches([' ', '\t', '"', '\'']);
             let separator = trimmed.chars().next().filter(|c| matches!(*c, '=' | ':' | '：'));
-            if let Some(separator) = separator {
-                let index = line.len() - (trimmed.len() - separator.len_utf8());
-                best = Some(best.map_or(index, |current| current.min(index)));
-            }
+            let index = if let Some(separator) = separator {
+                line.len() - (trimmed.len() - separator.len_utf8())
+            } else if line[..pos].ends_with("--") {
+                // CLI flag form `--password <value>`: value is whitespace-separated.
+                let gap = after.len() - after.trim_start_matches([' ', '\t']).len();
+                if gap == 0 {
+                    from = pos + key.len();
+                    continue;
+                }
+                pos + key.len()
+            } else {
+                from = pos + key.len();
+                continue;
+            };
+            best = Some(best.map_or(index, |current| current.min(index)));
             from = pos + key.len();
         }
     }
@@ -398,7 +410,9 @@ mod tests {
             model: Some("gpt-5".into()),
             first_user_message: "add an extract command".into(),
             last_user_message: "ship it".into(),
-            usage: serde_json::json!({"total_tokens": 1234}).as_object().unwrap().clone(),
+            usage: [("total_tokens".to_owned(), serde_json::json!(1234))]
+                .into_iter()
+                .collect(),
             parent_id: None,
             agent: None,
         }
@@ -441,6 +455,21 @@ mod tests {
         assert!(scrub("token=abcd1234").contains("***"));
         assert!(scrub("api_key: abcd1234").contains("***"));
         assert!(scrub("密码：hunter2").contains("***"));
+    }
+
+    #[test]
+    fn redact_masks_quoted_json_and_flag_values() {
+        let object = scrub(r#"{"password": "hunter2"}"#);
+        assert!(!object.contains("hunter2"));
+        assert!(object.contains("***"));
+
+        let pair = scrub(r#""secret":"abcdefgh123""#);
+        assert!(!pair.contains("abcdefgh123"));
+        assert!(pair.contains("***"));
+
+        let flag = scrub("mysql -u root --password hunter2");
+        assert!(!flag.contains("hunter2"));
+        assert!(flag.contains("***"));
     }
 
     #[test]
