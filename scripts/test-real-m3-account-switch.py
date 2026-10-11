@@ -9,7 +9,10 @@ parser.add_argument('--model-file',choices=['model_quantized.onnx','model_fp16.o
 parser.add_argument('--legacy-model-file',choices=['model_fp16.onnx','model_quantized.onnx'],default='model_fp16.onnx')
 parser.add_argument('--legacy-model-dir',help='Read-only baseline cache containing real FP16 and quantized files')
 parser.add_argument('--output-dir',required=True)
-parser.add_argument('--expect-in-process',action='store_true')
+architecture=parser.add_mutually_exclusive_group()
+architecture.add_argument('--expect-in-process',action='store_true',help='Historical binaries without an inference worker')
+architecture.add_argument('--expect-supervised-worker',action='store_true',help='Verify one owned worker and its lifetime/SQLite boundary')
+parser.add_argument('--resident-stress',action='store_true',help='Exercise concurrent recall, short writes, lightweight reads and background indexing')
 parser.add_argument('--seed-binary',help='Create both libraries with this published older binary, then upgrade its running runtime')
 args=parser.parse_args()
 BASE=pathlib.Path(args.output_dir).resolve()
@@ -29,9 +32,9 @@ if args.seed_binary:
 reports = []
 for binary in BINARIES:
     root = BASE / ('account-return-real-' + str(time.time_ns()))
-    if os.name == 'posix' and args.seed_binary:
-        # Historical runtimes bind rpc.sock under the library. A nested CI
-        # report directory exceeds Unix socket path limits; keep the owned
+    if os.name == 'posix':
+        # Runtimes bind rpc.sock under the library. A nested CI report
+        # directory exceeds Unix socket path limits; keep the owned
         # fixture in a short workspace directory and retain reports in BASE.
         root = pathlib.Path.cwd() / ('rsrs-up-' + secrets.token_hex(6))
     main = root / '.rsrs'
@@ -62,6 +65,16 @@ for binary in BINARIES:
         result = subprocess.run([str(binary),'--json',*args],env=env,capture_output=True,timeout=120)
         if result.returncode and not allow_failure: raise RuntimeError(result.stdout.decode(errors='replace')+result.stderr.decode(errors='replace'))
         return json.loads(result.stdout)
+    def wait_index_ready(timeout=180):
+        deadline = time.monotonic() + timeout
+        while True:
+            doctor = run('doctor', allow_failure=True)
+            rows = {item['name']: item for item in doctor['items'] if item['name'] in ['embedder', 'model index']}
+            if len(rows) == 2 and all(item['status'] == 'ok' for item in rows.values()):
+                return rows
+            assert time.monotonic() < deadline, rows
+            time.sleep(.25)
+
     def snapshot(profile):
         database = profile/'rsrs.db'
         if not database.exists(): database = profile/'onememory.db'
@@ -76,6 +89,32 @@ for binary in BINARIES:
     public_config={'addr':'https://fixture.invalid','autosync':False,'custom':'preserve-upgrade-fixture'}
     def select(profile):
         (main/'client.json').write_text(json.dumps({**public_config,'data_dir':str(profile)}),encoding='utf-8')
+    worker_identities=[]
+    def checked_worker(health):
+        import psutil
+        host=psutil.Process(health['pid'])
+        children=[child for child in host.children(recursive=True)
+                  if not (sys.platform=='win32' and child.name().lower()=='conhost.exe')]
+        assert len(children)==1, 'expected exactly one supervised Core worker'
+        worker=children[0]
+        assert worker.pid==health['inference']['worker_pid'] and worker.ppid()==host.pid
+        assert '--core-worker-internal' in worker.cmdline()
+        assert pathlib.Path(worker.exe()).resolve()==pathlib.Path(host.exe()).resolve()
+        assert not any(pathlib.Path(file.path).name in ('rsrs.db','lock.db') for file in worker.open_files())
+        assert not {'GH_TOKEN','GITHUB_TOKEN','OPENAI_API_KEY','RSRS_SUPER'} & worker.environ().keys()
+        identity=(worker.pid,worker.create_time())
+        if identity not in worker_identities: worker_identities.append(identity)
+        return identity
+    def confirm_workers_exited(identities):
+        import psutil
+        deadline=time.monotonic()+10
+        for pid,created in identities:
+            while True:
+                try: alive=psutil.Process(pid).create_time()==created
+                except psutil.NoSuchProcess: alive=False
+                if not alive: break
+                assert time.monotonic()<deadline, 'owned Core worker survived its host: '+str(pid)
+                time.sleep(.02)
     try:
         run('--direct','model','engine','cpu')
         global_engine=(main/'inference.json').read_bytes()
@@ -124,20 +163,17 @@ for binary in BINARIES:
         visited=set()
         generation_changes={}
         for account, profile in [('main',main),('alternate',alternate),('main',main)]:
+            previous_workers=list(worker_identities)
             run('account','use',account)
+            if args.expect_supervised_worker and previous_workers:
+                confirm_workers_exited(previous_workers)
             if old_runtime is not None:
                 assert old_runtime.wait(timeout=20)==0,'old runtime did not exit gracefully'
             assert run('model','engine')['summary']['engine']=='cpu'
             assert (main/'inference.json').read_bytes()==global_engine
             assert not (alternate/'inference.json').exists()
             # A real model change may rebuild derived indexes once; never source data.
-            deadline=time.monotonic()+180
-            while True:
-                doctor=run('doctor',allow_failure=True)
-                rows={item['name']:item for item in doctor['items'] if item['name'] in ['embedder','model index']}
-                if len(rows)==2 and all(item['status']=='ok' for item in rows.values()): break
-                assert time.monotonic()<deadline,rows
-                time.sleep(.25)
+            rows = wait_index_ready()
             if args.seed_binary and str(profile) not in visited:
                 current=snapshot(profile)
                 baseline=original[str(profile)]
@@ -145,7 +181,7 @@ for binary in BINARIES:
                 generation_changes[str(profile)]=current[0][2]!=baseline[0][2] or current[1]!=baseline[1]
                 original[str(profile)]=current
             visited.add(str(profile))
-            if args.expect_in_process:
+            if args.expect_in_process or args.expect_supervised_worker:
                 import psutil
                 pending=subprocess.Popen([str(binary),'--json','model','probe','--model','m3'],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
                 checks=0
@@ -157,10 +193,14 @@ for binary in BINARIES:
                         with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/health',timeout=2) as response:
                             health=json.load(response)
                         assert time.monotonic()-start < 2,'health blocked behind native inference'
-                        children=psutil.Process(health['pid']).children(recursive=True)
-                        # Windows may attach its console host; it is not an inference worker.
-                        children=[child for child in children if not (sys.platform=='win32' and child.name().lower()=='conhost.exe')]
-                        assert not children, 'runtime spawned an inference child: '+str([child.name() for child in children])
+                        if args.expect_supervised_worker:
+                            identity=checked_worker(health)
+                            if checks: assert identity==probe_worker,'warm native probe replaced its worker'
+                            probe_worker=identity
+                        else:
+                            children=psutil.Process(health['pid']).children(recursive=True)
+                            children=[child for child in children if not (sys.platform=='win32' and child.name().lower()=='conhost.exe')]
+                            assert not children, 'runtime spawned an inference child: '+str([child.name() for child in children])
                         checks+=1
                         time.sleep(.05)
                     stdout,stderr=pending.communicate(timeout=120)
@@ -173,6 +213,9 @@ for binary in BINARIES:
                 run('model','probe','--model','m3')
             recalled=run('recall','Real account return fixture','--titles')
             assert recalled.get('items'),'real recall returned no seeded entry'
+            if args.expect_supervised_worker:
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/health',timeout=2) as response:
+                    assert checked_worker(json.load(response))==probe_worker,'warm recall replaced its worker'
             doctor=run('doctor',allow_failure=True)
             rows={item['name']:item for item in doctor['items'] if item['name'] in ['embedder','model index']}
             assert len(rows)==2 and all(item['status']=='ok' for item in rows.values()),rows
@@ -183,6 +226,8 @@ for binary in BINARIES:
             # Independent important entries avoid the intentional daily-trivia append behavior.
             written=run('remember','Post-upgrade real inference '+account+' '+str(time.time_ns()),'--title','post-upgrade-'+account,'--importance','important','--force')
             assert written['summary'].get('id'),'real post-upgrade remember did not commit'
+            # The durable write precedes derived indexing; compare stable snapshots after background completion.
+            wait_index_ready()
             updated=snapshot(profile)
             assert all(row in updated[0][0] for row in original[str(profile)][0][0]),'remember changed an existing ciphertext'
             assert all(row in updated[0][1] for row in original[str(profile)][0][1]),'remember changed existing sync work'
@@ -191,12 +236,122 @@ for binary in BINARIES:
             original[str(profile)]=updated
             assert run('recall','Post-upgrade real inference','--titles').get('items'),'post-upgrade remember could not be recalled'
             statuses.append({'account':account,'model_rows':rows})
+        stress = None
+        if args.resident_stress:
+            import concurrent.futures, psutil
+            with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/health', timeout=2) as response:
+                health = json.load(response)
+            owned = psutil.Process(health['pid'])
+            assert '--runtime-internal' in owned.cmdline(), 'stress must target its owned runtime'
+            def total_memory():
+                members=[owned,*owned.children(recursive=True)]
+                memories=[member.memory_info() for member in members]
+                return sum(memory.rss for memory in memories),sum(getattr(memory,'private',0) or 0 for memory in memories)
+            baseline_rss,baseline_private=total_memory()
+            samples = []
+            timings = []
+            body = 'resident stress query ' + 'background indexing and foreground retrieval '.join(['sample'] * 110)
+            def timed(command):
+                started = time.monotonic()
+                try:
+                    envelope = run(*command)
+                except Exception as error:
+                    raise RuntimeError('stress '+command[0]+' failed after '+str(round(time.monotonic()-started,3))+'s: '+str(error)) from error
+                assert envelope['status'] in ['ok', 'warn'], command[0]
+                return command[0], time.monotonic() - started, envelope
+            def sample_health():
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/health', timeout=2) as response:
+                    current = json.load(response)
+                assert current['pid'] == owned.pid, 'stress changed runtime ownership'
+                rss,private=total_memory()
+                if args.expect_supervised_worker: checked_worker(current)
+                inference = current.get('inference', {})
+                samples.append({'rss':rss,'private':private,
+                    'foreground':inference.get('foreground',{}),'background':inference.get('background',{})})
+            with concurrent.futures.ThreadPoolExecutor(max_workers=18) as pool:
+                writes = [pool.submit(timed, ['remember', body, '--title', 'stress-'+str(i),
+                    '--importance', 'important', '--force']) for i in range(28)]
+                while any(not future.done() for future in writes):
+                    sample_health()
+                    time.sleep(.02)
+                created = []
+                for future in writes:
+                    command, elapsed, envelope = future.result()
+                    assert envelope['summary'].get('index_state') == 'pending', 'remember waited for derived indexing'
+                    created.append(envelope['summary']['id'])
+                    timings.append({'command':command,'seconds':elapsed})
+                # Retrieval quality evaluation must use the same pending-aware
+                # resident path as recall, without requiring derived artifacts.
+                eval_file = BASE / 'resident-stress-eval.jsonl'
+                bench_file = BASE / 'resident-stress-bench.json'
+                eval_file.write_text(json.dumps({'query':'resident stress query','expect':created})+'\n',encoding='utf-8')
+                run('bench','run',str(eval_file),'--save',str(bench_file))
+                bench_report = json.loads(bench_file.read_text(encoding='utf-8'))
+                # The worker can finish first; the controlled CLI unit fixture
+                # separately proves the all-pending retrieval contract.
+                assert 0 <= int(bench_report['params']['index_pending']) <= bench_report['n_entries'], 'invalid pending count'
+                assert bench_report['metrics']['hitk'] == 1, 'pending-aware benchmark lost the expected source'
+                run('bench','run',str(eval_file),'--baseline',str(bench_file))
+                # A healthy owner must serve reads even while another process
+                # holds the lifecycle gate for startup/replacement decisions.
+                lifecycle = sqlite3.connect(main/'runtime/takeover/lock.db', timeout=2)
+                try:
+                    lifecycle.execute('BEGIN EXCLUSIVE')
+                    command, elapsed, envelope = timed(['show', created[0]])
+                    assert elapsed < 5, 'warm request acquired the lifecycle gate'
+                finally:
+                    lifecycle.rollback()
+                    lifecycle.close()
+                work = []
+                for i in range(28):
+                    work.append(pool.submit(timed, ['recall','resident stress query','--titles','--no-related']))
+                    work.append(pool.submit(timed, ['show',created[i]]))
+                    if i < 16:
+                        work.append(pool.submit(timed, ['update',created[i],'--title','updated-stress-'+str(i)]))
+                work.append(pool.submit(timed, ['remember','concurrent trivial write','--importance','trivial']))
+                while any(not future.done() for future in work):
+                    sample_health()
+                    time.sleep(.02)
+                for future in work:
+                    command, elapsed, envelope = future.result()
+                    if command == 'recall':
+                        assert envelope.get('items'), 'pending or indexed stress data was not recalled'
+                    timings.append({'command':command,'seconds':elapsed})
+            metrics = {'passed':False,'requests':len(timings),'timings':timings,
+                'rss_before':baseline_rss,'rss_peak':max(sample['rss'] for sample in samples),
+                'resource_scope':'owned host and all descendants',
+                'private_before':baseline_private,
+                'private_peak':max((sample['private'] or 0) for sample in samples),
+                'both_lanes_observed':any(sample['foreground'].get('active') and sample['background'].get('active') for sample in samples)}
+            (BASE/'resident-stress-metrics.json').write_text(json.dumps(metrics,indent=2),encoding='utf-8')
+            # This fixture submits 28 long documents and 16 content-bearing edits;
+            # its background batch is larger than the initial account preparation.
+            wait_index_ready(timeout=900)
+            database = main / 'rsrs.db'
+            if not database.exists(): database = main / 'onememory.db'
+            with sqlite3.connect(database) as database_connection:
+                missing = database_connection.execute(
+                    'SELECT COUNT(*) FROM memories m WHERE deleted=0 AND NOT EXISTS '
+                    '(SELECT 1 FROM core_artifacts a WHERE a.memory_id=m.id AND a.source=m.ciphertext)').fetchone()[0]
+            assert missing == 0, 'background index did not catch up with edited sources'
+            light = [entry['seconds'] for entry in timings if entry['command'] == 'show']
+            assert max(light) < 5, 'lightweight reads were blocked by inference or background work'
+            stress = {'passed':True,'requests':len(timings),'background_source_checks':True,
+                'show_max_seconds':max(light),'timings':timings,'rss_before':baseline_rss,
+                'resource_scope':'owned host and all descendants',
+                'rss_peak':max(sample['rss'] for sample in samples),
+                'private_before':baseline_private,
+                'private_peak':max((sample['private'] or 0) for sample in samples),
+                'both_lanes_observed':any(sample['foreground'].get('active') and sample['background'].get('active') for sample in samples),
+                'samples':samples}
+            (BASE/'resident-stress-metrics.json').write_text(json.dumps(stress,indent=2),encoding='utf-8')
         restart_checked=False
-        if args.expect_in_process:
+        if args.expect_in_process or args.expect_supervised_worker:
             import psutil
             with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/health',timeout=2) as response:
                 health=json.load(response)
             owned=psutil.Process(health['pid'])
+            retired_workers=[checked_worker(health)] if args.expect_supervised_worker else []
             assert pathlib.Path(owned.exe()).name.lower() in ['rsrs','rsrs.exe']
             assert '--runtime-internal' in owned.cmdline(),'only the isolated runtime may be suspended'
             before_restart={str(profile):snapshot(profile) for profile in [main,alternate]}
@@ -210,16 +365,21 @@ for binary in BINARIES:
             assert restarted['summary']['forced'] is True,restarted
             assert restarted['summary']['stopped_pid']==health['pid'],restarted
             assert restarted['summary']['pid']!=health['pid'],restarted
+            confirm_workers_exited(retired_workers)
             assert pathlib.Path(restarted['summary']['data_dir'])==main,restarted
             assert (main/'client.json').read_bytes()==config_before,'restart changed the account or API configuration'
             assert {str(profile):snapshot(profile) for profile in [main,alternate]}==before_restart,'restart changed source, key, sync or compatible index'
             run('model','probe','--model','m3')
             assert run('recall','Real account return fixture','--titles').get('items')
+            if args.expect_supervised_worker:
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/health',timeout=2) as response:
+                    checked_worker(json.load(response))
             restart_checked=True
         reports.append({'binary_sha256':hashlib.sha256(binary.read_bytes()).hexdigest(),'binary':str(binary),'passed':True,
             'real_model':True,'model_file':args.model_file,'engine':'cpu','in_process_checked':args.expect_in_process,
+            'supervised_worker_checked':args.expect_supervised_worker,'owned_worker_identities':worker_identities,
             'global_engine_preserved':True,'distinct_vault_keys':True,'sequence':statuses,'source_and_keys_unchanged':True,
-            'compatible_index_reused':True,'forced_restart_checked':restart_checked,'old_rpc_checked':old_rpc_checked,
+            'compatible_index_reused':True,'resident_stress':stress,'forced_restart_checked':restart_checked,'old_rpc_checked':old_rpc_checked,
             'old_rpc_authenticated':old_rpc_authenticated,'initial_generation_changes':generation_changes,'fixture':str(root)})
         print('PASS '+str(binary)+': main -> alternate -> main; real CPU inference; compatible index reused after preparation',flush=True)
     except Exception as error:
@@ -227,6 +387,8 @@ for binary in BINARIES:
         raise
     finally:
         subprocess.run([str(binary),'--runtime-internal','--stop'],env=env,capture_output=True,timeout=50)
+        if args.expect_supervised_worker:
+            confirm_workers_exited(worker_identities)
         if old_runtime is not None and old_runtime.poll() is None:
             old_runtime.terminate(); old_runtime.wait(timeout=15)
         (BASE/'real-account-return-verification.json').write_text(json.dumps(reports,indent=2),encoding='utf-8')

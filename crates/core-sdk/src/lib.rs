@@ -5,6 +5,7 @@
 
 pub mod env;
 mod host;
+pub mod worker;
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod host_winml;
@@ -15,6 +16,8 @@ use std::{marker::PhantomData, rc::Rc};
 
 mod business;
 pub use business::*;
+mod resident;
+pub use resident::{ResidentLease, ResidentScope, resident_scope_active, BackgroundIndexScope, defer_indexing, indexing_deferred};
 
 pub const ABI_VERSION: u32 = 0x0001_0002;
 

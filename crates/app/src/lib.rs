@@ -18,6 +18,7 @@ pub mod lock;
 pub mod migration;
 pub mod service;
 pub mod session_import;
+pub mod resident;
 pub mod sync;
 pub mod taxonomy;
 pub mod transport;
