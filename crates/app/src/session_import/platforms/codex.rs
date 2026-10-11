@@ -130,10 +130,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn codex_db_reads_threads_and_spawn_edges() {
-        let dir = tempfile::tempdir().unwrap();
+    fn codex_db_reads_threads_and_spawn_edges() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
         let db = dir.path().join("state_1.sqlite");
-        let connection = rusqlite::Connection::open(&db).unwrap();
+        let connection = rusqlite::Connection::open(&db)?;
         connection
             .execute_batch(
                 "CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT, created_at INTEGER, updated_at INTEGER, \
@@ -142,8 +142,7 @@ mod tests {
                  CREATE TABLE thread_spawn_edges (child_thread_id TEXT, parent_thread_id TEXT); \
                  INSERT INTO threads VALUES ('t-9','/r.jsonl','/work',1700000000,1700000600,'openai','gpt-5','hi',7,'{}','Tesla','explorer'); \
                  INSERT INTO thread_spawn_edges VALUES ('t-9','p-3');",
-            )
-            .unwrap();
+            )?;
         drop(connection);
 
         let sessions = codex_db(&db);
@@ -154,6 +153,7 @@ mod tests {
         assert_eq!(session.parent_id.as_deref(), Some("p-3"));
         assert_eq!(session.agent.as_deref(), Some("Tesla (explorer)"));
         assert_eq!(session.model.as_deref(), Some("gpt-5"));
-        assert!(session.updated_at.as_deref().unwrap().starts_with("2023-11-14"));
+        assert!(session.updated_at.as_deref().ok_or("updated_at")?.starts_with("2023-11-14"));
+        Ok(())
     }
 }

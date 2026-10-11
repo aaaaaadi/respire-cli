@@ -195,8 +195,16 @@ fn spawn_worker(ids: Vec<String>, sender: Sender<Work>) {
                 for session in &pending {
                     cursor.mark(session);
                 }
-                let _ = cursor.save();
-                let _ = sender.send(Work::Done(format!("imported {imported} memory(ies)")));
+                match cursor.save() {
+                    Ok(()) => {
+                        let _ = sender.send(Work::Done(format!("imported {imported} memory(ies)")));
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Work::Failed(format!(
+                            "imported {imported} memory(ies) but cursor save failed: {error}"
+                        )));
+                    }
+                }
             }
             Err(error) => {
                 let _ = sender.send(Work::Failed(format!("{error}")));

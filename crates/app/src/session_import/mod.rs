@@ -307,11 +307,13 @@ mod tests {
     }
 
     #[test]
-    fn session_json_truncates_preview() {
+    fn session_json_truncates_preview() -> Result<(), Box<dyn std::error::Error>> {
         let mut s = session("opencode", "ses_1", None);
         s.first_user_message = "x".repeat(500);
         let value = s.to_json();
-        assert_eq!(value["first_user_message"].as_str().unwrap().chars().count(), 300);
-        assert_eq!(value["last_user_message"].as_str().unwrap(), value["first_user_message"].as_str().unwrap());
+        let first = value["first_user_message"].as_str().ok_or("first")?;
+        assert_eq!(first.chars().count(), 300);
+        assert_eq!(value["last_user_message"].as_str().ok_or("last")?, first);
+        Ok(())
     }
 }

@@ -83,14 +83,13 @@ pub fn mtime_seconds(path: &Path) -> f64 {
 
 /// Keep the `limit` newest paths by modification time (stable for ties).
 pub fn recent(paths: Vec<PathBuf>, limit: usize) -> Vec<PathBuf> {
-    let mut paths = paths;
-    paths.sort_by(|a, b| {
-        mtime_seconds(b)
-            .partial_cmp(&mtime_seconds(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    paths.truncate(limit);
-    paths
+    let mut keyed: Vec<(f64, PathBuf)> = paths
+        .into_iter()
+        .map(|path| (mtime_seconds(&path), path))
+        .collect();
+    keyed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    keyed.truncate(limit);
+    keyed.into_iter().map(|(_, path)| path).collect()
 }
 
 /// Whether a file name matches a `*`-wildcard pattern (single path segment).
@@ -218,23 +217,22 @@ pub fn date_bound(value: &str, end: bool) -> Option<DateTime<Utc>> {
     let base: DateTime<Utc> = if text == "today" {
         Utc.from_utc_datetime(&midnight)
     } else if text == "yesterday" {
-        Utc.from_utc_datetime(&(midnight - Duration::days(1)))
+        Utc.from_utc_datetime(&midnight.checked_sub_signed(Duration::try_days(1)?)?)
     } else if let Some(days) = text.strip_suffix('d').and_then(|n| n.parse::<i64>().ok()) {
-        Utc.from_utc_datetime(&(midnight - Duration::days(days)))
+        Utc.from_utc_datetime(&midnight.checked_sub_signed(Duration::try_days(days)?)?)
     } else {
         let parts: Vec<i64> = text.split('-').filter_map(|p| p.parse().ok()).collect();
-        let year = *parts.first()?;
-        let month = parts.get(1).copied().unwrap_or(1);
-        let day = parts.get(2).copied().unwrap_or(1);
-        Utc.with_ymd_and_hms(year as i32, month as u32, day as u32, 0, 0, 0)
-            .single()?
+        let year = i32::try_from(*parts.first()?).ok()?;
+        let month = u32::try_from(parts.get(1).copied().unwrap_or(1)).ok()?;
+        let day = u32::try_from(parts.get(2).copied().unwrap_or(1)).ok()?;
+        Utc.with_ymd_and_hms(year, month, day, 0, 0, 0).single()?
     };
     if !end {
         return Some(base);
     }
     let segment_count = text.split('-').count();
     if text == "today" || text == "yesterday" || text.ends_with('d') || segment_count == 3 {
-        return Some(base + Duration::days(1));
+        return base.checked_add_signed(Duration::try_days(1)?);
     }
     if segment_count == 2 {
         return Utc
@@ -311,24 +309,26 @@ mod tests {
     }
 
     #[test]
-    fn date_bound_handles_keywords_and_parts() {
+    fn date_bound_handles_keywords_and_parts() -> Result<(), Box<dyn std::error::Error>> {
         assert!(date_bound("2026-10-01", false).is_some());
-        let end = date_bound("2026-10", true).unwrap();
+        let end = date_bound("2026-10", true).ok_or("end bound")?;
         assert_eq!(end.month(), 11);
-        let month_only = date_bound("2026-10", false).unwrap();
+        let month_only = date_bound("2026-10", false).ok_or("month bound")?;
         assert_eq!(month_only.month(), 10);
         assert!(date_bound("7d", false).is_some());
         assert!(date_bound("", false).is_none());
+        Ok(())
     }
 
     #[test]
-    fn unix_and_content_helpers() {
-        assert!(unix_millis(1_700_000_000_000).unwrap().starts_with("2023-11-14"));
-        assert!(unix_seconds(1_700_000_000.0).unwrap().starts_with("2023-11-14"));
+    fn unix_and_content_helpers() -> Result<(), Box<dyn std::error::Error>> {
+        assert!(unix_millis(1_700_000_000_000).ok_or("millis")?.starts_with("2023-11-14"));
+        assert!(unix_seconds(1_700_000_000.0).ok_or("seconds")?.starts_with("2023-11-14"));
         let parts = serde_json::json!([{"text": "a"}, {"text": "b"}, {"type": "tool"}]);
         assert_eq!(content_text(&parts), "a\nb");
         assert_eq!(nick_role(Some("Tesla"), Some("explorer")), Some("Tesla (explorer)".into()));
         assert_eq!(nick_role(None, Some("writer")), Some("writer".into()));
         assert_eq!(nick_role(None, None), None);
+        Ok(())
     }
 }

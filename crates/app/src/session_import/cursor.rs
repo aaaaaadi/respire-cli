@@ -83,8 +83,10 @@ impl Cursor {
                 .with_context(|| format!("create {}", parent.display()))?;
         }
         let json = serde_json::to_string_pretty(&self.data)?;
-        std::fs::write(&self.path, json)
-            .with_context(|| format!("write {}", self.path.display()))?;
+        let temp = self.path.with_extension("json.tmp");
+        std::fs::write(&temp, json).with_context(|| format!("write {}", temp.display()))?;
+        std::fs::rename(&temp, &self.path)
+            .with_context(|| format!("replace {}", self.path.display()))?;
         Ok(())
     }
 

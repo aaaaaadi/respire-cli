@@ -129,10 +129,11 @@ fn tools() -> Vec<(&'static str, &'static str, serde_json::Value)> {
                 "properties":{
                     "id":{"type":"string","description":"One platform (codex/opencode/claude/…); omit for all detected"},
                     "dry_run":{"type":"boolean","description":"Scan and summarize without writing"},
-                    "limit":{"type":"integer","description":"Maximum sessions to import (newest first)"},
+                    "limit":{"type":"integer","description":"Maximum sessions to import per source (newest first)"},
                     "since":{"type":"string","description":"today|yesterday|7d|YYYY-MM-DD"},
                     "importance":{"type":"string","enum":["important","trivial"]},
-                    "parent":{"type":"string","description":"Attach imported memories under this parent id"}
+                    "parent":{"type":"string","description":"Attach imported memories under this parent (id / tree / anchor title)"},
+                    "confirm":{"type":"boolean","description":"Required to write (omit only with dry_run=true)"}
                 }
             }),
         ),
@@ -312,6 +313,13 @@ fn tool_argv(name: &str, args: &serde_json::Value) -> Result<Vec<String>, String
     match name {
         "memory_status" => Ok(vec!["status".to_owned()]),
         "memory_extract" => {
+            let dry_run = opt_bool("dry_run") == Some(true);
+            if !dry_run && opt_bool("confirm") != Some(true) {
+                return Err(
+                    "memory_extract writes memories: pass dry_run=true to preview or confirm=true to import"
+                        .to_owned(),
+                );
+            }
             let mut cmd = vec!["extract".to_owned()];
             if let Some(id) = opt_str("id") {
                 cmd.extend(["--id".to_owned(), id.to_owned()]);

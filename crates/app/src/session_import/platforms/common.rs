@@ -258,17 +258,41 @@ pub fn merge_usage(target: &mut Map<String, Value>, value: &Map<String, Value>) 
 /// User prompt text from a JSONL event and its optional message payload.
 pub fn user_text(data: &Value, message: Option<&Map<String, Value>>) -> String {
     if data.get("type").and_then(Value::as_str) == Some("user") {
-        let value = scan_util::content_text(data.get("content").unwrap_or(&Value::Null));
+        let value = prompt_text(data.get("content").unwrap_or(&Value::Null));
         if !value.is_empty() {
             return value;
         }
     }
     if let Some(message) = message {
         if message.get("role").and_then(Value::as_str) == Some("user") {
-            return scan_util::content_text(message.get("content").unwrap_or(&Value::Null));
+            return prompt_text(message.get("content").unwrap_or(&Value::Null));
         }
     }
     String::new()
+}
+
+/// Prompt text from user content, skipping non-text parts (Claude emits
+/// `tool_result`/`tool_use` blocks under the user role).
+fn prompt_text(value: &Value) -> String {
+    if let Some(text) = value.as_str() {
+        return text.to_owned();
+    }
+    let Some(items) = value.as_array() else {
+        return String::new();
+    };
+    items
+        .iter()
+        .filter(|item| {
+            !matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("tool_result") | Some("tool_use") | Some("image")
+            )
+        })
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .filter(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// A single SQLite cell value.
@@ -354,8 +378,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn jsonl_session_parses_codex_rollout() {
-        let dir = tempfile::tempdir().unwrap();
+    fn jsonl_session_parses_codex_rollout() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
         let path = dir.path().join("rollout-abc.jsonl");
         let lines = [
             r#"{"type":"session_meta","payload":{"id":"t-1","cwd":"/work","model_provider":"openai","source":{"subagent":{"thread_spawn":{"parent_thread_id":"p-0","agent_nickname":"Tesla","agent_role":"explorer"}}}}}"#,
@@ -363,7 +387,7 @@ mod tests {
             r#"{"type":"assistant","timestamp":"2026-10-01T00:05:00Z","message":{"role":"assistant","content":"ok","usage":{"total_tokens":42}}}"#,
         ]
         .join("\n");
-        std::fs::write(&path, lines).unwrap();
+        std::fs::write(&path, lines)?;
 
         let session = jsonl_session("codex", &path, "fallback".to_owned());
         assert_eq!(session.id, "t-1");
@@ -373,7 +397,8 @@ mod tests {
         assert_eq!(session.parent_id.as_deref(), Some("p-0"));
         assert_eq!(session.agent.as_deref(), Some("Tesla (explorer)"));
         assert!(session.usage.contains_key("total_tokens"));
-        assert!(session.updated_at.as_deref().unwrap().starts_with("2026-10-01"));
+        assert!(session.updated_at.as_deref().ok_or("updated_at")?.starts_with("2026-10-01"));
+        Ok(())
     }
 
     #[test]

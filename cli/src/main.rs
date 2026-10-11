@@ -1934,7 +1934,16 @@ fn run_extract(
         roots: Vec::new(),
         cwd: cwd.map(str::to_owned),
         model: model_filter.map(str::to_owned),
-        since: since.and_then(|value| respire::session_import::scan_util::date_bound(value, false)),
+        since: match since {
+            None => None,
+            Some(value) => Some(
+                respire::session_import::scan_util::date_bound(value, false).ok_or_else(|| {
+                    respire_app::input_error::InputError(format!(
+                        "invalid --since '{value}': use today|yesterday|Nd|YYYY-MM-DD"
+                    ))
+                })?,
+            ),
+        },
         until: None,
         limit: limit.unwrap_or(200),
         include_subagents,

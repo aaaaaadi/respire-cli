@@ -269,16 +269,22 @@ const SECRET_KEYS: [&str; 12] = [
 
 fn redact_line(line: &str) -> String {
     let lower = line.to_ascii_lowercase();
-    if SECRET_KEYS.iter().any(|key| lower.contains(key)) {
-        if let Some(pos) = line.find(['=', ':']) {
-            let (head, _) = line.split_at(pos + 1);
+    let hit = SECRET_KEYS
+        .iter()
+        .filter_map(|key| lower.find(key).map(|pos| (pos, key.len())))
+        .min_by_key(|(pos, _)| *pos);
+    if let Some((pos, len)) = hit {
+        if let Some(separator) = line.find(['=', ':']) {
+            let (head, _) = line.split_at(separator + 1);
             return format!("{head} ***");
         }
+        let (head, _) = line.split_at(pos + len);
+        return format!("{head} ***");
     }
     redact_prefixed_tokens(line)
 }
 
-const TOKEN_PREFIXES: [&str; 8] = ["sk-", "ghp_", "gho_", "ghs_", "xoxb-", "xoxp-", "AKIA", "AIza"];
+const TOKEN_PREFIXES: [&str; 9] = ["sk-", "ghp_", "gho_", "ghs_", "xoxb-", "xoxp-", "AKIA", "AIza", "eyJ"];
 
 fn redact_prefixed_tokens(line: &str) -> String {
     let mut result = String::new();
