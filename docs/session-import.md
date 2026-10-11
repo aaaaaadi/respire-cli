@@ -1,0 +1,79 @@
+# Session import (`rsrs extract`)
+
+Extract the process data local coding agents already save on disk and convert it
+into encrypted rsrs memories. Discovery mirrors the cross-platform
+`coding-agent-sessions` finder: each platform scanner normalizes its own store
+into one common session shape, which is then turned into a memory and sealed
+through the runtime store.
+
+## Supported platforms
+
+`codex`, `opencode`, `claude`, `senpi`, `oh-my-pi`, `gajae-code`, `openclaw`,
+`droid`, `amp`, `gemini`, `kimi`, `qwen`, `codebuff`, `roo-code`, `kilo-code`,
+`cline`, `kodu`, `cursor-cli`, `aider`, `kilo-cli`, `hermes`, `goose`, `crush`,
+`zed`, `kiro`, `aside`.
+
+Data sources per platform:
+
+| Platform | Store |
+| --- | --- |
+| codex | `$CODEX_HOME/state_*.sqlite` (`threads`, `thread_spawn_edges`) + `sessions/**/rollout-*.jsonl` |
+| opencode | `opencode.db` `session` table, else `storage/session/**/ses_*.json` + `messages/*/parts` |
+| claude | `~/.claude/projects/**/*.jsonl`, `transcripts/*.jsonl`, `subagents/**/agent-*.jsonl` |
+| openclaw / droid / amp / gemini / kimi / qwen / codebuff / roo-code / kilo-code / cline / aider | per-platform JSON/JSONL/VS Code `globalStorage` stores |
+| cursor-cli / kodu / kilo-cli / hermes / goose / crush / zed | per-platform SQLite stores |
+| senpi / oh-my-pi / gajae-code | `~/.*/agent/sessions/**/*.jsonl` (+ profile dirs) |
+| kiro / aside | per-platform JSON/JSONL + SQLite index |
+
+## Usage
+
+```sh
+rsrs extract --targets                 # list sources and whether a local store exists
+rsrs extract --all --dry-run           # preview what would be imported
+rsrs extract --id codex                # extract one source
+rsrs extract --all                     # extract every detected source
+rsrs extract --all --since 7d --limit 50
+rsrs extract --tui                     # interactive picker with a progress bar
+rsrs extract --all --importance trivial --kind context --parent <id>
+```
+
+Filters: `--cwd`, `--model`, `--session`, `--since`, `--limit`,
+`--include-subagents`. Conversion: `--kind` (default `context`),
+`--importance` (`important` default, or `trivial`), `--parent`. `--force`
+re-imports sessions already recorded in the cursor.
+
+## What gets stored
+
+One memory per session by default:
+
+- title: `<Platform> 会话 <first request>`
+- body: the mandatory `【前因】【行为】【后果】` three-marker form, carrying the
+  working directory, model/provider, first and last user requests, token usage
+  and any subagent linkage
+- `importance`/`kind` from the flags; `device`/`user` auto-filled
+- **extract is a raw ingester**: entries land as roots (or under `--parent` if
+  given). Organizing is a separate, AI-driven tidy pass — after extracting, have
+  an agent run the §3.8 tidy (`rsrs list --since-resort --json` → diagnose →
+  `resort` / `remember --merge-ids`).
+
+Re-running skips unchanged sessions through a cursor at
+`<data-dir>/extract-state.json` (keyed by `platform:id` + `updated_at`). `--limit`
+caps **new** imports per source per run (newest first): when a source exceeds the
+limit, the overflow is deferred, so repeating the run (or raising `--limit`) pulls
+the older history next. Bodies
+are scrubbed best-effort for PEM private keys, `key=value` secrets and known
+token prefixes before storage, but this is a safety net, not a guarantee.
+
+## Boundaries
+
+- Reads are best-effort and never panic on malformed stores.
+- Writes go through the runtime write path (`MemoryEngine::seal` + batch import
+  + one auto-sync), so `extract` is a write command: refused in read-only mode
+  and while memory is off.
+- Progress is a determinate stderr line (`done/total (pct%)`); `--json` keeps
+  progress silent. The TUI shows a `Gauge` and runs extraction on a worker thread.
+- `extract --tui` needs a real TTY; bare `rsrs extract` opens it only on a TTY.
+- Deviation from the reference finder: `opencode` is read from its documented
+  default database/file paths rather than by invoking the `opencode` CLI.
+
+MCP exposes the same capability as the `memory_extract` tool.

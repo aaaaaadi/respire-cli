@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::rpc;
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
-const TOOL_COUNT: usize = 15;
+const TOOL_COUNT: usize = 16;
 
 /// Incoming HTTP fields for `/mcp` and `/sse`.
 pub struct HttpIn {
@@ -120,6 +120,21 @@ fn tools() -> Vec<(&'static str, &'static str, serde_json::Value)> {
             "memory_status",
             "Local store status (data dir, session, counts). Use to check that rsrs is ready.",
             serde_json::json!({"type":"object","properties":{}}),
+        ),
+        (
+            "memory_extract",
+            "Extract local coding-agent sessions (Codex, OpenCode, Claude Code, …) into rsrs memories",
+            serde_json::json!({
+                "type":"object",
+                "properties":{
+                    "id":{"type":"string","description":"One platform (codex/opencode/claude/…); omit for all detected"},
+                    "dry_run":{"type":"boolean","description":"Scan and summarize without writing"},
+                    "limit":{"type":"integer","description":"Maximum sessions to import (newest first)"},
+                    "since":{"type":"string","description":"today|yesterday|7d|YYYY-MM-DD"},
+                    "importance":{"type":"string","enum":["important","trivial"]},
+                    "parent":{"type":"string","description":"Attach imported memories under this parent id"}
+                }
+            }),
         ),
         (
             "memory_remember",
@@ -296,6 +311,28 @@ fn tool_argv(name: &str, args: &serde_json::Value) -> Result<Vec<String>, String
     let opt_bool = |key: &str| args.get(key).and_then(|v| v.as_bool());
     match name {
         "memory_status" => Ok(vec!["status".to_owned()]),
+        "memory_extract" => {
+            let mut cmd = vec!["extract".to_owned()];
+            if let Some(id) = opt_str("id") {
+                cmd.extend(["--id".to_owned(), id.to_owned()]);
+            }
+            if opt_bool("dry_run") == Some(true) {
+                cmd.push("--dry-run".to_owned());
+            }
+            if let Some(limit) = opt_u64("limit") {
+                cmd.extend(["--limit".to_owned(), limit.to_string()]);
+            }
+            if let Some(since) = opt_str("since") {
+                cmd.extend(["--since".to_owned(), since.to_owned()]);
+            }
+            if let Some(importance) = opt_str("importance") {
+                cmd.extend(["--importance".to_owned(), importance.to_owned()]);
+            }
+            if let Some(parent) = opt_str("parent") {
+                cmd.extend(["--parent".to_owned(), parent.to_owned()]);
+            }
+            Ok(cmd)
+        }
         "memory_remember" => {
             let content = opt_str("content").ok_or("missing content")?;
             let mut cmd = vec!["remember".to_owned(), content.to_owned()];
@@ -723,6 +760,11 @@ mod tests {
         }
         let cases: Vec<(&str, serde_json::Value, &str)> = vec![
             ("memory_status", serde_json::json!({}), "status"),
+            (
+                "memory_extract",
+                serde_json::json!({"id":"codex","dry_run":true,"limit":5}),
+                "extract",
+            ),
             (
                 "memory_remember",
                 serde_json::json!({"content":"c","importance":"important","type":"decision","merge_ids":"a,b"}),

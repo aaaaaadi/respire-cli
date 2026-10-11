@@ -30,6 +30,8 @@ rsrs doctor
 rsrs help
 rsrs web
 rsrs recall "query" --titles --json
+rsrs extract --targets
+rsrs extract --all --dry-run
 ```
 
 `rsrs web` opens https://dash.rsrs.rs without starting a local Web server. No dashboard assets are embedded in the CLI.
@@ -52,6 +54,7 @@ Startup preserves the selected account and does not import old profiles automati
 
 | Guide | Topic |
 | --- | --- |
+| [Session import](docs/session-import.md) | Extract coding-agent sessions into memories |
 | [Runtime](docs/runtime.md) | Host lifecycle and sandbox clients |
 | [Inference](docs/inference.md) | Model installation and engines |
 | [Retrieval](docs/retrieval.md) | Retrieval modes and index migration |
