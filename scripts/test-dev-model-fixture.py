@@ -57,6 +57,19 @@ class ModelFixtureTests(unittest.TestCase):
             self.assertNotIn("private-", diagnostic)
             self.assertLessEqual(len(diagnostic), 1500)
 
+    def test_diagnostics_without_data_dir_preserve_original_error(self):
+        spec = importlib.util.spec_from_file_location("legacy", Path(__file__).with_name("dev-legacy-vault-smoke.py"))
+        legacy = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(legacy)
+        smoke = object.__new__(legacy.Smoke)
+        smoke.diagnostic_secrets = {"private-fixture-password"}
+        result = subprocess.CompletedProcess([], 1, json.dumps({"errors": [
+            "No such file (os error 2) private-fixture-password"
+        ]}).encode(), b"")
+        diagnostic = smoke.redacted_cli_error({}, result)
+        self.assertIn("os error 2", diagnostic)
+        self.assertNotIn("private-fixture-password", diagnostic)
+
 
 if __name__ == "__main__":
     unittest.main()

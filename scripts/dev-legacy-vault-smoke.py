@@ -132,8 +132,9 @@ class Smoke:
             diagnostic = ""
         diagnostic = diagnostic or output.stderr.decode("utf-8", errors="replace")[-1500:]
         secrets_to_redact = set(self.diagnostic_secrets)
-        session_path = Path(env["RSRS_DATA_DIR"]) / "session.json"
-        if session_path.is_file():
+        data_dir = env.get("RSRS_DATA_DIR")
+        session_path = Path(data_dir) / "session.json" if data_dir else None
+        if session_path is not None and session_path.is_file():
             session = json.loads(session_path.read_text())
             secrets_to_redact.update(session.get(key) for key in
                 ("pass", "pass_hash", "super", "token", "secret", "secret_key", "wrapped_urk", "urk_nonce", "kdf_salt")
