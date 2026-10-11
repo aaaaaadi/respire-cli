@@ -70,6 +70,10 @@ Each session maps to a stable id (UUIDv5-shaped from `platform:id`), so a
 re-import updates that same row instead of creating a duplicate. A re-import only
 refreshes the body and timestamp: an existing row keeps its tidy parent and any
 edited title, and a row the user deleted is skipped rather than resurrected.
+
+Import embeds every session first (that step holds no database lock), then writes
+in small committed chunks and persists the cursor after each chunk, so the write
+lock is never held across embedding and a failure resumes near where it stopped.
 Bodies, titles and the `--json` preview are scrubbed best-effort for PEM private
 keys, `key[:=]value` (including quoted/JSON) secrets, `--flag value` secrets and
 known token prefixes before storage; this is a safety net, not a guarantee.

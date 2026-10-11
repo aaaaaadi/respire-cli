@@ -7,11 +7,16 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::{scan_util, Session};
+
+/// Distinguishes each `save` within a process, so concurrent saves cannot reuse
+/// the same temporary path.
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct CursorFile {
@@ -83,10 +88,15 @@ impl Cursor {
                 .with_context(|| format!("create {}", parent.display()))?;
         }
         let json = serde_json::to_string_pretty(&self.data)?;
-        let temp = self.path.with_extension(format!("{}.tmp", std::process::id()));
+        let unique = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let temp = self
+            .path
+            .with_extension(format!("{}.{}.tmp", std::process::id(), unique));
         std::fs::write(&temp, json).with_context(|| format!("write {}", temp.display()))?;
-        std::fs::rename(&temp, &self.path)
-            .with_context(|| format!("replace {}", self.path.display()))?;
+        if let Err(error) = std::fs::rename(&temp, &self.path) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error).with_context(|| format!("replace {}", self.path.display()));
+        }
         Ok(())
     }
 

@@ -201,25 +201,26 @@ fn spawn_worker(ids: Vec<String>, sender: Sender<Work>) {
             .iter()
             .map(|session| session_import::session_entry(session, &convert))
             .collect();
-        let result = session_import::import_entries(&mut entries, "", |done, total| {
-            let _ = sender.send(Work::Progress("storing memories".to_owned(), done, total));
-        });
+        let mut cursor = cursor;
+        let result = session_import::import_entries(
+            &mut entries,
+            "",
+            |done, total| {
+                let _ = sender.send(Work::Progress("storing memories".to_owned(), done, total));
+            },
+            |start, completed| {
+                for (offset, ok) in completed.iter().enumerate() {
+                    if *ok {
+                        cursor.mark(&pending[start + offset]);
+                    }
+                }
+                cursor.save()?;
+                Ok(())
+            },
+        );
         match result {
-            Ok(imported) => {
-                let mut cursor = cursor;
-                for session in &pending {
-                    cursor.mark(session);
-                }
-                match cursor.save() {
-                    Ok(()) => {
-                        let _ = sender.send(Work::Done(format!("imported {imported} memory(ies)")));
-                    }
-                    Err(error) => {
-                        let _ = sender.send(Work::Failed(format!(
-                            "imported {imported} memory(ies) but cursor save failed: {error}"
-                        )));
-                    }
-                }
+            Ok(outcome) => {
+                let _ = sender.send(Work::Done(format!("imported {} memory(ies)", outcome.imported)));
             }
             Err(error) => {
                 let _ = sender.send(Work::Failed(format!("{error}")));

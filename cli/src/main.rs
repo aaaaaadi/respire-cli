@@ -2141,13 +2141,21 @@ fn run_extract(
     }
 
     progress::phase("Embedding and storing memories", "Embedding and storing memories");
-    let imported = respire::session_import::import_entries(&mut entries, parent, |done, total| {
-        progress::phase_count("写入记忆", "Storing memories", done, total);
-    })?;
-    for session in &pending {
-        cursor.mark(session);
-    }
-    cursor.save()?;
+    let outcome = respire::session_import::import_entries(
+        &mut entries,
+        parent,
+        |done, total| progress::phase_count("写入记忆", "Storing memories", done, total),
+        |start, completed| {
+            for (offset, ok) in completed.iter().enumerate() {
+                if *ok {
+                    cursor.mark(&pending[start + offset]);
+                }
+            }
+            cursor.save()?;
+            Ok(())
+        },
+    )?;
+    let imported = outcome.imported;
 
     let mut result = ResultEnvelope::new(
         "extract",
