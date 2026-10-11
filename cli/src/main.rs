@@ -1888,6 +1888,52 @@ fn run_tree_deepen(
     Ok(())
 }
 
+/// TUI/non-TUI dispatch for `extract`, kept out of `run_local_inner` to bound its stack frame.
+fn run_extract_command(command: &Command) -> Result<()> {
+    let Command::Extract {
+        targets,
+        tui,
+        all,
+        id,
+        dry_run,
+        since,
+        limit,
+        cwd,
+        model,
+        session,
+        kind,
+        importance,
+        parent,
+        include_subagents,
+        force,
+    } = command
+    else {
+        return Ok(());
+    };
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin())
+        && std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let bare = !*targets && id.is_none() && !*all && !*dry_run;
+    if *tui || (bare && interactive) {
+        return respire::extract_tui::run();
+    }
+    run_extract(
+        *targets,
+        id.as_deref(),
+        *all,
+        *dry_run,
+        since.as_deref(),
+        *limit,
+        cwd.as_deref(),
+        model.as_deref(),
+        session.as_deref(),
+        kind,
+        importance,
+        parent,
+        *include_subagents,
+        *force,
+    )
+}
+
 /// Extract local coding-agent sessions into rsrs memories (see `extract --help`).
 fn run_extract(
     targets_only: bool,
@@ -6165,46 +6211,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
         }) => return run_tree_cure(*top, id.as_deref(), parent.as_deref(), *auto, *min),
         Some(Command::TreeFloat { go, min }) => return run_tree_float(*go, *min),
         Some(Command::Split { id, go, spec }) => return run_split(id, *go, spec.as_deref()),
-        Some(Command::Extract {
-            targets,
-            tui,
-            all,
-            id,
-            dry_run,
-            since,
-            limit,
-            cwd,
-            model,
-            session,
-            kind,
-            importance,
-            parent,
-            include_subagents,
-            force,
-        }) => {
-            let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin())
-                && std::io::IsTerminal::is_terminal(&std::io::stdout());
-            let bare = !*targets && id.is_none() && !*all && !*dry_run;
-            if *tui || (bare && interactive) {
-                return respire::extract_tui::run();
-            }
-            return run_extract(
-                *targets,
-                id.as_deref(),
-                *all,
-                *dry_run,
-                since.as_deref(),
-                *limit,
-                cwd.as_deref(),
-                model.as_deref(),
-                session.as_deref(),
-                kind,
-                importance,
-                parent,
-                *include_subagents,
-                *force,
-            );
-        }
+        Some(command @ Command::Extract { .. }) => return run_extract_command(command),
         Some(Command::Inject {
             targets,
             id,
