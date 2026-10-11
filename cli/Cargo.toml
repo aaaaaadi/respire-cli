@@ -17,7 +17,7 @@ name = "rsrs"
 path = "src/main.rs"
 
 [dependencies]
-respire_app = { package = "respire_app", path = "../crates/app" }
+respire_app = { package = "respire_app", path = "../crates/app", default-features = false }
 respire_spawn = { path = "../spawn" }
 anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

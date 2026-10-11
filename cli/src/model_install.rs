@@ -156,7 +156,7 @@ fn install_m3_inner(mirror: Option<&str>) -> Result<InstallReport> {
 /// Keep ONNX for GPU/NPU. A CPU container upgrade does not change stored vectors or index schema.
 fn prepare_cpu_ort(directory: &Path) -> Result<bool> {
     use crate::memory::bge;
-    if crate::memory::onnx::configured_engine()? != crate::memory::onnx::Engine::Cpu { return Ok(true); }
+    if !bge::cpu_owned_mode(crate::memory::onnx::configured_engine()?)? { return Ok(true); }
     if file_valid(&bge::cpu_ort_path(directory), bge::CPU_ORT_SHA256)? { return Ok(true); }
     // Legacy packaged/system model directories may be read-only. Upgrade into the user cache.
     let dest = bge::cpu_ort_cache_path();
@@ -169,6 +169,7 @@ fn prepare_cpu_ort(directory: &Path) -> Result<bool> {
     }
     anyhow::ensure!(partial.metadata()?.len() == bge::CPU_ORT_SIZE, "CPU model size mismatch");
     replace_file(&partial, &dest)?;
+    bge::invalidate_cpu_ort_validation()?;
     std::fs::write(parent.join("CPU-MODEL-SOURCE.json"), serde_json::to_vec_pretty(&serde_json::json!({
         "container_version":bge::CPU_ORT_REVISION,"source_repository":MODEL_REPO,
         "source_revision":MODEL_REVISION,"source_onnx_sha256":ONNX_SHA256,
@@ -179,9 +180,9 @@ fn prepare_cpu_ort(directory: &Path) -> Result<bool> {
 }
 
 pub fn cpu_model_preparation_needed() -> Result<bool> {
-    if crate::memory::onnx::configured_engine()? != crate::memory::onnx::Engine::Cpu { return Ok(false); }
+    if !crate::memory::bge::cpu_owned_mode(crate::memory::onnx::configured_engine()?)? { return Ok(false); }
     Ok(match crate::memory::bge::resolve_model_dir() {
-        Ok(directory) => !crate::memory::bge::cpu_ort_present(&directory),
+        Ok(directory) => !crate::memory::bge::cpu_ort_present(&directory)?,
         Err(_) => true,
     })
 }
