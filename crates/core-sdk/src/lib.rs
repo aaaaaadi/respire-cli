@@ -5,12 +5,14 @@
 
 pub mod env;
 mod host;
+mod cpu_model;
 pub mod worker;
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod host_winml;
 
 use anyhow::{bail, Context, Result};
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::{marker::PhantomData, rc::Rc};
 
@@ -20,6 +22,19 @@ mod resident;
 pub use resident::{ResidentLease, ResidentScope, resident_scope_active, BackgroundIndexScope, defer_indexing, indexing_deferred};
 
 pub const ABI_VERSION: u32 = 0x0001_0002;
+
+#[derive(Serialize)]
+struct CoreRequest<'a> {
+    schema_version: u32,
+    request_id: &'a str,
+    operation: &'a str,
+    payload: &'a Value,
+}
+
+fn response_result(response: &mut Value) -> Result<Value> {
+    response.as_object_mut().and_then(|fields| fields.remove("result"))
+        .context("Core response missing result")
+}
 
 /// Confined to its owner thread; calls cannot race destruction or one another.
 pub struct Core {
@@ -64,10 +79,10 @@ impl Core {
             .checked_add(1)
             .context("request counter exhausted")?;
         let request_id = self.next_request.to_string();
-        let request = serde_json::to_vec(&json!({
-            "schema_version": 1, "request_id": request_id,
-            "operation": operation, "payload": payload,
-        }))?;
+        let request = serde_json::to_vec(&CoreRequest {
+            schema_version: 1, request_id: &request_id,
+            operation, payload: &payload,
+        })?;
         let (code, bytes) = match transport {
             Some(transport) => self.handle.call_with_transport(&request, transport)?,
             None => self.handle.call(&request)?,
@@ -75,7 +90,7 @@ impl Core {
         if code == 7 {
             self.poisoned = true;
         }
-        let response: Value =
+        let mut response: Value =
             serde_json::from_slice(&bytes).context("invalid Core response JSON")?;
         if code != 0 {
             bail!("Core error {code}: {}", response["error"]["message"]);
@@ -85,10 +100,7 @@ impl Core {
         {
             bail!("Core response schema or request ID mismatch");
         }
-        response
-            .get("result")
-            .cloned()
-            .context("Core response missing result")
+        response_result(&mut response)
     }
 
     pub fn capabilities(&mut self) -> Result<Value> {
@@ -100,9 +112,9 @@ impl Core {
         anyhow::ensure!(!self.poisoned, "Core handle is poisoned; recreate it");
         let (code, bytes) = self.handle.load_model(&serde_json::to_vec(&config)?, model, tokenizer)?;
         if code == 7 { self.poisoned = true; }
-        let response: Value = serde_json::from_slice(&bytes).context("invalid Core model response")?;
+        let mut response: Value = serde_json::from_slice(&bytes).context("invalid Core model response")?;
         anyhow::ensure!(code == 0, "Core error {code}: {}", response["error"]["message"]);
-        response.get("result").cloned().context("Core model response missing result")
+        response_result(&mut response)
     }
 
     #[cfg(windows)]
@@ -112,6 +124,30 @@ impl Core {
         let response: Value = serde_json::from_slice(&bytes).context("invalid Core provider response")?;
         anyhow::ensure!(code == 0, "Core provider registration error {code}: {}", response["error"]["message"]);
         Ok(diagnostics)
+    }
+}
+
+#[cfg(test)]
+mod core_wire_tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_request_and_moved_result_preserve_protocol() -> Result<()> {
+        for payload in [Value::Null, json!({"nested":[1,"你好",{"flag":true}]}), json!([1,2,3])] {
+            let bytes = serde_json::to_vec(&CoreRequest {
+                schema_version:1, request_id:"42", operation:"query", payload:&payload,
+            })?;
+            let request: Value = serde_json::from_slice(&bytes)?;
+            assert_eq!(request, json!({"schema_version":1,"request_id":"42",
+                "operation":"query","payload":payload}));
+            let mut response = json!({"schema_version":1,"request_id":"42","result":payload});
+            assert_eq!(response_result(&mut response)?, payload);
+            assert!(response.get("result").is_none());
+            assert_eq!(response["request_id"], "42");
+        }
+        assert!(response_result(&mut json!({"error":{"message":"failure"}})).is_err());
+        assert!(response_result(&mut Value::Null).is_err());
+        Ok(())
     }
 }
 
@@ -269,7 +305,10 @@ mod ffi {
             let mut options = SessionOptionsContext { profiling:crate::env::var_os("RSRS_ORT_PROFILE").map(std::path::PathBuf::from),
                 device_options, cache:crate::onnx::host_cache_dir(), error:None };
             // Borrowed slices and host option callback remain alive through this call.
-            let code = if options.profiling.is_some() || options.device_options {
+            let options_required = options.profiling.is_some() || options.device_options;
+            #[cfg(test)]
+            let options_required = options_required || test_option_failure_armed();
+            let code = if options_required {
                 unsafe { rs_core_model_load_with_host(self.pointer.as_ptr(), config.as_ptr(), config.len(),
                     model.as_ptr(), model.len(), tokenizer.as_ptr(), tokenizer.len(),
                     ptr::from_mut(&mut options).cast(), configure_session_options, &mut output) }
@@ -304,11 +343,36 @@ mod ffi {
     struct SessionOptionsContext { profiling: Option<std::path::PathBuf>, device_options:bool,
         cache:std::path::PathBuf, error: Option<anyhow::Error> }
 
+    #[cfg(test)]
+    thread_local! {
+        static TEST_OPTION_FAILURE: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
+    }
+    #[cfg(test)]
+    pub(super) fn set_test_option_failure(at: Option<usize>) {
+        TEST_OPTION_FAILURE.with(|failure| failure.set(at.map(|at| (at, 0))));
+    }
+    #[cfg(test)]
+    pub(super) fn test_option_failure_armed() -> bool { TEST_OPTION_FAILURE.with(|failure| failure.get().is_some()) }
+    #[cfg(test)]
+    pub(super) fn test_option_callback_count() -> usize { TEST_OPTION_FAILURE.with(|failure| failure.get().map_or(0, |(_, count)| count)) }
+    #[cfg(test)]
+    fn fail_options_for_test() -> Result<()> {
+        TEST_OPTION_FAILURE.with(|failure| {
+            if let Some((at, count)) = failure.get() {
+                failure.set(Some((at, count + 1)));
+                anyhow::ensure!(count + 1 != at, "intentional native options callback failure");
+            }
+            Ok(())
+        })
+    }
+
     unsafe extern "C" fn configure_session_options(context: *mut c_void, options: *mut c_void, api: *const c_void,
         environment: *mut c_void, device: *const c_void) -> i32 {
         let context = unsafe { &mut *context.cast::<SessionOptionsContext>() };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
             anyhow::ensure!(!options.is_null() && !api.is_null(), "invalid Core native session options");
+            #[cfg(test)]
+            fail_options_for_test()?;
             let api = unsafe { &*api.cast::<ort_sys::OrtApi>() };
             if !device.is_null() {
                 anyhow::ensure!(!environment.is_null(), "invalid Core native environment");

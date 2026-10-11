@@ -400,7 +400,12 @@ fn index_loop_inner() -> Result<()> {
             let model = store.retrieval_model()?;
             let prepare_requested = INDEX_WORK.lock().map_err(|_| anyhow::anyhow!("index work lock poisoned"))?.prepare_mirror.is_some();
             let pending = store.index_missing(&model)?;
-            if !pending && !prepare_requested {
+            // An indexed library still needs the CPU container for its next query.
+            // Empty libraries wait for a write or explicit preparation instead of
+            // starting an unsolicited model download during status/restart.
+            let cpu_upgrade = model == "m3" && respire::MemoryTransport::count(&store)? > 0
+                && respire::model_install::cpu_model_preparation_needed()?;
+            if !pending && !prepare_requested && !cpu_upgrade {
                 return Ok(true);
             }
             let Some(_operation) = respire::model_progress::Operation::try_begin_background_index()? else {

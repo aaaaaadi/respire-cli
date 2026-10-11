@@ -1264,6 +1264,54 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Extract local coding-agent sessions (Codex, OpenCode, Claude Code, …) into rsrs memories
+    Extract {
+        /// List agent sources and whether a local session store exists
+        #[arg(long)]
+        targets: bool,
+        /// Force the interactive TUI picker (needs a TTY)
+        #[arg(long, conflicts_with_all = ["targets", "id", "all", "dry_run"])]
+        tui: bool,
+        /// Extract from every detected source (default when --id is omitted)
+        #[arg(long, conflicts_with = "id")]
+        all: bool,
+        /// Extract from one source (codex/opencode/claude/…); see --targets
+        #[arg(long)]
+        id: Option<String>,
+        /// Scan and summarize without writing any memory
+        #[arg(long)]
+        dry_run: bool,
+        /// Only sessions updated since this bound (today|yesterday|7d|YYYY-MM-DD)
+        #[arg(long)]
+        since: Option<String>,
+        /// Maximum sessions to import per source (newest first)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Filter by working-directory substring
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Filter by model/provider substring
+        #[arg(long)]
+        model: Option<String>,
+        /// Filter by session id substring
+        #[arg(long)]
+        session: Option<String>,
+        /// Memory kind for imported sessions
+        #[arg(long, default_value = "context")]
+        kind: String,
+        /// Importance: important (default) or trivial (diary)
+        #[arg(long, default_value = "important")]
+        importance: String,
+        /// Optional pre-attach parent (id / tree / anchor title); omit to ingest as roots for a later tidy
+        #[arg(long, default_value = "")]
+        parent: String,
+        /// Include subagent/child sessions (hidden by default)
+        #[arg(long)]
+        include_subagents: bool,
+        /// Re-import sessions already recorded in the cursor
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1838,6 +1886,292 @@ fn run_tree_deepen(
         }
     }
     Ok(())
+}
+
+/// TUI/non-TUI dispatch for `extract`, kept out of `run_local_inner` to bound its stack frame.
+fn run_extract_command(command: &Command) -> Result<()> {
+    let Command::Extract {
+        targets,
+        tui,
+        all,
+        id,
+        dry_run,
+        since,
+        limit,
+        cwd,
+        model,
+        session,
+        kind,
+        importance,
+        parent,
+        include_subagents,
+        force,
+    } = command
+    else {
+        return Ok(());
+    };
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin())
+        && std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let filters_absent = since.is_none()
+        && limit.is_none()
+        && cwd.is_none()
+        && model.is_none()
+        && session.is_none()
+        && kind.as_str() == "context"
+        && importance.as_str() == "important"
+        && parent.is_empty()
+        && !*include_subagents
+        && !*force;
+    let bare = !*targets && id.is_none() && !*all && !*dry_run && filters_absent && !json_mode();
+    if *tui {
+        if !bare {
+            anyhow::bail!(
+                "--tui opens the interactive picker and cannot be combined with extraction options \
+                 (--since/--limit/--cwd/--model/--session/--kind/--importance/--parent/--include-subagents/--force) \
+                 or --json; drop --tui to apply them."
+            );
+        }
+        return respire::extract_tui::run();
+    }
+    if bare && interactive {
+        return respire::extract_tui::run();
+    }
+    run_extract(
+        *targets,
+        id.as_deref(),
+        *dry_run,
+        since.as_deref(),
+        *limit,
+        cwd.as_deref(),
+        model.as_deref(),
+        session.as_deref(),
+        kind,
+        importance,
+        parent,
+        *include_subagents,
+        *force,
+    )
+}
+
+/// Extract local coding-agent sessions into rsrs memories (see `extract --help`).
+fn run_extract(
+    targets_only: bool,
+    id: Option<&str>,
+    dry_run: bool,
+    since: Option<&str>,
+    limit: Option<usize>,
+    cwd: Option<&str>,
+    model_filter: Option<&str>,
+    session_filter: Option<&str>,
+    kind: &str,
+    importance: &str,
+    parent: &str,
+    include_subagents: bool,
+    force: bool,
+) -> Result<()> {
+    if !matches!(importance, "important" | "trivial") {
+        anyhow::bail!("--importance must be important or trivial");
+    }
+    if !matches!(
+        kind,
+        "context" | "decision" | "preference" | "task" | "emotion" | "time" | "skill" | "knowledge"
+    ) {
+        anyhow::bail!("--kind must be context|decision|preference|task|emotion|time|skill|knowledge");
+    }
+    if targets_only {
+        let sources = respire::session_import::source_list();
+        let installed = sources.iter().filter(|source| source.installed).count();
+        let items = sources
+            .iter()
+            .map(|source| {
+                OutputItem::new(
+                    source.id.clone(),
+                    if source.installed { OutputStatus::Ok } else { OutputStatus::Skip },
+                    if source.installed {
+                        format!("{} ({} root(s))", source.name, source.roots.len())
+                    } else {
+                        format!("{} not found", source.name)
+                    },
+                )
+            })
+            .collect();
+        let details = serde_json::Value::Array(
+            sources
+                .iter()
+                .map(|source| {
+                    serde_json::json!({
+                        "id": source.id,
+                        "name": source.name,
+                        "installed": source.installed,
+                        "roots": source.roots.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+                    })
+                })
+                .collect(),
+        );
+        let mut result = ResultEnvelope::new(
+            "extract",
+            OutputStatus::Ok,
+            serde_json::json!({"count": sources.len(), "installed": installed}),
+            items,
+        );
+        result.details = details;
+        result.actions.push("extract --all --dry-run".into());
+        return emit_result(result);
+    }
+
+    let scan_options = respire::session_import::ScanOptions {
+        roots: Vec::new(),
+        cwd: cwd.map(str::to_owned),
+        model: model_filter.map(str::to_owned),
+        since: match since {
+            None => None,
+            Some(value) => Some(
+                respire::session_import::scan_util::date_bound(value, false).ok_or_else(|| {
+                    respire_app::input_error::InputError(format!(
+                        "invalid --since '{value}': use today|yesterday|Nd|YYYY-MM-DD"
+                    ))
+                })?,
+            ),
+        },
+        until: None,
+        limit: limit.unwrap_or(200),
+        include_subagents,
+    };
+
+    let scanners: Vec<Box<dyn respire::session_import::SessionScanner>> = match id {
+        Some(id) => vec![respire::session_import::find_scanner(id).ok_or_else(|| {
+            anyhow::anyhow!("unknown platform '{id}' (run `rsrs extract --targets`)")
+        })?],
+        None => respire::session_import::scanners()
+            .into_iter()
+            .filter(|scanner| !scanner.roots().is_empty())
+            .collect(),
+    };
+    if scanners.is_empty() {
+        return emit_result(ResultEnvelope::new(
+            "extract",
+            OutputStatus::Skip,
+            serde_json::json!({"reason": "no installed session stores detected"}),
+            Vec::new(),
+        ));
+    }
+
+    let mut sessions = Vec::new();
+    for scanner in &scanners {
+        let label = format!("Scanning {} sessions", scanner.name());
+        progress::phase(&label, &label);
+        let mut found = scanner.scan(&scan_options);
+        found.retain(|session| scan_options.matches(session));
+        if let Some(filter) = session_filter {
+            found.retain(|session| session.id.contains(filter));
+        }
+        sessions.extend(found);
+    }
+    let sessions = respire::session_import::dedupe(sessions);
+    let discovered = sessions.len();
+    let mut cursor = respire::session_import::Cursor::load();
+    let fresh: Vec<respire::session_import::Session> = sessions
+        .into_iter()
+        .filter(|session| force || !cursor.is_imported(session))
+        .collect();
+    let not_imported = fresh.len();
+    let pending = respire::session_import::cap_per_platform(fresh, scan_options.limit);
+
+    let convert_options = respire::session_import::ConvertOptions {
+        kind: respire::Kind::from_str(kind),
+        importance: importance.to_owned(),
+        parent: String::new(),
+        user: respire::service::current_user(),
+        device: respire::service::device_tag(),
+        project: String::new(),
+    };
+    let mut entries: Vec<respire::MemoryEntry> = pending
+        .iter()
+        .map(|session| respire::session_import::session_entry(session, &convert_options))
+        .collect();
+
+    let platform_counts: Vec<(String, usize)> = scanners
+        .iter()
+        .map(|scanner| {
+            let id = scanner.id();
+            (
+                id.to_owned(),
+                pending.iter().filter(|session| session.platform == id).count(),
+            )
+        })
+        .filter(|(_, count)| *count > 0)
+        .collect();
+    let items: Vec<OutputItem> = platform_counts
+        .iter()
+        .map(|(id, count)| OutputItem::new(id.clone(), OutputStatus::Ok, format!("{count} session(s)")))
+        .collect();
+
+    if dry_run {
+        let mut result = ResultEnvelope::new(
+            "extract",
+            OutputStatus::Ok,
+            serde_json::json!({
+                "dry_run": true,
+                "scanned": discovered,
+                "pending": entries.len(),
+                "skipped_imported": discovered - not_imported,
+                "deferred_by_limit": not_imported - pending.len(),
+                "by_platform": platform_counts.iter().map(|(id, count)| serde_json::json!({"id": id, "count": count})).collect::<Vec<_>>(),
+            }),
+            items,
+        );
+        result.details = serde_json::json!({
+            "sessions": pending.iter().map(|session| session.to_json()).collect::<Vec<_>>(),
+        });
+        result.actions.push("extract --all".into());
+        return emit_result(result);
+    }
+
+    if entries.is_empty() {
+        let mut result = ResultEnvelope::new(
+            "extract",
+            OutputStatus::Skip,
+            serde_json::json!({"imported": 0, "scanned": discovered, "skipped_imported": discovered - not_imported, "deferred_by_limit": not_imported}),
+            Vec::new(),
+        );
+        if discovered > 0 && not_imported == 0 {
+            result.actions.push("extract --all --force".into());
+        }
+        return emit_result(result);
+    }
+
+    progress::phase("Embedding and storing memories", "Embedding and storing memories");
+    let outcome = respire::session_import::import_entries(
+        &mut entries,
+        parent,
+        |done, total| progress::phase_count("写入记忆", "Storing memories", done, total),
+        |start, completed| {
+            for (offset, ok) in completed.iter().enumerate() {
+                if *ok {
+                    cursor.mark(&pending[start + offset]);
+                }
+            }
+            cursor.save()?;
+            Ok(())
+        },
+    )?;
+    let imported = outcome.imported;
+
+    let mut result = ResultEnvelope::new(
+        "extract",
+        OutputStatus::Ok,
+        serde_json::json!({
+            "imported": imported,
+            "scanned": discovered,
+            "deferred_by_limit": not_imported - pending.len(),
+            "by_platform": platform_counts.iter().map(|(id, count)| serde_json::json!({"id": id, "count": count})).collect::<Vec<_>>(),
+        }),
+        items,
+    );
+    result
+        .actions
+        .push("tidy imported roots: rsrs list --since-resort --json".into());
+    emit_result(result)
 }
 
 /// Inject-source distribution: no args injects every detected host; --targets lists status; --id injects/uninstalls.
@@ -5208,6 +5542,7 @@ fn is_write_command(c: &Command) -> bool {
             | Command::Resort { .. }
             | Command::Split { .. }
             | Command::Import { .. }
+            | Command::Extract { .. }
             | Command::Repack
             | Command::RootCreate { .. }
             | Command::TreeCure { .. }
@@ -5908,6 +6243,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
         }) => return run_tree_cure(*top, id.as_deref(), parent.as_deref(), *auto, *min),
         Some(Command::TreeFloat { go, min }) => return run_tree_float(*go, *min),
         Some(Command::Split { id, go, spec }) => return run_split(id, *go, spec.as_deref()),
+        Some(command @ Command::Extract { .. }) => return run_extract_command(command),
         Some(Command::Inject {
             targets,
             id,
@@ -8344,6 +8680,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
         | Command::TreeCure { .. }
         | Command::TreeFloat { .. }
         | Command::Split { .. }
+        | Command::Extract { .. }
         | Command::Inject { .. }
         | Command::TreeDeepen { .. }
         | Command::Config { .. }

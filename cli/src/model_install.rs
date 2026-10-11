@@ -95,6 +95,7 @@ pub fn prepare_m3_for_index() -> Result<()> {
     for path in candidates {
         if file_valid(&path.join("tokenizer.json"), TOKENIZER_SHA256)?
             && m3_model_valid(&path.join("onnx/model_quantized.onnx"))? {
+            prepare_cpu_ort(&path)?;
             return Ok(());
         }
     }
@@ -147,7 +148,43 @@ fn install_m3_inner(mirror: Option<&str>) -> Result<InstallReport> {
     std::fs::remove_dir_all(&tmp)?;
     anyhow::ensure!(model_files_present(&dest) && m3_model_valid(&dest.join("onnx/model_quantized.onnx"))?, "BGE-M3 quantized install is incomplete");
     write_model_notices(&dest, "m3", MODEL_REPO, MODEL_REVISION)?;
-    Ok(InstallReport { dir: dest, skipped })
+    let cpu_ready = prepare_cpu_ort(&dest)?;
+    Ok(InstallReport { dir: dest, skipped: skipped && cpu_ready })
+}
+
+/// Runs outside the Core worker on the existing cancellable model-operation thread.
+/// Keep ONNX for GPU/NPU. A CPU container upgrade does not change stored vectors or index schema.
+fn prepare_cpu_ort(directory: &Path) -> Result<bool> {
+    use crate::memory::bge;
+    if !bge::cpu_owned_mode(crate::memory::onnx::configured_engine()?)? { return Ok(true); }
+    if file_valid(&bge::cpu_ort_path(directory), bge::CPU_ORT_SHA256)? { return Ok(true); }
+    // Legacy packaged/system model directories may be read-only. Upgrade into the user cache.
+    let dest = bge::cpu_ort_cache_path();
+    if file_valid(&dest, bge::CPU_ORT_SHA256)? { return Ok(true); }
+    let parent = dest.parent().context("CPU model cache directory missing")?;
+    std::fs::create_dir_all(parent)?;
+    let partial = parent.join(format!(".download-{}.ort", bge::CPU_ORT_REVISION));
+    if !file_valid(&partial, bge::CPU_ORT_SHA256)? {
+        download_verified(bge::CPU_ORT_URL, &partial, bge::CPU_ORT_SHA256)?;
+    }
+    anyhow::ensure!(partial.metadata()?.len() == bge::CPU_ORT_SIZE, "CPU model size mismatch");
+    replace_file(&partial, &dest)?;
+    bge::invalidate_cpu_ort_validation()?;
+    std::fs::write(parent.join("CPU-MODEL-SOURCE.json"), serde_json::to_vec_pretty(&serde_json::json!({
+        "container_version":bge::CPU_ORT_REVISION,"source_repository":MODEL_REPO,
+        "source_revision":MODEL_REVISION,"source_onnx_sha256":ONNX_SHA256,
+        "cpu_ort_sha256":bge::CPU_ORT_SHA256,"url":bge::CPU_ORT_URL,
+        "ort_version":"1.28.0","graph_optimization":99,"weights_changed":false
+    }))?)?;
+    Ok(false)
+}
+
+pub fn cpu_model_preparation_needed() -> Result<bool> {
+    if !crate::memory::bge::cpu_owned_mode(crate::memory::onnx::configured_engine()?)? { return Ok(false); }
+    Ok(match crate::memory::bge::resolve_model_dir() {
+        Ok(directory) => !crate::memory::bge::cpu_ort_present(&directory)?,
+        Err(_) => true,
+    })
 }
 
 pub struct UninstallReport {
@@ -251,6 +288,7 @@ fn file_valid(path: &Path, expected: &str) -> Result<bool> {
         return Ok(false);
     }
     if expected == ONNX_SHA256 && path.metadata()?.len() != ONNX_SIZE { return Ok(false); }
+    if expected == crate::memory::bge::CPU_ORT_SHA256 && path.metadata()?.len() != crate::memory::bge::CPU_ORT_SIZE { return Ok(false); }
     let actual = sha256_file(path)?;
     Ok(actual.eq_ignore_ascii_case(expected))
 }

@@ -215,6 +215,7 @@ pub mod bge {
         fn model_name(&self) -> &str { &self.model }
         fn dims(&self) -> usize { self.dims }
     }
+    pub use crate::cpu_model::{CPU_ORT_REVISION, CPU_ORT_NAME, CPU_ORT_SHA256, CPU_ORT_SIZE, CPU_ORT_URL, cpu_owned_mode, cpu_ort_cache_path, cpu_ort_path, cpu_ort_present, invalidate_cpu_ort_validation};
     // Installation paths are public infrastructure and use the Respire profile.
     pub fn default_user_model_dir() -> PathBuf {
         crate::env::var("RSRS_DATA_DIR").ok()
