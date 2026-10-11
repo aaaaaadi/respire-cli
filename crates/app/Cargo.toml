@@ -10,6 +10,7 @@ publish = false
 
 [features]
 native-fault-tests = ["respire_core_sdk/native-fault-tests"]
+cpu-owned-ort-experiment = ["respire_core_sdk/cpu-owned-ort-experiment"]
 
 [dependencies]
 crossterm = "0.28"
