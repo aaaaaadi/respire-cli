@@ -133,6 +133,15 @@ pub fn phase(zh: &str, en: &str) {
     });
 }
 
+/// Determinate variant of [`phase`]: appends `done/total (pct%)`.
+pub fn phase_count(zh: &str, en: &str, done: usize, total: usize) {
+    let percent = if total == 0 { 100 } else { done.saturating_mul(100) / total };
+    phase(
+        &format!("{zh} {done}/{total} ({percent}%)"),
+        &format!("{en} {done}/{total} ({percent}%)"),
+    );
+}
+
 pub fn remote_id() -> Option<String> {
     CURRENT.with(|current| current.borrow().as_ref().map(|entry| {
         phase("连接 runtime；等待命令结果", "Connecting to runtime; waiting for command result");
