@@ -23,6 +23,10 @@ struct CursorFile {
     /// `platform:id` → last imported `updated_at` (`*` = unknown timestamp).
     #[serde(default)]
     entries: BTreeMap<String, String>,
+    /// Content versions for SQLite sources; legacy timestamp-only cursors get
+    /// one refresh to establish a version that can see WAL changes.
+    #[serde(default)]
+    fingerprints: BTreeMap<String, String>,
 }
 
 /// Persistent set of already-imported sessions.
@@ -55,17 +59,26 @@ impl Cursor {
 
     /// Whether the session is already imported and unchanged since.
     pub fn is_imported(&self, session: &Session) -> bool {
+        if let Some(current) = session.content_fingerprint() {
+            return self.data.fingerprints.get(&session.key()) == Some(&current);
+        }
         let Some(stored) = self.data.entries.get(&session.key()) else {
             return false;
         };
         if stored == "*" {
-            return session.updated_at.as_deref().map_or(true, |stamp| stamp.is_empty());
+            return session
+                .updated_at
+                .as_deref()
+                .map_or(true, |stamp| stamp.is_empty());
         }
         let current = session.updated_at.clone().unwrap_or_default();
         if current.is_empty() {
             return true;
         }
-        match (scan_util::parse_stamp(&current), scan_util::parse_stamp(stored)) {
+        match (
+            scan_util::parse_stamp(&current),
+            scan_util::parse_stamp(stored),
+        ) {
             (Some(current), Some(previous)) => current <= previous,
             _ => stored == &current,
         }
@@ -73,6 +86,9 @@ impl Cursor {
 
     /// Record a session as imported.
     pub fn mark(&mut self, session: &Session) {
+        if let Some(fingerprint) = session.content_fingerprint() {
+            self.data.fingerprints.insert(session.key(), fingerprint);
+        }
         let stamp = session
             .updated_at
             .clone()
@@ -103,6 +119,7 @@ impl Cursor {
     /// Drop all tracked sessions.
     pub fn clear(&mut self) {
         self.data.entries.clear();
+        self.data.fingerprints.clear();
     }
 }
 
@@ -159,5 +176,38 @@ mod tests {
 
         let stamped = session("t3", Some("2026-10-02T00:00:00Z"));
         assert!(!cursor.is_imported(&stamped));
+    }
+
+    #[test]
+    fn content_cursor_migrates_legacy_marks_and_ignores_checkpoint_time() {
+        let mut cursor = Cursor {
+            path: "ignored.json".into(),
+            data: CursorFile::default(),
+        };
+        let mut current = session("wal", Some("2026-10-01T00:00:00Z"));
+        current.platform = "hermes".into();
+        current.first_user_message = "synthetic first request".into();
+        cursor
+            .data
+            .entries
+            .insert(current.key(), current.updated_at.clone().unwrap());
+        assert!(
+            !cursor.is_imported(&current),
+            "legacy mtime mark needs one refresh"
+        );
+        cursor.mark(&current);
+        assert!(cursor.is_imported(&current));
+        current.updated_at = Some("2026-10-02T00:00:00Z".into());
+        current.created_at = current.updated_at.clone();
+        assert!(
+            cursor.is_imported(&current),
+            "checkpoint alone changes no summary"
+        );
+        current.last_user_message = "new request".into();
+        assert!(!cursor.is_imported(&current));
+        cursor.mark(&current);
+        assert!(cursor.is_imported(&current));
+        cursor.clear();
+        assert!(!cursor.is_imported(&current));
     }
 }

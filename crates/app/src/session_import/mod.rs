@@ -25,7 +25,7 @@ pub mod platforms;
 pub mod scan_util;
 pub mod store;
 
-pub use convert::{session_entry, scrub, ConvertOptions};
+pub use convert::{scrub, session_entry, ConvertOptions};
 pub use cursor::Cursor;
 pub use store::import_entries;
 
@@ -48,6 +48,37 @@ pub struct Session {
 }
 
 impl Session {
+    /// Version of the imported summary for SQLite sources without a trustworthy
+    /// per-session update time. Exclude database file timestamps: checkpoints and
+    /// writes to other sessions must not re-import an unchanged summary.
+    pub(crate) fn uses_content_cursor(&self) -> bool {
+        matches!(
+            self.platform.as_str(),
+            "kilo-cli" | "hermes" | "goose" | "crush" | "cursor-cli"
+        )
+    }
+
+    pub(crate) fn content_fingerprint(&self) -> Option<String> {
+        if !self.uses_content_cursor() {
+            return None;
+        }
+        use sha2::{Digest, Sha256};
+        let summary = json!([
+            self.cwd,
+            self.provider,
+            self.model,
+            self.first_user_message,
+            self.last_user_message,
+            self.usage,
+            self.parent_id,
+            self.agent,
+        ]);
+        Some(format!(
+            "{:x}",
+            Sha256::digest(summary.to_string().as_bytes())
+        ))
+    }
+
     /// Stable identity used for cross-run dedup (`platform:id`).
     pub fn key(&self) -> String {
         format!("{}:{}", self.platform, self.id)
@@ -118,7 +149,12 @@ impl ScanOptions {
                 return false;
             }
         }
-        if let Some(model) = self.model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(model) = self
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             let hay = format!(
                 "{} {}",
                 session.model.as_deref().unwrap_or_default(),
@@ -132,7 +168,12 @@ impl ScanOptions {
             .updated_at
             .as_deref()
             .and_then(scan_util::parse_stamp)
-            .or_else(|| session.created_at.as_deref().and_then(scan_util::parse_stamp));
+            .or_else(|| {
+                session
+                    .created_at
+                    .as_deref()
+                    .and_then(scan_util::parse_stamp)
+            });
         if (self.since.is_some() || self.until.is_some()) && stamp.is_none() {
             return false;
         }
@@ -185,7 +226,9 @@ pub fn scanners() -> Vec<Box<dyn SessionScanner>> {
 /// Find one scanner by id (case-insensitive, with a few common aliases).
 pub fn find_scanner(id: &str) -> Option<Box<dyn SessionScanner>> {
     let wanted = platforms::normalize_alias(id);
-    scanners().into_iter().find(|scanner| scanner.id() == wanted)
+    scanners()
+        .into_iter()
+        .find(|scanner| scanner.id() == wanted)
 }
 
 /// Current machine's source list, for `extract --targets`.
@@ -281,7 +324,10 @@ mod tests {
         assert!(!opts.matches(&s), "cwd mismatch");
         s.cwd = Some("/work/respire".into());
         s.agent = Some("Sisyphus".into());
-        assert!(opts.matches(&s), "agent label alone is not a child indicator");
+        assert!(
+            opts.matches(&s),
+            "agent label alone is not a child indicator"
+        );
     }
 
     #[test]
@@ -302,7 +348,11 @@ mod tests {
             2,
         );
         assert_eq!(out.len(), 3);
-        let a: Vec<&str> = out.iter().filter(|s| s.platform == "a").map(|s| s.id.as_str()).collect();
+        let a: Vec<&str> = out
+            .iter()
+            .filter(|s| s.platform == "a")
+            .map(|s| s.id.as_str())
+            .collect();
         assert_eq!(a, vec!["2", "3"]);
     }
 

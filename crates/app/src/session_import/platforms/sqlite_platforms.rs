@@ -25,7 +25,8 @@ use crate::session_import::{scan_util, ScanOptions, Session};
 
 /// VS Code extension id whose `globalStorage` subdirectory holds the DB.
 const KODU_APP: &str = "kodu-ai.claude-dev-experimental";
-const KODU_TASKS_SQL: &str = "select id, name, dir_absolute_path, created_at, updated_at, tokens_in, \
+const KODU_TASKS_SQL: &str =
+    "select id, name, dir_absolute_path, created_at, updated_at, tokens_in, \
      tokens_out, cache_reads, cache_writes, cost from tasks";
 const KODU_MESSAGES_SQL: &str = "select role, content, model_id, started_at, finished_at, tokens_in, \
      tokens_out, cache_reads, cache_writes, cost from messages where task_id = ? order by started_at";
@@ -214,7 +215,9 @@ fn kodu_messages(connection: &Connection, task_id: &str) -> Vec<Vec<SqlVal>> {
                 Ok(ValueRef::Null) | Err(_) => SqlVal::Null,
                 Ok(ValueRef::Integer(value)) => SqlVal::Int(value),
                 Ok(ValueRef::Real(value)) => SqlVal::Real(value),
-                Ok(ValueRef::Text(text)) => SqlVal::Text(String::from_utf8_lossy(text).into_owned()),
+                Ok(ValueRef::Text(text)) => {
+                    SqlVal::Text(String::from_utf8_lossy(text).into_owned())
+                }
                 Ok(ValueRef::Blob(_)) => SqlVal::Null,
             });
         }
@@ -298,7 +301,10 @@ fn cursor_blobs(connection: &Connection) -> Vec<Option<Vec<u8>>> {
 /// Decode a raw blob as UTF-8 JSON object (`None` when either step fails).
 fn json_blob(value: &[u8]) -> Option<Map<String, Value>> {
     let text = std::str::from_utf8(value).ok()?;
-    serde_json::from_str::<Value>(text).ok()?.as_object().cloned()
+    serde_json::from_str::<Value>(text)
+        .ok()?
+        .as_object()
+        .cloned()
 }
 
 /// `_content`: unwrap JSON text/parts, falling back to the raw string.
@@ -358,4 +364,42 @@ fn cell_text(row: &[SqlVal], index: usize) -> Option<String> {
 
 fn cell_int(row: &[SqlVal], index: usize) -> Option<i64> {
     row.get(index).and_then(SqlVal::as_i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session_import::Cursor;
+
+    #[test]
+    fn cursor_wal_append_and_edit_change_content_cursor() -> anyhow::Result<()> {
+        let isolate = crate::test_lock::Isolate::new()?;
+        let path = isolate.path().join("fixture-session").join("store.db");
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE blobs(data BLOB);",
+        )?;
+        let first = br#"{"role":"user","content":"first request"}"#;
+        connection.execute("INSERT INTO blobs VALUES (?1)", [first.as_slice()])?;
+        connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        let initial = cursor_db(&path);
+        let mut cursor = Cursor::load();
+        cursor.mark(&initial[0]);
+        let newer = br#"{"role":"user","content":"new request"}"#;
+        connection.execute("INSERT INTO blobs VALUES (?1)", [newer.as_slice()])?;
+        let updated = cursor_db(&path);
+        assert_eq!(updated[0].last_user_message, "new request");
+        assert_eq!(updated[0].updated_at, initial[0].updated_at);
+        assert!(!cursor.is_imported(&updated[0]));
+        cursor.mark(&updated[0]);
+        let edit = br#"{"role":"user","content":"edited request"}"#;
+        connection.execute("UPDATE blobs SET data=?1 WHERE rowid=2", [edit.as_slice()])?;
+        let edited = cursor_db(&path);
+        assert!(!cursor.is_imported(&edited[0]));
+        cursor.mark(&edited[0]);
+        connection.execute("DELETE FROM blobs WHERE rowid=2", [])?;
+        assert!(!cursor.is_imported(&cursor_db(&path)[0]));
+        Ok(())
+    }
 }

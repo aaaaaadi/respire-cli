@@ -67,7 +67,14 @@ pub fn session_entry(session: &Session, opts: &ConvertOptions) -> MemoryEntry {
         computer: opts.device.clone(),
         project: project_of(session, &opts.project),
         created_at,
-        updated_at,
+        // These SQLite sources have no reliable per-session modification stamp:
+        // WAL commits can leave the main file mtime unchanged. Their cursor uses
+        // content instead, and a fresh import needs a fresh LWW write stamp.
+        updated_at: if session.uses_content_cursor() {
+            now
+        } else {
+            updated_at
+        },
         emotion: -1.0,
         parent_id: opts.parent.clone(),
         importance: opts.importance.clone(),
@@ -138,7 +145,10 @@ pub fn build_body(session: &Session) -> String {
     }
     let last_raw = session.last_user_message.trim();
     if !last_raw.is_empty() && last_raw != first_raw {
-        body.push_str(&format!("\n末次请求：{}", truncate_chars(&scrub(last_raw), 400)));
+        body.push_str(&format!(
+            "\n末次请求：{}",
+            truncate_chars(&scrub(last_raw), 400)
+        ));
     }
 
     body.push_str(&format!("\n【后果】会话更新于 {}。", scrub(updated)));
@@ -286,13 +296,9 @@ const SECRET_KEYS: [&str; 17] = [
 ];
 
 fn redact_line(line: &str) -> String {
-    if let Some(masked) = redact_key_value(line) {
-        return masked;
-    }
-    if let Some(masked) = redact_bearer(line) {
-        return masked;
-    }
-    redact_prefixed_tokens(line)
+    let masked = redact_key_value(line).unwrap_or_else(|| line.to_owned());
+    let masked = redact_bearer(&masked);
+    redact_prefixed_tokens(&masked)
 }
 
 /// Mask the value when a secret keyword is followed (after spaces/tabs and an
@@ -308,7 +314,10 @@ fn redact_key_value(line: &str) -> Option<String> {
             let pos = from + relative;
             let after = &line[pos + key.len()..];
             let trimmed = after.trim_start_matches([' ', '\t', '"', '\'']);
-            let separator = trimmed.chars().next().filter(|c| matches!(*c, '=' | ':' | '：'));
+            let separator = trimmed
+                .chars()
+                .next()
+                .filter(|c| matches!(*c, '=' | ':' | '：'));
             let index = if let Some(separator) = separator {
                 line.len() - (trimmed.len() - separator.len_utf8())
             } else if line[..pos].ends_with("--") {
@@ -334,30 +343,43 @@ fn redact_key_value(line: &str) -> Option<String> {
 }
 
 /// Mask the token in `Bearer <token>` even without a `=`/`:` separator.
-fn redact_bearer(line: &str) -> Option<String> {
-    let lower = line.to_ascii_lowercase();
-    let pos = lower.find("bearer")?;
-    let rest = &line[pos + "bearer".len()..];
-    let space = rest.len() - rest.trim_start_matches([' ', '\t']).len();
-    if space == 0 {
-        return None;
+fn redact_bearer(line: &str) -> String {
+    let mut result = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(pos) = rest.to_ascii_lowercase().find("bearer") {
+        let end = pos + "bearer".len();
+        result.push_str(&rest[..end]);
+        rest = &rest[end..];
+        let space = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+        let token = &rest[space..];
+        let token_len = token
+            .find(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | ',' | ';' | ')' | ']'))
+            .unwrap_or(token.len());
+        if space > 0 && token_len >= 8 {
+            result.push_str(&rest[..space]);
+            result.push_str("***");
+            rest = &rest[space + token_len..];
+        }
     }
-    let token = &rest[space..];
-    let token_len = token.find(char::is_whitespace).unwrap_or(token.len());
-    if token_len < 8 {
-        return None;
-    }
-    Some(format!(
-        "{}{}***{}",
-        &line[..pos + "bearer".len()],
-        &rest[..space],
-        &rest[space + token_len..]
-    ))
+    result.push_str(rest);
+    result
 }
 
 const TOKEN_PREFIXES: [&str; 14] = [
-    "sk-", "ghp_", "gho_", "ghs_", "ghu_", "ghr_", "github_pat_", "glpat-", "xoxa-", "xoxb-", "xoxp-",
-    "AKIA", "AIza", "eyJ",
+    "sk-",
+    "ghp_",
+    "gho_",
+    "ghs_",
+    "ghu_",
+    "ghr_",
+    "github_pat_",
+    "glpat-",
+    "xoxa-",
+    "xoxb-",
+    "xoxp-",
+    "AKIA",
+    "AIza",
+    "eyJ",
 ];
 
 fn redact_prefixed_tokens(line: &str) -> String {
@@ -380,7 +402,12 @@ fn redact_prefixed_tokens(line: &str) -> String {
         let after = &rest[idx..];
         let run: String = after[prefix.len()..]
             .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .take_while(|c| {
+                c.is_ascii_alphanumeric()
+                    || *c == '-'
+                    || *c == '_'
+                    || (prefix == "eyJ" && *c == '.')
+            })
             .collect();
         if run.len() >= 8 {
             result.push_str(prefix);
@@ -427,7 +454,10 @@ mod tests {
         assert_eq!(entry.project, "respire");
         assert_eq!(entry.importance, "important");
         assert!(entry.title.starts_with("Codex 会话"));
-        assert_eq!(entry.tags, vec!["session-import".to_owned(), "codex".to_owned()]);
+        assert_eq!(
+            entry.tags,
+            vec!["session-import".to_owned(), "codex".to_owned()]
+        );
     }
 
     #[test]
@@ -450,8 +480,14 @@ mod tests {
 
     #[test]
     fn redact_only_when_keyword_adjoins_separator() {
-        assert_eq!(scrub("会话更新于 2026-10-01T02:03:00Z"), "会话更新于 2026-10-01T02:03:00Z");
-        assert_eq!(scrub("fix the token refresh bug: now"), "fix the token refresh bug: now");
+        assert_eq!(
+            scrub("会话更新于 2026-10-01T02:03:00Z"),
+            "会话更新于 2026-10-01T02:03:00Z"
+        );
+        assert_eq!(
+            scrub("fix the token refresh bug: now"),
+            "fix the token refresh bug: now"
+        );
         assert!(scrub("token=abcd1234").contains("***"));
         assert!(scrub("api_key: abcd1234").contains("***"));
         assert!(scrub("密码：hunter2").contains("***"));
@@ -498,5 +534,77 @@ mod tests {
         s.first_user_message = "password=hunter2 now continue".into();
         let entry = session_entry(&s, &ConvertOptions::default());
         assert!(!entry.title.contains("hunter2"));
+    }
+
+    #[test]
+    fn mixed_and_repeated_credentials_are_scrubbed_in_every_projection() {
+        let secrets = [
+            "ghp_SYNTHETIC1234567890",
+            "sk-SYNTHETIC1234567890",
+            "SYNTHETIC_BEARER_A",
+            "SYNTHETIC_BEARER_B",
+            "fixture-password",
+        ];
+        let lines = [
+            format!("{} password={}", secrets[0], secrets[4]),
+            format!("{} {} password={}", secrets[0], secrets[1], secrets[4]),
+            format!("Bearer {} Bearer {}", secrets[2], secrets[3]),
+            format!(
+                r#"{{"a":"Bearer {}","b":"Bearer {}"}}"#,
+                secrets[2], secrets[3]
+            ),
+            format!("Bearer short; bearer {}; BEARER {}", secrets[2], secrets[3]),
+            format!(
+                r#"{{"note":"{}", "password":"{}", "other":"{}"}}"#,
+                secrets[0], secrets[4], secrets[1]
+            ),
+            format!(
+                "Bearer {} {} --password {}",
+                secrets[2], secrets[0], secrets[4]
+            ),
+            format!(
+                "{}\nBearer {}\npassword={}",
+                secrets[0], secrets[2], secrets[4]
+            ),
+        ];
+        for line in lines {
+            let mut session = sample();
+            session.first_user_message = line.clone();
+            session.last_user_message = line.clone();
+            let entry = session_entry(&session, &ConvertOptions::default());
+            for output in [
+                scrub(&line),
+                entry.title,
+                entry.content,
+                session.to_json().to_string(),
+            ] {
+                for secret in secrets {
+                    assert!(!output.contains(secret), "credential leaked from {line:?}");
+                }
+            }
+        }
+        let prose = "fix the token refresh bug: now; discuss bearer";
+        assert_eq!(scrub(prose), prose);
+        let jwt = "eyJSYNTHETIC_HEADER.SYNTHETIC_PAYLOAD.SYNTHETIC_SIGNATURE";
+        let scrubbed = scrub(&format!("{jwt} {}", secrets[0]));
+        assert!(!scrubbed.contains("SYNTHETIC_PAYLOAD"));
+        assert!(!scrubbed.contains("SYNTHETIC_SIGNATURE"));
+    }
+
+    #[test]
+    fn content_versioned_sqlite_import_gets_fresh_write_timestamp() {
+        let mut session = sample();
+        session.platform = "hermes".into();
+        session.updated_at = Some("2020-01-01T00:00:00.000Z".into());
+        let entry = session_entry(&session, &ConvertOptions::default());
+        assert!(
+            super::super::scan_util::parse_stamp(&entry.updated_at).unwrap()
+                > super::super::scan_util::parse_stamp(session.updated_at.as_deref().unwrap())
+                    .unwrap()
+        );
+        assert!(
+            entry.content.contains("2020-01-01"),
+            "source time remains in body"
+        );
     }
 }

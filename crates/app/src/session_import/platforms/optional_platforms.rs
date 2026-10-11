@@ -78,7 +78,13 @@ fn goose_roots() -> Vec<PathBuf> {
     scan_util::existing(
         [
             home_join(&[".local", "share", "goose", "sessions", "sessions.db"]),
-            home_join(&["Library", "Application Support", "goose", "sessions", "sessions.db"]),
+            home_join(&[
+                "Library",
+                "Application Support",
+                "goose",
+                "sessions",
+                "sessions.db",
+            ]),
         ]
         .into_iter()
         .flatten(),
@@ -111,15 +117,27 @@ fn home_join(parts: &[&str]) -> Option<PathBuf> {
 // ── Scanners ──
 
 fn scan_kilo_cli(opts: &ScanOptions) -> Vec<Session> {
-    message_table_sessions("kilo-cli", "message", database_paths(kilo_roots(), "kilo.db", opts))
+    message_table_sessions(
+        "kilo-cli",
+        "message",
+        database_paths(kilo_roots(), "kilo.db", opts),
+    )
 }
 
 fn scan_hermes(opts: &ScanOptions) -> Vec<Session> {
-    message_table_sessions("hermes", "messages", database_paths(hermes_roots(), "state.db", opts))
+    message_table_sessions(
+        "hermes",
+        "messages",
+        database_paths(hermes_roots(), "state.db", opts),
+    )
 }
 
 fn scan_goose(opts: &ScanOptions) -> Vec<Session> {
-    message_table_sessions("goose", "messages", database_paths(goose_roots(), "sessions.db", opts))
+    message_table_sessions(
+        "goose",
+        "messages",
+        database_paths(goose_roots(), "sessions.db", opts),
+    )
 }
 
 fn scan_crush(opts: &ScanOptions) -> Vec<Session> {
@@ -155,7 +173,10 @@ fn database_paths(defaults: Vec<PathBuf>, filename: &str, opts: &ScanOptions) ->
     let candidates = defaults
         .into_iter()
         .chain(opts.roots.iter().map(|root| root.join(filename)));
-    scan_util::recent(scan_util::existing(candidates), scan_util::MAX_PLATFORM_FILES)
+    scan_util::recent(
+        scan_util::existing(candidates),
+        scan_util::MAX_PLATFORM_FILES,
+    )
 }
 
 /// `select session_id, role, data, created_at` scanners, one session per id.
@@ -241,7 +262,9 @@ fn group_message_rows(platform: &str, path: &Path, rows: &[Vec<SqlVal>]) -> Vec<
 fn zed_sessions(path: &Path, rows: &[Vec<SqlVal>]) -> Vec<Session> {
     let mut sessions = Vec::new();
     for row in rows {
-        if row_text(row, 1).as_deref() != Some("json") || row_text(row, 4).as_deref() != Some("blob") {
+        if row_text(row, 1).as_deref() != Some("json")
+            || row_text(row, 4).as_deref() != Some("blob")
+        {
             continue;
         }
         let data = row_text(row, 2)
@@ -385,7 +408,11 @@ fn json_messages(data: Option<&Map<String, Value>>) -> Vec<Value> {
     };
     for key in ["messages", "turns", "entries"] {
         if let Some(Value::Array(items)) = data.get(key) {
-            return items.iter().filter(|item| item.is_object()).cloned().collect();
+            return items
+                .iter()
+                .filter(|item| item.is_object())
+                .cloned()
+                .collect();
         }
     }
     Vec::new()
@@ -411,7 +438,9 @@ fn stamp(row: &[SqlVal], index: usize) -> Option<String> {
 
 /// `_row_text`: string cells only (numbers, blobs and NULL become `None`).
 fn row_text(row: &[SqlVal], index: usize) -> Option<String> {
-    row.get(index).and_then(SqlVal::as_text).map(ToOwned::to_owned)
+    row.get(index)
+        .and_then(SqlVal::as_text)
+        .map(ToOwned::to_owned)
 }
 
 /// `_row_json`: parse a string cell as a JSON object.
@@ -428,4 +457,83 @@ fn parse_json_text(value: &str) -> Option<Value> {
 /// `file_time`: the store file's modification time as an ISO-8601 string.
 fn file_time(path: &Path) -> Option<String> {
     scan_util::file_mtime_iso(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session_import::Cursor;
+    use rusqlite::Connection;
+
+    #[test]
+    fn wal_summary_changes_reimport_but_other_sessions_and_checkpoint_do_not() -> anyhow::Result<()>
+    {
+        let isolate = crate::test_lock::Isolate::new()?;
+        for platform in ["kilo-cli", "hermes", "goose", "crush"] {
+            let path = isolate.path().join(format!("{platform}.db"));
+            let connection = Connection::open(&path)?;
+            connection.execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE messages(session_id TEXT, role TEXT, data TEXT, created_at INTEGER);
+                 INSERT INTO messages VALUES ('fixture-session','user','{\"content\":\"first request\"}',1700000000000);
+                 PRAGMA wal_checkpoint(TRUNCATE);"
+            )?;
+            let scan = || message_table_sessions(platform, "messages", vec![path.clone()]);
+            let first = scan();
+            assert_eq!(first.len(), 1);
+            let mut cursor = Cursor::load();
+            cursor.mark(&first[0]);
+            cursor.save()?;
+            let original_stamp = first[0].updated_at.clone();
+            connection.execute_batch(
+                "INSERT INTO messages VALUES ('fixture-session','user','{\"content\":\"new request\"}',1700000001000);"
+            )?;
+            let second = scan();
+            assert_eq!(second[0].last_user_message, "new request");
+            assert_eq!(
+                second[0].updated_at, original_stamp,
+                "main DB unchanged during WAL commit"
+            );
+            assert!(
+                !Cursor::load().is_imported(&second[0]),
+                "new message cannot be skipped"
+            );
+            cursor.mark(&second[0]);
+            cursor.save()?;
+            assert!(
+                Cursor::load().is_imported(&scan()[0]),
+                "retry skips unchanged summary"
+            );
+
+            connection.execute_batch("UPDATE messages SET data='{\"content\":\"edited request\"}' WHERE created_at=1700000001000;")?;
+            let edited = scan();
+            assert_eq!(edited[0].last_user_message, "edited request");
+            assert!(
+                !cursor.is_imported(&edited[0]),
+                "same-timestamp edit is visible"
+            );
+            cursor.mark(&edited[0]);
+            connection.execute_batch("DELETE FROM messages WHERE created_at=1700000001000;")?;
+            let deleted = scan();
+            assert_eq!(deleted[0].last_user_message, "first request");
+            assert!(
+                !cursor.is_imported(&deleted[0]),
+                "delete changes imported summary"
+            );
+            cursor.mark(&deleted[0]);
+            connection.execute_batch(
+                "INSERT INTO messages VALUES ('other-session','user','{\"content\":\"unrelated\"}',1700000002000);
+                 PRAGMA wal_checkpoint(TRUNCATE);"
+            )?;
+            let unchanged = scan()
+                .into_iter()
+                .find(|session| session.id == "fixture-session")
+                .unwrap();
+            assert!(
+                cursor.is_imported(&unchanged),
+                "unrelated writes/checkpoint must not replay this session"
+            );
+        }
+        Ok(())
+    }
 }

@@ -45,17 +45,38 @@ pub struct ImportOutcome {
 pub fn import_entries<F, G>(
     entries: &mut [MemoryEntry],
     parent_spec: &str,
-    mut progress: F,
-    mut on_commit: G,
+    progress: F,
+    on_commit: G,
 ) -> Result<ImportOutcome>
 where
     F: FnMut(usize, usize),
     G: FnMut(usize, &[bool]) -> Result<()>,
 {
     if entries.is_empty() {
-        return Ok(ImportOutcome { imported: 0, completed: Vec::new() });
+        return Ok(ImportOutcome {
+            imported: 0,
+            completed: Vec::new(),
+        });
     }
     let app = App::open()?;
+    import_entries_with_app(&app, entries, parent_spec, progress, on_commit, || {
+        app.auto_sync()
+    })
+}
+
+fn import_entries_with_app<F, G, H>(
+    app: &App,
+    entries: &mut [MemoryEntry],
+    parent_spec: &str,
+    mut progress: F,
+    mut on_commit: G,
+    auto_sync: H,
+) -> Result<ImportOutcome>
+where
+    F: FnMut(usize, usize),
+    G: FnMut(usize, &[bool]) -> Result<()>,
+    H: FnOnce(),
+{
     let spec = parent_spec.trim();
     if !spec.is_empty() {
         let all = app.store.all(false)?;
@@ -68,8 +89,12 @@ where
     }
     // Phase 1: seal every entry with no database write, so the slow embedding does
     // not hold the SQLite write lock.
-    let existing: HashMap<String, StoredMemory> =
-        app.store.all(true)?.into_iter().map(|memory| (memory.id.clone(), memory)).collect();
+    let existing: HashMap<String, StoredMemory> = app
+        .store
+        .all(true)?
+        .into_iter()
+        .map(|memory| (memory.id.clone(), memory))
+        .collect();
     let total = entries.len();
     let mut completed = vec![false; total];
     let mut sealed: Vec<Option<StoredMemory>> = Vec::with_capacity(total);
@@ -92,33 +117,248 @@ where
     }
     // Phase 2: write in committed chunks, so the write lock is held only briefly
     // per chunk and other writers can interleave between chunks.
-    let mut imported = 0usize;
-    let mut start = 0usize;
-    while start < total {
-        let end = (start + IMPORT_CHUNK).min(total);
-        let flags = app.store.write_transaction(|| {
-            let mut flags = vec![false; end - start];
-            for (offset, plan) in sealed[start..end].iter().enumerate() {
-                if let Some(stored) = plan {
-                    flags[offset] = app.store.put(stored)?;
+    let mut committed = false;
+    let result = (|| {
+        let mut imported = 0usize;
+        let mut start = 0usize;
+        while start < total {
+            let end = (start + IMPORT_CHUNK).min(total);
+            let flags = app.store.write_transaction(|| {
+                let mut flags = vec![false; end - start];
+                for (offset, plan) in sealed[start..end].iter().enumerate() {
+                    if let Some(stored) = plan {
+                        flags[offset] = app.store.put(stored)?;
+                    }
+                }
+                Ok(flags)
+            })?;
+            committed = true;
+            for (offset, wrote) in flags.iter().enumerate() {
+                if *wrote {
+                    completed[start + offset] = true;
+                    imported += 1;
                 }
             }
-            Ok(flags)
-        })?;
-        for (offset, wrote) in flags.iter().enumerate() {
-            if *wrote {
-                completed[start + offset] = true;
-                imported += 1;
-            }
+            on_commit(start, &completed[start..end])?;
+            start = end;
         }
-        if let Err(error) = on_commit(start, &completed[start..end]) {
-            // Committed chunks above still need a sync notification even if the
-            // caller's cursor write failed; mirrors the success path's auto_sync.
-            app.auto_sync();
-            return Err(error);
-        }
-        start = end;
+        Ok(ImportOutcome {
+            imported,
+            completed,
+        })
+    })();
+    // A later transaction or cursor error must not suppress notifications for
+    // earlier commits. Preserve the original Result after this single cleanup.
+    if committed {
+        auto_sync();
     }
-    app.auto_sync();
-    Ok(ImportOutcome { imported, completed })
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session_import::{session_entry, ConvertOptions, Session};
+    use std::cell::Cell;
+
+    fn fixture(count: usize) -> Result<(crate::test_lock::Isolate, App, Vec<MemoryEntry>)> {
+        let isolate = crate::test_lock::Isolate::new()?;
+        let app = App {
+            keys: crate::memory::SessionKeys::from_urk([7; 32])?,
+            store: crate::transport::local::LocalStore::open(&isolate.path().join("fixture.db"))?,
+            embedder: Box::new(crate::memory::search::HashingEmbedder::default()),
+        };
+        let entries = (0..count)
+            .map(|index| {
+                let mut entry = session_entry(
+                    &Session {
+                        platform: "fixture".into(),
+                        id: index.to_string(),
+                        first_user_message: "synthetic import regression".into(),
+                        updated_at: Some("2026-10-11T00:00:00.000Z".into()),
+                        ..Default::default()
+                    },
+                    &ConvertOptions::default(),
+                );
+                entry.id = format!("fixture-{index:03}");
+                entry
+            })
+            .collect();
+        Ok((isolate, app, entries))
+    }
+
+    fn inject_failure(isolate: &crate::test_lock::Isolate, index: usize) -> Result<()> {
+        let connection = rusqlite::Connection::open(isolate.path().join("fixture.db"))?;
+        connection.execute_batch(&format!(
+            "CREATE TRIGGER fail_import BEFORE INSERT ON memories \
+             WHEN NEW.id = 'fixture-{index:03}' \
+             BEGIN SELECT RAISE(ABORT, 'synthetic chunk failure'); END;"
+        ))?;
+        Ok(())
+    }
+
+    #[test]
+    fn later_transaction_failure_syncs_only_committed_chunk() -> Result<()> {
+        let (isolate, app, mut entries) = fixture(51)?;
+        inject_failure(&isolate, 26)?;
+        let syncs = Cell::new(0);
+        let mut cursor = Vec::new();
+        let result = import_entries_with_app(
+            &app,
+            &mut entries,
+            "",
+            |_, _| {},
+            |start, flags| {
+                cursor.push((start, flags.to_vec()));
+                Ok(())
+            },
+            || syncs.set(syncs.get() + 1),
+        );
+        let error = result.err().expect("second chunk should fail");
+        assert!(
+            error.downcast_ref::<rusqlite::Error>().is_some(),
+            "original SQLite error retained"
+        );
+        assert!(error.to_string().contains("synthetic chunk failure"));
+        let rows = app.store.all(true)?;
+        assert_eq!(rows.len(), 25);
+        assert!(rows.iter().all(|row| row.id.as_str() < "fixture-025"));
+        assert_eq!(cursor, vec![(0, vec![true; 25])]);
+        assert_eq!(syncs.get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn first_transaction_failure_neither_advances_cursor_nor_syncs() -> Result<()> {
+        let (isolate, app, mut entries) = fixture(51)?;
+        inject_failure(&isolate, 1)?;
+        let syncs = Cell::new(0);
+        let callbacks = Cell::new(0);
+        let result = import_entries_with_app(
+            &app,
+            &mut entries,
+            "",
+            |_, _| {},
+            |_, _| {
+                callbacks.set(callbacks.get() + 1);
+                Ok(())
+            },
+            || syncs.set(syncs.get() + 1),
+        );
+        assert!(result.is_err());
+        assert!(app.store.all(true)?.is_empty());
+        assert_eq!(callbacks.get(), 0);
+        assert_eq!(syncs.get(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn successful_import_syncs_once_and_retry_creates_no_duplicates() -> Result<()> {
+        let (_isolate, app, mut entries) = fixture(51)?;
+        let syncs = Cell::new(0);
+        let mut starts = Vec::new();
+        let outcome = import_entries_with_app(
+            &app,
+            &mut entries,
+            "",
+            |_, _| {},
+            |start, flags| {
+                assert!(flags.iter().all(|flag| *flag));
+                starts.push(start);
+                Ok(())
+            },
+            || syncs.set(syncs.get() + 1),
+        )?;
+        assert_eq!(outcome.imported, 51);
+        assert_eq!(outcome.completed, vec![true; 51]);
+        assert_eq!(starts, vec![0, 25, 50]);
+        assert_eq!(syncs.get(), 1);
+        let retry =
+            import_entries_with_app(&app, &mut entries, "", |_, _| {}, |_, _| Ok(()), || {})?;
+        assert_eq!(retry.imported, 0);
+        assert_eq!(app.store.all(true)?.len(), 51);
+        Ok(())
+    }
+
+    #[test]
+    fn callback_failure_stops_after_commit_and_keeps_original_error() -> Result<()> {
+        let (_isolate, app, mut entries) = fixture(51)?;
+        let syncs = Cell::new(0);
+        let callbacks = Cell::new(0);
+        let result = import_entries_with_app(
+            &app,
+            &mut entries,
+            "",
+            |_, _| {},
+            |_, flags| {
+                assert!(flags.iter().all(|flag| *flag));
+                callbacks.set(callbacks.get() + 1);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "synthetic cursor failure",
+                )
+                .into())
+            },
+            || syncs.set(syncs.get() + 1),
+        );
+        let error = result.err().expect("callback should fail");
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(callbacks.get(), 1);
+        assert_eq!(app.store.all(true)?.len(), 25);
+        assert_eq!(syncs.get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_input_does_not_open_app_or_call_callbacks() -> Result<()> {
+        let outcome = import_entries(
+            &mut [],
+            "",
+            |_, _| panic!("no progress"),
+            |_, _| panic!("no commit"),
+        )?;
+        assert_eq!(outcome.imported, 0);
+        assert!(outcome.completed.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_delete_is_not_overwritten_by_content_versioned_refresh() -> Result<()> {
+        let (_isolate, app, mut entries) = fixture(1)?;
+        import_entries_with_app(&app, &mut entries, "", |_, _| {}, |_, _| Ok(()), || {})?;
+        let id = entries[0].id.clone();
+        let mut refresh = session_entry(
+            &Session {
+                platform: "hermes".into(),
+                id: "refresh".into(),
+                first_user_message: "changed source summary".into(),
+                ..Default::default()
+            },
+            &ConvertOptions::default(),
+        );
+        refresh.id = id.clone();
+        let outcome = import_entries_with_app(
+            &app,
+            &mut [refresh],
+            "",
+            |_, _| {
+                app.store
+                    .forget(&id)
+                    .expect("synthetic concurrent deletion");
+            },
+            |_, _| Ok(()),
+            || {},
+        )?;
+        assert_eq!(outcome.imported, 0);
+        assert_eq!(
+            outcome.completed,
+            vec![false],
+            "rejected refresh stays retryable"
+        );
+        assert!(app.store.all(true)?[0].deleted);
+        Ok(())
+    }
 }

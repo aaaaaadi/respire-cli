@@ -66,6 +66,13 @@ caps **new** imports per source per run (newest first; `0` imports none): when a
 source exceeds the limit, the overflow is deferred, so repeating the run (or
 raising `--limit`) pulls the older history next.
 
+For `kilo-cli`, `hermes`, `goose`, `crush` and `cursor-cli`, the cursor records a
+SHA-256 fingerprint of the imported summary (prompts, usage and metadata), since
+SQLite WAL commits can leave the main database's modification time unchanged.
+Legacy timestamp-only marks receive one refresh. Checkpoints and unrelated
+sessions do not cause repeat imports; changed summaries receive a fresh memory
+write timestamp while retaining source timestamps in the body.
+
 Each session maps to a stable id (UUIDv5-shaped from `platform:id`), so a
 re-import updates that same row instead of creating a duplicate. A re-import only
 refreshes the body and timestamp: an existing row keeps its tidy parent and any
