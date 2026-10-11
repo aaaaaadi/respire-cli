@@ -150,6 +150,7 @@ jobs:
       - run: node npm/scripts/check-manifest.mjs
       - run: node npm/scripts/test-wrapper.mjs
       - run: python3 scripts/test-dev-smoke-gate.py
+      - run: python3 scripts/test-dev-model-fixture.py
 
   native-published-m3:
     if: ${{ inputs.native_published_only && !inputs.version_upgrade_only }}

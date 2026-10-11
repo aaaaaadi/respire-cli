@@ -15,6 +15,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from dev_model_fixture import share_cpu_container
 
 UPSTREAM = "https://api.dev.rsrs.rs"
 REQUIRED = ("model_cpu_real", "local_v1_upgrade", "cloud_v2_recovery_upgrade", "cloud_v3_secret_key_recovery_upgrade")
@@ -122,6 +123,27 @@ class Smoke:
             self.keys.configure_env(env)
         return env
 
+    def redacted_cli_error(self, env, output):
+        try:
+            value = json.loads(output.stdout)
+            errors = value.get("errors", []) if isinstance(value, dict) else []
+            diagnostic = "; ".join(str(error) for error in errors)
+        except (ValueError, UnicodeError):
+            diagnostic = ""
+        diagnostic = diagnostic or output.stderr.decode("utf-8", errors="replace")[-1500:]
+        secrets_to_redact = set(self.diagnostic_secrets)
+        session_path = Path(env["RSRS_DATA_DIR"]) / "session.json"
+        if session_path.is_file():
+            session = json.loads(session_path.read_text())
+            secrets_to_redact.update(session.get(key) for key in
+                ("pass", "pass_hash", "super", "token", "secret", "secret_key", "wrapped_urk", "urk_nonce", "kdf_salt")
+                if isinstance(session.get(key), str) and session[key])
+        for secret in sorted(secrets_to_redact, key=len, reverse=True):
+            diagnostic = diagnostic.replace(secret, "[redacted]")
+        diagnostic = re.sub(r"(?i)bearer\s+\S+", "Bearer [redacted]", diagnostic)
+        diagnostic = re.sub(r"(?i)\b(?:A3-)?[a-f0-9]{24,}\b", "[redacted]", diagnostic)
+        return diagnostic[:1500] or "no structured error"
+
     def cli(self, env, *args, timeout=180):
         try:
             output = subprocess.run([str(self.args.binary), "--direct", "--json", *args],
@@ -133,26 +155,8 @@ class Smoke:
                 cwd=self.root, env=env, capture_output=True, timeout=60)
             require(stopped.returncode in (0, 2), 'owned_runtime_stop_failed')
         if output.returncode != 0:
-            try:
-                value = json.loads(output.stdout)
-                errors = value.get("errors", []) if isinstance(value, dict) else []
-                diagnostic = "; ".join(str(error) for error in errors)
-            except (ValueError, UnicodeError):
-                diagnostic = ""
-            diagnostic = diagnostic or output.stderr.decode("utf-8", errors="replace")[-1500:]
-            secrets_to_redact = set(self.diagnostic_secrets)
-            session_path = Path(env["RSRS_DATA_DIR"]) / "session.json"
-            if session_path.is_file():
-                session = json.loads(session_path.read_text())
-                secrets_to_redact.update(session.get(key) for key in
-                    ("pass", "pass_hash", "super", "token", "secret", "secret_key", "wrapped_urk", "urk_nonce", "kdf_salt")
-                    if isinstance(session.get(key), str) and session[key])
-            for secret in sorted(secrets_to_redact, key=len, reverse=True):
-                diagnostic = diagnostic.replace(secret, "[redacted]")
-            diagnostic = re.sub(r"(?i)bearer\s+\S+", "Bearer [redacted]", diagnostic)
-            diagnostic = re.sub(r"(?i)\b(?:A3-)?[a-f0-9]{24,}\b", "[redacted]", diagnostic)
             self.report["cli_failure"] = {"command": args[0], "exit_code": output.returncode,
-                "stage": self.report.get("stage"), "error": diagnostic[:1500] or "no structured error"}
+                "stage": self.report.get("stage"), "error": self.redacted_cli_error(env, output)}
             self.save()
             raise RuntimeError("cli_failed_" + args[0])
         try:
@@ -414,6 +418,7 @@ class Smoke:
         output = subprocess.run([str(self.args.binary), "--version"], env=env, capture_output=True, timeout=20)
         require(output.returncode == 0 and re.search(r"(?<!\S)" + re.escape(self.args.version) + r"(?!\S)", output.stdout.decode()), "binary_version_mismatch")
         self.cli(env, "model", "install-m3", timeout=900)
+        share_cpu_container(self.root, env, self.model)
         require(all(digest(self.model / p) == h for p, h in MODEL_HASHES.items()), "model_hash_mismatch")
         self.cli(env, "model", "engine", "cpu")
         probe = self.cli(env, "model", "probe", "--model", "m3", "--text", "Legacy recovery CPU probe")["summary"]

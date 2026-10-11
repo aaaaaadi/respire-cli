@@ -15,6 +15,7 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from dev_model_fixture import share_cpu_container
 
 UPSTREAM = "https://api.dev.rsrs.rs"
 
@@ -431,6 +432,7 @@ def run(args, report):
         args.model_dir.mkdir(mode=0o700)
         # The CLI sweep can uninstall its models; install independently through the pinned CLI flow.
         fixture.direct(fixture.a, ["model", "install-m3"], timeout=600)
+        share_cpu_container(args.root, fixture.a, args.model_dir)
         require(all(path.is_file() and path.stat().st_size > 0 for path in
                     (args.model_dir / "tokenizer.json", args.model_dir / "onnx" / "model_quantized.onnx")),
                 "installed_model_files_missing")
