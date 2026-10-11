@@ -134,8 +134,8 @@ impl ScanOptions {
         let stamp = session
             .updated_at
             .as_deref()
-            .or(session.created_at.as_deref())
-            .and_then(scan_util::parse_stamp);
+            .and_then(scan_util::parse_stamp)
+            .or_else(|| session.created_at.as_deref().and_then(scan_util::parse_stamp));
         if (self.since.is_some() || self.until.is_some()) && stamp.is_none() {
             return false;
         }
