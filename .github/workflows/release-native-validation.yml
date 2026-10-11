@@ -123,6 +123,7 @@ jobs:
             ${{ runner.temp }}/resident-concurrency/real-account-return-verification.json
             ${{ runner.temp }}/resident-concurrency/resident-stress-metrics.json
             ${{ runner.temp }}/resident-concurrency/**/boundary-inspector/inspector.log
+            ${{ runner.temp }}/resident-concurrency/**/boundary-inspector/inspection-failure.json
             ${{ runner.temp }}/native-fixture-bounds/fixture-process-verification.json
           if-no-files-found: error
       - uses: actions/upload-artifact@v4

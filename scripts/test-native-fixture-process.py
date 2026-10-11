@@ -42,6 +42,8 @@ try:
 except TimeoutError:
     elapsed = time.monotonic() - started
     assert elapsed < 5 and inspector.process.poll() is not None
+    failure = json.loads((directory / 'responses/inspection-failure.json').read_text(encoding='utf-8'))
+    assert failure['passed'] is False and 'deadline' in failure['error']
     results.append({'scenario': 'inspection does not respond', 'passed': True,
                     'seconds': elapsed, 'helper_reaped': True})
 finally:

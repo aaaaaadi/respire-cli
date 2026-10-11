@@ -68,8 +68,10 @@ class WorkerInspector:
         deadline = time.monotonic() + self.timeout
         while True:
             if self.process.poll() is not None:
+                self.record_failure('worker inspector exited')
                 raise RuntimeError('worker inspector exited; see ' + str(self.directory / 'inspector.log'))
             if time.monotonic() >= deadline:
+                self.record_failure('worker boundary inspection exceeded deadline')
                 self.close()
                 raise TimeoutError('worker boundary inspection exceeded ' + str(self.timeout) +
                                    's; see ' + str(self.directory / 'inspector.log'))
@@ -80,8 +82,17 @@ class WorkerInspector:
                 # Windows may briefly deny access while a just-renamed file is
                 # being closed or scanned. This shares the inspection deadline.
                 time.sleep(.005)
-        assert result['passed'], result.get('error')
+        if not result['passed']:
+            self.record_failure(result.get('error', 'worker boundary assertion failed'))
+            raise AssertionError(result.get('error'))
         return tuple(result['identity'])
+
+    def record_failure(self, reason):
+        # Persist before kill/wait: a cleanup failure cannot erase the cause.
+        (self.directory / 'inspection-failure.json').write_text(json.dumps({
+            'passed': False, 'sequence': self.sequence, 'helper_pid': self.process.pid,
+            'deadline_seconds': self.timeout, 'error': reason,
+        }, indent=2), encoding='utf-8')
 
     def close(self):
         try:

@@ -408,13 +408,27 @@ for binary in BINARIES:
         print('PASS '+str(binary)+': main -> alternate -> main; real CPU inference; compatible index reused after preparation',flush=True)
     except Exception as error:
         reports.append({'binary':str(binary),'passed':False,'error':str(error)[:2000]})
+        (BASE/'real-account-return-verification.json').write_text(json.dumps(reports,indent=2),encoding='utf-8')
         raise
     finally:
-        if inspector is not None: inspector.close()
-        captured_run([str(binary),'--runtime-internal','--stop'],env=env,timeout=50)
-        if args.expect_supervised_worker:
-            confirm_workers_exited(worker_identities)
-        if old_runtime is not None and old_runtime.poll() is None:
-            old_runtime.terminate(); old_runtime.wait(timeout=15)
+        cleanup_errors=[]
+        try:
+            if inspector is not None: inspector.close()
+        except Exception as error: cleanup_errors.append('inspector: '+str(error))
+        try:
+            stopped=captured_run([str(binary),'--runtime-internal','--stop'],env=env,timeout=50)
+            assert stopped.returncode==0,'owned runtime stop failed'
+        except Exception as error: cleanup_errors.append('runtime: '+str(error))
+        try:
+            if args.expect_supervised_worker: confirm_workers_exited(worker_identities)
+        except Exception as error: cleanup_errors.append('worker reap: '+str(error))
+        try:
+            if old_runtime is not None and old_runtime.poll() is None:
+                old_runtime.terminate(); old_runtime.wait(timeout=15)
+        except Exception as error: cleanup_errors.append('old runtime: '+str(error))
+        if cleanup_errors:
+            reports[-1]['passed']=False
+            reports[-1]['cleanup_errors']=cleanup_errors
         (BASE/'real-account-return-verification.json').write_text(json.dumps(reports,indent=2),encoding='utf-8')
+        if cleanup_errors: raise RuntimeError('fixture cleanup failed: '+str(cleanup_errors))
 (BASE/'real-account-return-verification.json').write_text(json.dumps(reports,indent=2),encoding='utf-8')
