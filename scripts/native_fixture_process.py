@@ -16,10 +16,13 @@ import traceback
 def captured_run(command, *, env, timeout):
     # Regular files avoid communicate() waiting forever for inherited pipe EOF
     # after Windows subprocess.run() kills a timed-out direct child.
+    started_unix = time.time()
+    started_monotonic = time.monotonic()
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         process = subprocess.Popen(command, env=env, stdout=stdout, stderr=stderr)
         try:
             process.wait(timeout=timeout)
+            wait_completed_monotonic = time.monotonic()
         except BaseException:
             if process.poll() is None:
                 process.kill()
@@ -27,7 +30,10 @@ def captured_run(command, *, env, timeout):
             raise
         stdout.seek(0)
         stderr.seek(0)
-        return subprocess.CompletedProcess(command, process.returncode, stdout.read(), stderr.read())
+        result = subprocess.CompletedProcess(command, process.returncode, stdout.read(), stderr.read())
+        result.fixture_timing = {'client_pid': process.pid, 'started_unix': started_unix,
+            'started_monotonic': started_monotonic, 'wait_completed_monotonic': wait_completed_monotonic}
+        return result
 
 
 def inspect_worker(request, phase):

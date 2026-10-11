@@ -72,7 +72,9 @@ for binary in BINARIES:
     def run(*args, allow_failure=False):
         result = captured_run([str(binary),'--json',*args],env=env,timeout=120)
         if result.returncode and not allow_failure: raise RuntimeError(result.stdout.decode(errors='replace')+result.stderr.decode(errors='replace'))
-        return json.loads(result.stdout)
+        envelope=json.loads(result.stdout)
+        envelope['_fixture_timing']=result.fixture_timing
+        return envelope
     def wait_index_ready(timeout=180):
         deadline = time.monotonic() + timeout
         while True:
@@ -265,8 +267,16 @@ for binary in BINARIES:
                 health = json.load(response)
             owned = psutil.Process(health['pid'])
             assert '--runtime-internal' in owned.cmdline(), 'stress must target its owned runtime'
-            def total_memory():
-                members=[owned,*owned.children(recursive=True)]
+            resource_members=None
+            resource_members_checked=None
+            def total_memory(refresh_members=True):
+                global resource_members, resource_members_checked
+                if refresh_members:
+                    # Keep the original all-descendant audit. Continuous RSS
+                    # sampling must not repeatedly scan the entire OS PID map.
+                    resource_members=[owned,*owned.children(recursive=True)]
+                    resource_members_checked=time.monotonic()
+                members=resource_members
                 memories=[member.memory_info() for member in members]
                 return sum(memory.rss for memory in memories),sum(getattr(memory,'private',0) or 0 for memory in memories)
             baseline_rss,baseline_private=total_memory()
@@ -285,13 +295,23 @@ for binary in BINARIES:
             def sample_health(check_boundary=True):
                 if check_boundary and observer_errors:
                     raise RuntimeError('continuous health observer failed: '+str(observer_errors))
+                sample_started=time.monotonic()
+                sample_unix=time.time()
                 with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/health', timeout=2) as response:
                     current = json.load(response)
+                health_completed=time.monotonic()
                 assert current['pid'] == owned.pid, 'stress changed runtime ownership'
-                rss,private=total_memory()
+                rss,private=total_memory(refresh_members=check_boundary)
+                memory_completed=time.monotonic()
                 if check_boundary and args.expect_supervised_worker: checked_worker(current)
                 inference = current.get('inference', {})
                 samples.append({'rss':rss,'private':private,
+                    'started_unix':sample_unix,'started_monotonic':sample_started,
+                    'health_seconds':health_completed-sample_started,
+                    'memory_seconds':memory_completed-health_completed,
+                    'boundary_seconds':time.monotonic()-memory_completed,
+                    'membership_age_seconds':time.monotonic()-resource_members_checked,
+                    'boundary_checked':check_boundary,
                     'foreground':inference.get('foreground',{}),'background':inference.get('background',{})})
             @contextlib.contextmanager
             def observed_pool():
@@ -329,7 +349,7 @@ for binary in BINARIES:
                     command, elapsed, envelope = future.result()
                     assert envelope['summary'].get('index_state') == 'pending', 'remember waited for derived indexing'
                     created.append(envelope['summary']['id'])
-                    timings.append({'command':command,'seconds':elapsed})
+                    timings.append({'command':command,'seconds':elapsed,**envelope['_fixture_timing']})
                 # Retrieval quality evaluation must use the same pending-aware
                 # resident path as recall, without requiring derived artifacts.
                 eval_file = BASE / 'resident-stress-eval.jsonl'
@@ -369,13 +389,14 @@ for binary in BINARIES:
                     command, elapsed, envelope = future.result()
                     if command == 'recall':
                         assert envelope.get('items'), 'pending or indexed stress data was not recalled'
-                    timings.append({'command':command,'seconds':elapsed})
+                    timings.append({'command':command,'seconds':elapsed,**envelope['_fixture_timing']})
             metrics = {'passed':False,'requests':len(timings),'timings':timings,
                 'rss_before':baseline_rss,'rss_peak':max(sample['rss'] for sample in samples),
                 'resource_scope':'owned host and all descendants',
                 'private_before':baseline_private,
                 'private_peak':max((sample['private'] or 0) for sample in samples),
-                'both_lanes_observed':any(sample['foreground'].get('active') and sample['background'].get('active') for sample in samples)}
+                'both_lanes_observed':any(sample['foreground'].get('active') and sample['background'].get('active') for sample in samples),
+                'samples':samples}
             (BASE/'resident-stress-metrics.json').write_text(json.dumps(metrics,indent=2),encoding='utf-8')
             assert metrics['both_lanes_observed'],'concurrent foreground/background activity was not observed'
             # This fixture submits 28 long documents and 16 content-bearing edits;
