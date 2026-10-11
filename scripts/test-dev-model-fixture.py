@@ -4,8 +4,9 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import dev_model_fixture as model
 
@@ -69,6 +70,40 @@ class ModelFixtureTests(unittest.TestCase):
         diagnostic = smoke.redacted_cli_error({}, result)
         self.assertIn("os error 2", diagnostic)
         self.assertNotIn("private-fixture-password", diagnostic)
+
+    def check_reporter_failure(self, filename):
+        spec = importlib.util.spec_from_file_location("fixture_reporter", Path(__file__).with_name(filename))
+        reporter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(reporter)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "session.json").write_text(json.dumps({"token": "private-session-token"}))
+            smoke = object.__new__(reporter.Smoke)
+            smoke.root = root
+            smoke.args = SimpleNamespace(binary=root / "unused-fixture-cli")
+            smoke.report = {}
+            smoke.save = Mock()
+            smoke.diagnostic_secrets = {"private-fixture-password"}
+            failed = subprocess.CompletedProcess([], 1, json.dumps({"errors": [
+                "No such file (os error 2) private-fixture-password private-session-token Bearer private-bearer " + "x" * 2000
+            ]}).encode(), b"")
+            stopped = subprocess.CompletedProcess([], 0, b"", b"")
+            with patch.object(subprocess, "run", side_effect=[failed, stopped]) as run:
+                with self.assertRaisesRegex(RuntimeError, "cli_failed_remember"):
+                    smoke.cli({"RSRS_DATA_DIR": str(root)}, "remember", "synthetic content")
+            self.assertEqual(run.call_count, 2)
+            smoke.save.assert_called()
+            diagnostic = smoke.report["cli_failure"]["error"]
+            self.assertIn("os error 2", diagnostic)
+            self.assertIn("[redacted]", diagnostic)
+            self.assertNotIn("private-", json.dumps(smoke.report))
+            self.assertLessEqual(len(diagnostic), 1500)
+
+    def test_legacy_reporter_saves_bounded_redacted_failure(self):
+        self.check_reporter_failure("dev-legacy-vault-smoke.py")
+
+    def test_profile_reporter_saves_bounded_redacted_failure(self):
+        self.check_reporter_failure("dev-profile-migration-smoke.py")
 
 
 if __name__ == "__main__":
