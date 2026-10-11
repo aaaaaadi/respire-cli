@@ -51,7 +51,7 @@ const collect = (directory, prefix = '') => {
 collect(directory);
 if (inventory.some(file => /\.(a|lib|dll|so|dylib|onnx|pt|safetensors|pdb|bc|ll)$/i.test(file))) throw new Error('Crate includes a native binary or model payload');
 if (selection === 'sdk') {
-  const allowed = new Set(['Cargo.toml', 'Cargo.toml.orig', 'Cargo.lock', '.cargo_vcs_info.json', 'LICENSE', 'README.md', 'build.rs', 'core-sdk.lock.json', 'prepare-sdk.mjs', 'src/lib.rs', 'src/env.rs', 'src/host.rs', 'src/host_winml.rs', 'host-winml-build.rs', 'notices/WinML-2.4.89-license.txt', 'src/business.rs', 'src/business/reports.rs']);
+  const allowed = new Set(['Cargo.toml', 'Cargo.toml.orig', 'Cargo.lock', '.cargo_vcs_info.json', 'LICENSE', 'README.md', 'build.rs', 'core-sdk.lock.json', 'prepare-sdk.mjs', 'src/lib.rs', 'src/env.rs', 'src/host.rs', 'src/host_winml.rs', 'host-winml-build.rs', 'notices/WinML-2.4.89-license.txt', 'src/business.rs', 'src/business/reports.rs', 'src/worker.rs', 'src/cpu_model.rs']);
   if (inventory.some(file => !allowed.has(file))) throw new Error('Unexpected thin SDK package file');
   const before = readFileSync(join(source, 'core-sdk.lock.json'));
   if (!before.equals(readFileSync(join(directory, 'core-sdk.lock.json')))) throw new Error('Packaged SDK pins differ');
