@@ -20,6 +20,11 @@ faulthandler.enable()
 faulthandler.dump_traceback_later(60, repeat=True)
 BASE=pathlib.Path(args.output_dir).resolve()
 BASE.mkdir(parents=True,exist_ok=True)
+import cryptography, importlib.metadata, psutil
+(BASE/'fixture-dependencies.json').write_text(json.dumps({
+    'python':sys.version,'cryptography':cryptography.__version__,'psutil':psutil.__version__,
+    'psutil_source':json.loads(importlib.metadata.distribution('psutil').read_text('direct_url.json') or 'null'),
+},indent=2),encoding='utf-8')
 CACHE=pathlib.Path(args.model_dir).resolve()
 BINARIES=[pathlib.Path(path).resolve() for path in args.binary]
 MODEL_HASHES={'model_quantized.onnx':'0826f8c1ab9edf1801db86c61919d4d108e8bfc0b809ec823ad366882ff0b77d',
@@ -255,7 +260,7 @@ for binary in BINARIES:
             statuses.append({'account':account,'model_rows':rows})
         stress = None
         if args.resident_stress:
-            import concurrent.futures, psutil
+            import concurrent.futures, contextlib, psutil, threading
             with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/health', timeout=2) as response:
                 health = json.load(response)
             owned = psutil.Process(health['pid'])
@@ -266,6 +271,7 @@ for binary in BINARIES:
                 return sum(memory.rss for memory in memories),sum(getattr(memory,'private',0) or 0 for memory in memories)
             baseline_rss,baseline_private=total_memory()
             samples = []
+            observer_errors=[]
             timings = []
             body = 'resident stress query ' + 'background indexing and foreground retrieval '.join(['sample'] * 110)
             def timed(command):
@@ -276,16 +282,40 @@ for binary in BINARIES:
                     raise RuntimeError('stress '+command[0]+' failed after '+str(round(time.monotonic()-started,3))+'s: '+str(error)) from error
                 assert envelope['status'] in ['ok', 'warn'], command[0]
                 return command[0], time.monotonic() - started, envelope
-            def sample_health():
+            def sample_health(check_boundary=True):
+                if check_boundary and observer_errors:
+                    raise RuntimeError('continuous health observer failed: '+str(observer_errors))
                 with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/health', timeout=2) as response:
                     current = json.load(response)
                 assert current['pid'] == owned.pid, 'stress changed runtime ownership'
                 rss,private=total_memory()
-                if args.expect_supervised_worker: checked_worker(current)
+                if check_boundary and args.expect_supervised_worker: checked_worker(current)
                 inference = current.get('inference', {})
                 samples.append({'rss':rss,'private':private,
                     'foreground':inference.get('foreground',{}),'background':inference.get('background',{})})
-            with concurrent.futures.ThreadPoolExecutor(max_workers=18) as pool:
+            @contextlib.contextmanager
+            def observed_pool():
+                stopped=threading.Event()
+                def observe():
+                    try:
+                        while not stopped.is_set():
+                            # Retain every original boundary check in the main
+                            # loop. Handle inspection must not starve concurrent
+                            # HTTP responsiveness/lane/resource observations.
+                            sample_health(check_boundary=False)
+                            stopped.wait(.02)
+                    except Exception as error: observer_errors.append(str(error))
+                observer=threading.Thread(target=observe,name='resident-health-observer',daemon=True)
+                observer.start()
+                try:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=18) as pool:
+                        yield pool
+                finally:
+                    stopped.set()
+                    observer.join(timeout=3)
+                    assert not observer.is_alive(),'continuous health observer did not stop'
+                    assert not observer_errors,'continuous health observer failed: '+str(observer_errors)
+            with observed_pool() as pool:
                 print('resident phase: concurrent writes',flush=True)
                 batch_deadline=time.monotonic()+120*2+10
                 writes = [pool.submit(timed, ['remember', body, '--title', 'stress-'+str(i),
@@ -347,6 +377,7 @@ for binary in BINARIES:
                 'private_peak':max((sample['private'] or 0) for sample in samples),
                 'both_lanes_observed':any(sample['foreground'].get('active') and sample['background'].get('active') for sample in samples)}
             (BASE/'resident-stress-metrics.json').write_text(json.dumps(metrics,indent=2),encoding='utf-8')
+            assert metrics['both_lanes_observed'],'concurrent foreground/background activity was not observed'
             # This fixture submits 28 long documents and 16 content-bearing edits;
             # its background batch is larger than the initial account preparation.
             print('resident phase: final index drain (900s)',flush=True)

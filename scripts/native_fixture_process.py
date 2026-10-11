@@ -46,6 +46,7 @@ def inspect_worker(request, phase):
     assert not any(pathlib.Path(file.path).name in ('rsrs.db', 'lock.db') for file in worker.open_files())
     phase('environ')
     assert not {'GH_TOKEN', 'GITHUB_TOKEN', 'OPENAI_API_KEY', 'RSRS_SUPER'} & worker.environ().keys()
+    phase('identity')
     return [worker.pid, worker.create_time()]
 
 
@@ -108,22 +109,29 @@ def serve(directory):
     import faulthandler
     faulthandler.enable()
     directory = pathlib.Path(directory)
-    for line in sys.stdin:
-        request = json.loads(line)
-        sequence = request['sequence']
-        def phase(name):
-            print(json.dumps({'sequence': sequence, 'phase': name}), flush=True)
-        faulthandler.dump_traceback_later(3)
-        try:
-            identity = inspect_worker(request, phase)
-            result = {'passed': True, 'identity': identity}
-        except Exception:
-            result = {'passed': False, 'error': traceback.format_exc()}
-        finally:
-            faulthandler.cancel_dump_traceback_later()
-        temporary = directory / 'response.tmp'
-        temporary.write_text(json.dumps(result), encoding='utf-8')
-        os.replace(temporary, directory / ('response-' + str(sequence) + '.json'))
+    import psutil
+    print(json.dumps({'inspector_pid': os.getpid(), 'psutil': psutil.__version__}), flush=True)
+    # One watchdog for the helper lifetime; do not create/join a timer thread
+    # for every high-frequency check, and cover response I/O as well as psutil.
+    faulthandler.dump_traceback_later(3, repeat=True)
+    try:
+        for line in sys.stdin:
+            request = json.loads(line)
+            sequence = request['sequence']
+            def phase(name):
+                print(json.dumps({'sequence': sequence, 'phase': name, 'monotonic': time.monotonic()}), flush=True)
+            try:
+                identity = inspect_worker(request, phase)
+                result = {'passed': True, 'identity': identity}
+            except Exception:
+                result = {'passed': False, 'error': traceback.format_exc()}
+            phase('response')
+            temporary = directory / 'response.tmp'
+            temporary.write_text(json.dumps(result), encoding='utf-8')
+            os.replace(temporary, directory / ('response-' + str(sequence) + '.json'))
+            phase('responded')
+    finally:
+        faulthandler.cancel_dump_traceback_later()
 
 
 if __name__ == '__main__':

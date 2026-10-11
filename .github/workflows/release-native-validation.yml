@@ -89,7 +89,14 @@ jobs:
             py="$RUNNER_TEMP/upgrade-python/Scripts/python.exe"
             exe="$exe.exe"
           fi
-          "$py" -m pip install --only-binary=:all: cryptography==46.0.3 psutil==7.1.0
+          "$py" -m pip install --only-binary=:all: cryptography==46.0.3
+          if [ "$RUNNER_OS" = Windows ]; then
+            # PyPI 7.2.2 predates the fixed Windows handle-query implementation.
+            # Build the exact upstream fix, not a moving branch or local patch.
+            "$py" -m pip install --no-deps 'psutil @ https://github.com/giampaolo/psutil/archive/078f2f08d2ccea916a42f9571ab8bd40d958e7a1.tar.gz#sha256=8073a6389894b1ea3edc4f0feb47dba742b5552eab93f28ba6f45d2b19f11e4b'
+          else
+            "$py" -m pip install --only-binary=:all: psutil==7.1.0
+          fi
           # Only the real historical baseline uses FP16; the candidate uses quantized.
           mkdir -p native-legacy-model/onnx
           cp "$RUNNER_TEMP/release-probe/models/bge-m3/tokenizer.json" native-legacy-model/tokenizer.json
@@ -122,6 +129,7 @@ jobs:
           path: |
             ${{ runner.temp }}/resident-concurrency/real-account-return-verification.json
             ${{ runner.temp }}/resident-concurrency/resident-stress-metrics.json
+            ${{ runner.temp }}/resident-concurrency/fixture-dependencies.json
             ${{ runner.temp }}/resident-concurrency/**/boundary-inspector/inspector.log
             ${{ runner.temp }}/resident-concurrency/**/boundary-inspector/inspection-failure.json
             ${{ runner.temp }}/native-fixture-bounds/fixture-process-verification.json
