@@ -111,6 +111,7 @@ jobs:
             py="$RUNNER_TEMP/upgrade-python/Scripts/python.exe"
             exe="$exe.exe"
           fi
+          "$py" scripts/test-native-fixture-process.py --output-dir "$RUNNER_TEMP/native-fixture-bounds"
           "$py" scripts/test-real-m3-account-switch.py --binary "$exe" \
             --model-dir "$RUNNER_TEMP/release-probe/models/bge-m3" \
             --output-dir "$RUNNER_TEMP/resident-concurrency" --expect-supervised-worker --resident-stress
@@ -121,6 +122,8 @@ jobs:
           path: |
             ${{ runner.temp }}/resident-concurrency/real-account-return-verification.json
             ${{ runner.temp }}/resident-concurrency/resident-stress-metrics.json
+            ${{ runner.temp }}/resident-concurrency/**/boundary-inspector/inspector.log
+            ${{ runner.temp }}/native-fixture-bounds/fixture-process-verification.json
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         if: always()

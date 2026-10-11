@@ -1,5 +1,6 @@
 """Read-only real M3 cache; disposable profiles and owned runtime port only."""
-import argparse, hashlib, hmac, json, os, pathlib, secrets, socket, sqlite3, subprocess, sys, time, urllib.request
+import argparse, faulthandler, hashlib, hmac, json, os, pathlib, secrets, socket, sqlite3, subprocess, sys, tempfile, time, urllib.request
+from native_fixture_process import WorkerInspector, captured_run
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 parser=argparse.ArgumentParser()
@@ -15,6 +16,8 @@ architecture.add_argument('--expect-supervised-worker',action='store_true',help=
 parser.add_argument('--resident-stress',action='store_true',help='Exercise concurrent recall, short writes, lightweight reads and background indexing')
 parser.add_argument('--seed-binary',help='Create both libraries with this published older binary, then upgrade its running runtime')
 args=parser.parse_args()
+faulthandler.enable()
+faulthandler.dump_traceback_later(60, repeat=True)
 BASE=pathlib.Path(args.output_dir).resolve()
 BASE.mkdir(parents=True,exist_ok=True)
 CACHE=pathlib.Path(args.model_dir).resolve()
@@ -62,7 +65,7 @@ for binary in BINARIES:
         if key.startswith(('RSRS_', 'ONEMEMORY_', 'RESPIRE_')):
             seed_env['ONEMEMORY_' + key[5:]] = value
     def run(*args, allow_failure=False):
-        result = subprocess.run([str(binary),'--json',*args],env=env,capture_output=True,timeout=120)
+        result = captured_run([str(binary),'--json',*args],env=env,timeout=120)
         if result.returncode and not allow_failure: raise RuntimeError(result.stdout.decode(errors='replace')+result.stderr.decode(errors='replace'))
         return json.loads(result.stdout)
     def wait_index_ready(timeout=180):
@@ -90,7 +93,16 @@ for binary in BINARIES:
     def select(profile):
         (main/'client.json').write_text(json.dumps({**public_config,'data_dir':str(profile)}),encoding='utf-8')
     worker_identities=[]
+    inspector=None
     def checked_worker(health):
+        global inspector
+        if sys.platform=='win32':
+            if inspector is None:
+                inspector=WorkerInspector(root/'boundary-inspector')
+            identity=inspector.inspect({'host_pid':health['pid'],
+                'worker_pid':health['inference']['worker_pid'],'binary':str(binary)})
+            if identity not in worker_identities: worker_identities.append(identity)
+            return identity
         import psutil
         host=psutil.Process(health['pid'])
         children=[child for child in host.children(recursive=True)
@@ -122,7 +134,7 @@ for binary in BINARIES:
             select(profile)
             if args.seed_binary:
                 for command in [('model','activate','m3'),('remember','Real account return fixture '+profile.name,'--title',profile.name,'--importance','important','--force')]:
-                    seeded=subprocess.run([str(pathlib.Path(args.seed_binary).resolve()),'--json','--direct',*command],env=seed_env,capture_output=True,timeout=180)
+                    seeded=captured_run([str(pathlib.Path(args.seed_binary).resolve()),'--json','--direct',*command],env=seed_env,timeout=180)
                     assert seeded.returncode==0,seeded.stdout.decode(errors='replace')+seeded.stderr.decode(errors='replace')
             else:
                 run('--direct','remember','Real account return fixture '+profile.name,'--title',profile.name,'--importance','important','--force')
@@ -183,7 +195,9 @@ for binary in BINARIES:
             visited.add(str(profile))
             if args.expect_in_process or args.expect_supervised_worker:
                 import psutil
-                pending=subprocess.Popen([str(binary),'--json','model','probe','--model','m3'],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                probe_stdout=tempfile.TemporaryFile()
+                probe_stderr=tempfile.TemporaryFile()
+                pending=subprocess.Popen([str(binary),'--json','model','probe','--model','m3'],env=env,stdout=probe_stdout,stderr=probe_stderr)
                 checks=0
                 deadline=time.monotonic()+120
                 try:
@@ -203,12 +217,15 @@ for binary in BINARIES:
                             assert not children, 'runtime spawned an inference child: '+str([child.name() for child in children])
                         checks+=1
                         time.sleep(.05)
-                    stdout,stderr=pending.communicate(timeout=120)
+                    pending.wait(timeout=5)
+                    probe_stdout.seek(0); probe_stderr.seek(0)
+                    stdout,stderr=probe_stdout.read(),probe_stderr.read()
                     assert pending.returncode==0,stdout.decode(errors='replace')+stderr.decode(errors='replace')
                     assert checks>0,'native inference responsiveness was not exercised'
                 finally:
                     if pending.poll() is None:
-                        pending.kill(); pending.communicate()
+                        pending.kill(); pending.wait(timeout=5)
+                    probe_stdout.close(); probe_stderr.close()
             else:
                 run('model','probe','--model','m3')
             recalled=run('recall','Real account return fixture','--titles')
@@ -269,9 +286,12 @@ for binary in BINARIES:
                 samples.append({'rss':rss,'private':private,
                     'foreground':inference.get('foreground',{}),'background':inference.get('background',{})})
             with concurrent.futures.ThreadPoolExecutor(max_workers=18) as pool:
+                print('resident phase: concurrent writes',flush=True)
+                batch_deadline=time.monotonic()+120*2+10
                 writes = [pool.submit(timed, ['remember', body, '--title', 'stress-'+str(i),
                     '--importance', 'important', '--force']) for i in range(28)]
                 while any(not future.done() for future in writes):
+                    assert time.monotonic()<batch_deadline,'resident write batch exceeded command deadlines'
                     sample_health()
                     time.sleep(.02)
                 created = []
@@ -303,6 +323,8 @@ for binary in BINARIES:
                     lifecycle.rollback()
                     lifecycle.close()
                 work = []
+                print('resident phase: concurrent recall/show/update',flush=True)
+                batch_deadline=time.monotonic()+120*5+10
                 for i in range(28):
                     work.append(pool.submit(timed, ['recall','resident stress query','--titles','--no-related']))
                     work.append(pool.submit(timed, ['show',created[i]]))
@@ -310,6 +332,7 @@ for binary in BINARIES:
                         work.append(pool.submit(timed, ['update',created[i],'--title','updated-stress-'+str(i)]))
                 work.append(pool.submit(timed, ['remember','concurrent trivial write','--importance','trivial']))
                 while any(not future.done() for future in work):
+                    assert time.monotonic()<batch_deadline,'resident mixed batch exceeded command deadlines'
                     sample_health()
                     time.sleep(.02)
                 for future in work:
@@ -326,6 +349,7 @@ for binary in BINARIES:
             (BASE/'resident-stress-metrics.json').write_text(json.dumps(metrics,indent=2),encoding='utf-8')
             # This fixture submits 28 long documents and 16 content-bearing edits;
             # its background batch is larger than the initial account preparation.
+            print('resident phase: final index drain (900s)',flush=True)
             wait_index_ready(timeout=900)
             database = main / 'rsrs.db'
             if not database.exists(): database = main / 'onememory.db'
@@ -386,7 +410,8 @@ for binary in BINARIES:
         reports.append({'binary':str(binary),'passed':False,'error':str(error)[:2000]})
         raise
     finally:
-        subprocess.run([str(binary),'--runtime-internal','--stop'],env=env,capture_output=True,timeout=50)
+        if inspector is not None: inspector.close()
+        captured_run([str(binary),'--runtime-internal','--stop'],env=env,timeout=50)
         if args.expect_supervised_worker:
             confirm_workers_exited(worker_identities)
         if old_runtime is not None and old_runtime.poll() is None:
