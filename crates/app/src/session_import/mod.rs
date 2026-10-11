@@ -136,6 +136,9 @@ impl ScanOptions {
             .as_deref()
             .or(session.created_at.as_deref())
             .and_then(scan_util::parse_stamp);
+        if (self.since.is_some() || self.until.is_some()) && stamp.is_none() {
+            return false;
+        }
         if let Some(since) = self.since {
             if let Some(stamp) = stamp {
                 if stamp < since {
@@ -223,7 +226,6 @@ pub fn dedupe(sessions: Vec<Session>) -> Vec<Session> {
 /// high-volume source cannot crowd out every other source.
 pub fn cap_per_platform(mut sessions: Vec<Session>, limit: usize) -> Vec<Session> {
     sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    let limit = limit.max(1);
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     sessions.retain(|session| {
         let count = counts.entry(session.platform.clone()).or_insert(0);

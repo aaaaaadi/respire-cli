@@ -141,13 +141,13 @@ pub fn build_body(session: &Session) -> String {
         body.push_str(&format!("\n末次请求：{}", truncate_chars(&scrub(last_raw), 400)));
     }
 
-    body.push_str(&format!("\n【后果】会话更新于 {updated}。"));
+    body.push_str(&format!("\n【后果】会话更新于 {}。", scrub(updated)));
     if let Some(line) = usage_line(&session.usage) {
         body.push(' ');
         body.push_str(&line);
     }
     if let Some(agent) = session.agent.as_deref().filter(|s| !s.is_empty()) {
-        body.push_str(&format!(" 由 `{agent}` 子代理执行"));
+        body.push_str(&format!(" 由 `{}` 子代理执行", scrub(agent)));
         if let Some(parent) = session.parent_id.as_deref().filter(|s| !s.is_empty()) {
             body.push_str(&format!("（父会话 {}）", short_id(parent)));
         }
@@ -189,15 +189,15 @@ fn usage_line(usage: &serde_json::Map<String, Value>) -> Option<String> {
 /// Resolve the project label: explicit override, else the cwd basename.
 fn project_of(session: &Session, explicit: &str) -> String {
     if !explicit.trim().is_empty() {
-        return explicit.trim().to_owned();
+        return scrub(explicit.trim());
     }
     session
         .cwd
         .as_deref()
         .and_then(|cwd| cwd.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next())
         .filter(|name| !name.is_empty())
+        .map(scrub)
         .unwrap_or_default()
-        .to_owned()
 }
 
 fn first_line(text: &str) -> String {

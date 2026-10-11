@@ -24,6 +24,7 @@ use crate::transport::MemoryTransport;
 pub fn import_entries<F: FnMut(usize, usize)>(
     entries: &mut [MemoryEntry],
     parent_spec: &str,
+    force: bool,
     mut progress: F,
 ) -> Result<usize> {
     if entries.is_empty() {
@@ -44,7 +45,12 @@ pub fn import_entries<F: FnMut(usize, usize)>(
     let mut imported = 0usize;
     for (index, entry) in entries.iter().enumerate() {
         let sealed = MemoryEngine::seal(&app.keys, &app.embedder, entry, &entry.user)?;
-        if app.store.put(&sealed)? {
+        let written = if force {
+            app.store.put_authoritative(&sealed)?
+        } else {
+            app.store.put(&sealed)?
+        };
+        if written {
             imported += 1;
         }
         progress(index + 1, total);

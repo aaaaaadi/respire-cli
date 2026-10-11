@@ -2131,7 +2131,7 @@ fn run_extract(
     }
 
     progress::phase("Embedding and storing memories", "Embedding and storing memories");
-    let imported = respire::session_import::import_entries(&mut entries, parent, |done, total| {
+    let imported = respire::session_import::import_entries(&mut entries, parent, force, |done, total| {
         progress::phase_count("写入记忆", "Storing memories", done, total);
     })?;
     for session in &pending {
