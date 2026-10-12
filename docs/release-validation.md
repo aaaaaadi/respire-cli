@@ -18,6 +18,40 @@ dispatch this same trusted-publisher workflow with `version` and required
 `release_run`. A missing older entry is rejected if publishing it would move
 `latest` or `dev` backward; no distribution tag is silently rolled back.
 
+## Actions artifact retention and recovery
+
+All workflows explicitly retain Actions artifacts for one day after upload.
+Build inputs, cross-job transfers, and publication receipts are still uploaded;
+consumers, validation gates, publication locks, and digest checks are unchanged.
+This policy does not change GitHub Release assets, published npm packages, or
+Actions cache and workflow-log retention.
+
+After an artifact expires or is deleted, failed-job reruns that need original
+build inputs and historical short-package repair that needs the original
+`npm-release-validation` receipt are not guaranteed to work. Supplying a version
+does not replace that receipt. Long publication queues can also outlive the
+one-day window. Missing or expired evidence must fail closed: never skip digest,
+source, regression, receipt, or publication checks to work around retention.
+A full workflow rerun can allocate a different DEV version and is not guaranteed
+to recover the same version. Diagnose the remaining draft and public package
+state before a separately authorized recovery or new release.
+
+The targeted `migration-keyring-check.yml` workflow also downloads
+`cli-release-${{ matrix.target }}` from its `release_run_id`; expiry prevents
+that diagnostic from verifying the original binary. For a new candidate,
+separately authorize a fresh, non-publishing `release-validation.yml` run. Its
+dispatch workflow ref and `ref` input must resolve to the same source commit,
+because the targeted consumer checks the producer's `head_sha`. Wait for all
+required platform builds and `npm-dry-run` to succeed, then use the new run ID
+for targeted migration before its artifacts expire. This validates a freshly
+built candidate, not the deleted original bytes. Preserve all source, version,
+and digest checks; if the original artifact identity is required, stop and
+report that evidence as unavailable rather than substituting a newer binary.
+
+Deletion or expiry also removes downloadable diagnostic reports and publication
+receipts; run status and logs are not a substitute for those files. An artifact
+cleanup is not permission to delete Release assets or npm versions.
+
 Only version allocation and publication share a serial lock. Allocation reserves the DEV number in an unpublished draft. The existing version script counts drafts to prevent collisions. Failed drafts remain available for diagnosis. Full regression does not hold this lock. Workflow or documentation changes alone do not publish a DEV.
 
 Four-target builds run in Release. The separate compile matrix is manual. CLI tests run once through the existing coverage command; other workspace tests run separately. musl builds reuse the existing cache. macOS reuses the model cache while still checking model files and performing real inference.
