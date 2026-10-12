@@ -58,12 +58,14 @@ pub fn recall_catalog(keys: &SessionKeys, store: &LocalStore)
         let entry = MemoryEngine::open(keys, memory).context("decrypt changed resident entry")?;
         snapshots.push(respire_core_sdk::Snapshot::new(memory, Some(entry)));
         // Catalog metadata suffices after Core has received the authorized body.
-        memory.ciphertext.clear();
-        memory.nonce.clear();
-        memory.embedding_enc.clear();
+        // Clear would retain the encrypted-body allocation in the long-lived cache.
+        memory.ciphertext = String::new();
+        memory.nonce = String::new();
+        memory.embedding_enc = String::new();
     }
     let lease = respire_core_sdk::ResidentLease::publish(uuid::Uuid::new_v4().to_string(),
         matching.map(|cache| cache.lease.as_ref()), &store.retrieval_model()?, &snapshots, &removed)?;
+    drop(snapshots);
     let changed: HashSet<&str> = delta.iter().map(|memory| memory.id.as_str()).collect();
     let removed: HashSet<&str> = removed.iter().map(String::as_str).collect();
     let mut memories = Vec::new();

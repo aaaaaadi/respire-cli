@@ -30,6 +30,9 @@ fn unchanged_catalog_reuses_arcs_and_old_readers_survive_updates_and_deletes() -
     let (first, pending, old_lease) = recall_catalog(&keys, &store)?;
     assert_eq!(pending, 1);
     assert!(first[0].ciphertext.is_empty());
+    assert_eq!(first[0].ciphertext.capacity(), 0);
+    assert_eq!(first[0].nonce.capacity(), 0);
+    assert_eq!(first[0].embedding_enc.capacity(), 0);
     let (same, _, same_lease) = recall_catalog(&keys, &store)?;
     assert!(Arc::ptr_eq(&first, &same));
     assert!(Arc::ptr_eq(&old_lease, &same_lease));
