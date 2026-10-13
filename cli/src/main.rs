@@ -1623,6 +1623,31 @@ fn current_user() -> String {
     respire::env::var("RSRS_USER").unwrap_or_else(|_| "local".to_owned())
 }
 
+/// Daily identity is stable even when its display title or importance changes.
+/// Legacy same-user/title tracks still participate in the existing atomic merge.
+fn select_diary_tracks<'a>(
+    memories: &'a [respire::StoredMemory],
+    track_id: &str,
+    track_title: &str,
+    mut same_legacy_author: impl FnMut(&respire::StoredMemory) -> Result<bool>,
+) -> Result<Vec<&'a respire::StoredMemory>> {
+    let mut tracks = Vec::new();
+    for memory in memories.iter().filter(|memory| !memory.deleted) {
+        // The stable ID already includes the author/day. Wire user is server
+        // routing metadata, so legacy authors must come from the sealed payload.
+        if memory.id == track_id
+            || (memory.local_title == track_title && same_legacy_author(memory)?) {
+            tracks.push(memory);
+        }
+    }
+    tracks.sort_by(|left, right| {
+        (left.id != track_id).cmp(&(right.id != track_id))
+            .then_with(|| left.local_created_at.cmp(&right.local_created_at))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(tracks)
+}
+
 /// Assemble transport: RSRS_ADDR (or session.json addr) -> remote backup store; else local store.
 fn build_transport() -> Result<Arc<dyn MemoryTransport>> {
     if let Some((addr, token)) = remote_config_from_session_or_env()? {
@@ -6790,28 +6815,25 @@ fn run_local_inner(args: Cli) -> Result<()> {
             let (mut content, mut title) = (content, title);
             if importance == "trivial" {
                 if respire::service::diary_mode() != "verbose" {
-                    // Track mode: one diary-track entry per day. Look up every same-title track (many sessions/devices may each have created one):
-                    // found -> merge all lines into the earliest by time, tombstone the rest (self-heal); none -> create with a deterministic id (same id across devices, sync converges)
+                    // Stable identity survives retitling; dated titles remain a fallback
+                    // for legacy tracks created before deterministic IDs were used.
                     let now_local = chrono::Local::now();
                     let day = now_local.format("%Y-%m-%d").to_string();
                     let track_title = format!("活动轨迹 {day}");
                     let line = format!("【{}】{}", now_local.format("%H:%M"), content.trim());
                     let all = store.all(false)?;
-                    // Track identity is the title only (the dated track title is specific enough):
-                    // do not also require importance - a merged/old-peer copy may be normal,
-                    // and that filter kicked the track off the day's chain, old lines flowing back (reproduced 2026-09-11)
-                    let mut tracks: Vec<&respire::StoredMemory> = all
-                        .iter()
-                        .filter(|m| !m.deleted && m.local_title == track_title)
-                        .collect();
-                    tracks.sort_by(|a, b| a.local_created_at.cmp(&b.local_created_at));
+                    let user = current_user();
                     let track_id = uuid::Uuid::new_v5(
                         &uuid::Uuid::NAMESPACE_URL,
-                        format!("activity-track/{}/{}", current_user(), day).as_bytes(),
+                        format!("activity-track/{user}/{day}").as_bytes(),
                     )
                     .to_string();
+                    let tracks = select_diary_tracks(&all, &track_id, &track_title, |memory| {
+                        Ok(MemoryEngine::open(&session, memory)?.user == user)
+                    })?;
                     if !tracks.is_empty() {
-                        // Primary = earliest created; other entries' lines merge in, then tombstone (self-heal merge)
+                        // Prefer the stable ID; otherwise keep the earliest legacy track.
+                        // The source-checked transaction still protects every merged row.
                         let main = tracks[0];
                         let mut merged = String::new();
                         for t in &tracks {
@@ -6828,39 +6850,16 @@ fn run_local_inner(args: Cli) -> Result<()> {
 
                         }
                         merged.push_str(&line);
-                        let e = respire::MemoryEntry {
-                            supersedes: String::new(),
-                            superseded_by: String::new(),
-                            see_also: Vec::new(),
-                            id: main.id.clone(),
-                            kind: respire::memory::model::Kind::from_str(&main.local_kind),
-                            tags: vec![],
-                            title: track_title.clone(),
-                            content: merged,
-                            user: main.user.clone(),
-                            computer: if main.local_computer.is_empty() {
-                                respire::service::device_tag()
-                            } else {
-                                main.local_computer.clone()
-                            },
-                            device: if main.local_device.is_empty() {
-                                respire::service::device_tag()
-                            } else {
-                                main.local_device.clone()
-                            },
-                            modified_by: respire::service::device_tag(),
-                            project: main.local_project.clone(),
-                            created_at: main.local_created_at.clone(),
-                            updated_at: stamp.clone(),
-                            emotion: 0.0,
-                            parent_id: main.local_parent_id.clone(),
-                            importance: "trivial".to_owned(),
-                        };
-                        let stored = MemoryEngine::seal(&session, embedder!(), &e, &e.user)?;
+                        // Appending must preserve a user's title and other metadata.
+                        let mut e = MemoryEngine::open(&session, main)?;
+                        e.content = merged;
+                        e.updated_at = store.edit_stamp(&main.id)?;
+                        e.modified_by = respire::service::device_tag();
+                        let stored = MemoryEngine::seal(&session, embedder!(), &e, &main.user)?;
                         anyhow::ensure!(commit_prepared_write(short_write, write_generation, || store.put_diary_checked(&stored, &main.ciphertext, &tracks[1..]))?, "diary was not saved");
                         respire::hooks::fire(
                             respire::hooks::HookEvent::PostRemember,
-                            respire::hooks::remember_done_payload(&stored.id, &title, "trivial"),
+                            respire::hooks::remember_done_payload(&stored.id, &e.title, &e.importance),
                         );
                         // A sealed StoredMemory contains the encrypted payload and local
                         // storage columns.  It is an internal persistence shape, not a
@@ -6873,7 +6872,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
                                 "action": "diary_appended",
                                 "index_state": if stored.local_artifact.is_empty() { "pending" } else { "ready" },
                                 "id": stored.id,
-                                "title": track_title,
+                                "title": e.title,
                             }),
                             vec![OutputItem::new(
                                 "write",
@@ -8982,6 +8981,60 @@ mod capture_tests {
             Some(value) => std::env::set_var("RSRS_BIN_DIR", value),
             None => std::env::remove_var("RSRS_BIN_DIR"),
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod diary_identity_tests {
+    use super::*;
+
+    fn track(id: &str, user: &str, title: &str, created: &str) -> respire::StoredMemory {
+        let mut memory = respire::StoredMemory::new_pending(id.into(), user.into());
+        memory.local_title = title.into();
+        memory.local_created_at = created.into();
+        memory
+    }
+
+    #[test]
+    fn stable_id_precedes_legacy_titles_and_preserves_importance_compatibility() -> Result<()> {
+        let mut legacy = track("legacy", "alice", "活动轨迹 2026-10-13", "2026-10-13T00:00:00Z");
+        legacy.local_importance = "normal".into();
+        let canonical = track("stable", "server-routing-owner", "User's renamed day", "2026-10-13T01:00:00Z");
+        let rows = vec![legacy, canonical];
+        let tracks = select_diary_tracks(&rows, "stable", "活动轨迹 2026-10-13", |row| Ok(row.user == "alice"))?;
+        assert_eq!(tracks.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), ["stable", "legacy"]);
+        Ok(())
+    }
+
+    #[test]
+    fn blank_title_deleted_rows_other_users_and_days_are_handled_separately() -> Result<()> {
+        let mut deleted = track("deleted", "alice", "活动轨迹 2026-10-13", "0");
+        deleted.deleted = true;
+        let rows = vec![
+            track("stable", "alice", "", "1"),
+            deleted,
+            track("other-user", "bob", "活动轨迹 2026-10-13", "0"),
+            track("other-day", "alice", "活动轨迹 2026-10-12", "0"),
+        ];
+        let tracks = select_diary_tracks(&rows, "stable", "活动轨迹 2026-10-13", |row| Ok(row.user == "alice"))?;
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].id, "stable");
+        assert!(select_diary_tracks(&rows, "charlie-stable", "活动轨迹 2026-10-14", |row| Ok(row.user == "charlie"))?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_or_deleted_stable_id_keeps_earliest_legacy_track() -> Result<()> {
+        let mut deleted = track("stable", "alice", "renamed", "0");
+        deleted.deleted = true;
+        let rows = vec![
+            track("later", "alice", "活动轨迹 2026-10-13", "2"),
+            track("earlier", "alice", "活动轨迹 2026-10-13", "1"),
+            deleted,
+        ];
+        let tracks = select_diary_tracks(&rows, "stable", "活动轨迹 2026-10-13", |row| Ok(row.user == "alice"))?;
+        assert_eq!(tracks.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), ["earlier", "later"]);
         Ok(())
     }
 }
