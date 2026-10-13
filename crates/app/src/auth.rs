@@ -96,14 +96,26 @@ pub fn logout(full: bool) -> Result<()> {
 
 /// Unlock session keys from local session.json.
 pub fn load_local_session() -> Result<SessionKeys> {
-    let data = read_session_json()?;
+    load_local_session_with_owner().map(|(keys, _)| keys)
+}
+
+/// Unlock keys and retain the profile-owner alias from the same file snapshot.
+/// This is local configuration identity, not proof of remote account authentication.
+pub fn load_local_session_with_owner() -> Result<(SessionKeys, Option<String>)> {
+    unlock_local_session_snapshot(&read_session_json()?)
+}
+
+/// Keep key material and owner inseparable even if the profile changes after reading.
+fn unlock_local_session_snapshot(data: &serde_json::Value) -> Result<(SessionKeys, Option<String>)> {
     let user = data["user"].as_str().unwrap_or("").to_owned();
     let explicit_pass = if data["vault_version"] == 1 {
         crate::env::var("RSRS_PASS").ok().filter(|value| !value.is_empty())
     } else { None };
     let pass = explicit_pass.or_else(|| data["pass"].as_str().map(ToOwned::to_owned))
         .or_else(|| crate::keystore::load_login_pass(&user)).unwrap_or_default();
-    unlock_session_keys(&data, &pass, None, &user)
+    let keys = unlock_session_keys(data, &pass, None, &user)?;
+    let owner = if user.trim().is_empty() { None } else { Some(user) };
+    Ok((keys, owner))
 }
 
 /// Try to unlock the local session; no session → Ok(None) (unregistered; web can guide register).
@@ -875,6 +887,43 @@ mod tests {
         });
         unlock_session_keys(&v2, "login-pass", None, "u")?;
         assert!(unlock_session_keys(&v2, "login-pass", Some("wrong-pass"), "u").is_err());
+        Ok(())
+    }
+
+    /// A replaced session file cannot supply an alias for previously read key material.
+    #[test]
+    fn local_session_owner_and_keys_share_one_snapshot() -> Result<()> {
+        let _iso = crate::test_lock::Isolate::new()?;
+        assert!(load_local_session_with_owner().is_err());
+        let salt = crypto::random_hex(16);
+        let kek = crypto::derive_super_kek("synthetic-super", &salt)?;
+        let first_urk = [11; 32];
+        let (nonce, wrapped) = crypto::wrap_key(&first_urk, &kek)?;
+        let first = serde_json::json!({"user":"snapshot-owner", "pass":"unused",
+            "super":"synthetic-super", "vault_version":2, "kdf_salt":salt,
+            "wrapped_urk":wrapped, "urk_nonce":nonce});
+        write_session_json(&first)?;
+        let snapshot = read_session_json()?;
+        let second_urk = [12; 32];
+        let (nonce, wrapped) = crypto::wrap_key(&second_urk, &kek)?;
+        let mut second = first.clone();
+        second["user"] = serde_json::json!("replacement-owner");
+        second["wrapped_urk"] = serde_json::json!(wrapped);
+        second["urk_nonce"] = serde_json::json!(nonce);
+        write_session_json(&second)?;
+        let (keys, owner) = unlock_local_session_snapshot(&snapshot)?;
+        assert!(keys.urk == first_urk);
+        assert_eq!(owner.as_deref(), Some("snapshot-owner"));
+        let (keys, owner) = load_local_session_with_owner()?;
+        assert!(keys.urk == second_urk);
+        assert_eq!(owner.as_deref(), Some("replacement-owner"));
+        for user in [serde_json::Value::Null, serde_json::json!(""), serde_json::json!(" ")] {
+            second["user"] = user;
+            write_session_json(&second)?;
+            let (keys, owner) = load_local_session_with_owner()?;
+            assert!(keys.urk == second_urk && owner.is_none());
+            assert!(load_local_session()?.urk == second_urk);
+        }
         Ok(())
     }
 

@@ -1629,15 +1629,17 @@ fn select_diary_tracks<'a>(
     memories: &'a [respire::StoredMemory],
     track_id: &str,
     track_title: &str,
-    mut same_legacy_author: impl FnMut(&respire::StoredMemory) -> Result<bool>,
+    mut accepted_author: impl FnMut(&respire::StoredMemory) -> Result<bool>,
 ) -> Result<Vec<&'a respire::StoredMemory>> {
     let mut tracks = Vec::new();
     for memory in memories.iter().filter(|memory| !memory.deleted) {
-        // The stable ID already includes the author/day. Wire user is server
-        // routing metadata, so legacy authors must come from the sealed payload.
-        if memory.id == track_id
-            || (memory.local_title == track_title && same_legacy_author(memory)?) {
-            tracks.push(memory);
+        // Envelope IDs and wire owners are not authenticated payload identity.
+        // Accept authors only from the logical identity or unlocked local profile.
+        if memory.id == track_id || memory.local_title == track_title {
+            let accepted = accepted_author(memory)?;
+            anyhow::ensure!(memory.id != track_id || accepted,
+                "daily track author does not match this profile; append was not applied");
+            if accepted { tracks.push(memory); }
         }
     }
     tracks.sort_by(|left, right| {
@@ -1696,8 +1698,14 @@ fn build_remote() -> Result<RemoteTransport> {
 
 /// Unlock session keys: local keyfile first (from keygen/register), else env vars.
 fn build_session() -> Result<SessionKeys> {
-    if let Ok(keys) = load_local_session() {
-        return Ok(keys);
+    build_session_with_owner().map(|(keys, _)| keys)
+}
+
+/// Preserve only the owner alias from the local snapshot that supplied these keys.
+/// Environment-key fallback must never inherit identity from an unrelated profile.
+fn build_session_with_owner() -> Result<(SessionKeys, Option<String>)> {
+    if let Ok(session) = auth::load_local_session_with_owner() {
+        return Ok(session);
     }
     if read_session_json().is_err() {
         // no local session -> first-run guide
@@ -1717,7 +1725,7 @@ fn build_session() -> Result<SessionKeys> {
         .map_err(|_| anyhow!("need RSRS_WRAPPED_URK (from keygen/login)"))?;
     let urk_nonce = respire::env::var("RSRS_URK_NONCE")
         .map_err(|_| anyhow!("need RSRS_URK_NONCE (from keygen/login)"))?;
-    SessionKeys::unlock(&password, &secret, &kdf_salt, &wrapped_urk, &urk_nonce)
+    Ok((SessionKeys::unlock(&password, &secret, &kdf_salt, &wrapped_urk, &urk_nonce)?, None))
 }
 
 fn read_session_json() -> Result<serde_json::Value> {
@@ -4196,10 +4204,6 @@ fn run_defrag(min: f32, top: usize) -> Result<()> {
     emit_result(result)?;
     Ok(())
 }
-fn load_local_session() -> Result<SessionKeys> {
-    auth::load_local_session()
-}
-
 fn run_keygen(pass: Option<&str>, force: bool) -> Result<()> {
     // v4: --pass is unused for encryption (super password is system-generated); kept for old scripts
     if pass.is_some() {
@@ -6798,7 +6802,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
                     eprintln!("WARN {w}");
                 }
             }
-            let session = build_session()?;
+            let (session, profile_owner) = build_session_with_owner()?;
             let store = build_local()?;
             let stamp = now_stamp();
             let mut id = Uuid::new_v4().to_string();
@@ -6829,7 +6833,8 @@ fn run_local_inner(args: Cli) -> Result<()> {
                     )
                     .to_string();
                     let tracks = select_diary_tracks(&all, &track_id, &track_title, |memory| {
-                        Ok(MemoryEngine::open(&session, memory)?.user == user)
+                        let author = MemoryEngine::open(&session, memory)?.user;
+                        Ok(author == user || profile_owner.as_deref() == Some(author.as_str()))
                     })?;
                     if !tracks.is_empty() {
                         // Prefer the stable ID; otherwise keep the earliest legacy track.
@@ -8989,6 +8994,7 @@ mod capture_tests {
 mod diary_identity_tests {
     use super::*;
 
+    /// Construct selection-only metadata without opening a vault.
     fn track(id: &str, user: &str, title: &str, created: &str) -> respire::StoredMemory {
         let mut memory = respire::StoredMemory::new_pending(id.into(), user.into());
         memory.local_title = title.into();
@@ -8996,17 +9002,29 @@ mod diary_identity_tests {
         memory
     }
 
+    /// Stable identity wins over older same-title legacy rows.
     #[test]
     fn stable_id_precedes_legacy_titles_and_preserves_importance_compatibility() -> Result<()> {
         let mut legacy = track("legacy", "alice", "活动轨迹 2026-10-13", "2026-10-13T00:00:00Z");
         legacy.local_importance = "normal".into();
         let canonical = track("stable", "server-routing-owner", "User's renamed day", "2026-10-13T01:00:00Z");
         let rows = vec![legacy, canonical];
-        let tracks = select_diary_tracks(&rows, "stable", "活动轨迹 2026-10-13", |row| Ok(row.user == "alice"))?;
+        let tracks = select_diary_tracks(&rows, "stable", "活动轨迹 2026-10-13", |row| Ok(row.id == "stable" || row.user == "alice"))?;
         assert_eq!(tracks.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), ["stable", "legacy"]);
         Ok(())
     }
 
+    /// An unrelated canonical payload must fail before legacy candidates can be merged.
+    #[test]
+    fn canonical_author_mismatch_is_not_a_legacy_fallback() -> Result<()> {
+        let rows = vec![track("stable", "wire-owner", "renamed", "1"),
+            track("legacy", "alice", "活动轨迹 2026-10-13", "0")];
+        let result = select_diary_tracks(&rows, "stable", "活动轨迹 2026-10-13", |row| Ok(row.id != "stable"));
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    /// Blank titles remain valid while deleted and unrelated tracks stay separate.
     #[test]
     fn blank_title_deleted_rows_other_users_and_days_are_handled_separately() -> Result<()> {
         let mut deleted = track("deleted", "alice", "活动轨迹 2026-10-13", "0");
@@ -9024,6 +9042,7 @@ mod diary_identity_tests {
         Ok(())
     }
 
+    /// Live legacy tracks retain their deterministic earliest-created ordering.
     #[test]
     fn missing_or_deleted_stable_id_keeps_earliest_legacy_track() -> Result<()> {
         let mut deleted = track("stable", "alice", "renamed", "0");

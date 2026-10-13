@@ -5,7 +5,7 @@ use respire::{MemoryEngine, MemoryEntry, MemoryTransport, SessionKeys, StoredMem
 use respire::memory::{crypto, search::HashingEmbedder};
 use respire::transport::local::LocalStore;
 use serde_json::{json, Value};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, Output};
 use std::time::Duration;
 
 struct Fixture {
@@ -14,9 +14,11 @@ struct Fixture {
     secret: String,
     keys: SessionKeys,
     child: Option<Child>,
+    extra_env: Vec<(&'static str, String)>,
 }
 
 impl Fixture {
+    /// Create an isolated local vault containing only deterministic synthetic keys.
     fn new() -> anyhow::Result<Self> {
         let home = tempfile::tempdir()?;
         std::fs::create_dir(home.path().join("data"))?;
@@ -32,9 +34,10 @@ impl Fixture {
             "urk_nonce":nonce
         }))?)?;
         std::fs::write(home.path().join("data/agent.json"), br#"{"diary_mode":"concise"}"#)?;
-        Ok(Self { home, port, secret, keys:SessionKeys::from_urk(urk)?, child:None })
+        Ok(Self { home, port, secret, keys:SessionKeys::from_urk(urk)?, child:None, extra_env:Vec::new() })
     }
 
+    /// Build a command confined to this profile, port, and disabled remote services.
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_rsrs"));
         for (name, _) in std::env::vars_os() {
@@ -56,12 +59,15 @@ impl Fixture {
             // Refuse background model downloads at a loopback-only destination.
             .env("RSRS_MIRROR", "http://127.0.0.1:9")
             .env("RSRS_CPU_ORT_MIRROR", "http://127.0.0.1:9");
+        command.envs(self.extra_env.iter().map(|(name, value)| (*name, value)));
         command
     }
 
+    /// Start an owned runtime and verify its process and profile before use.
     fn start(&mut self) -> anyhow::Result<()> {
         self.child = Some(self.command(&["--runtime-internal"])
-            .stdout(Stdio::null()).stderr(Stdio::null()).spawn()?);
+            .stdout(std::fs::File::create(self.home.path().join("runtime.stdout"))?)
+            .stderr(std::fs::File::create(self.home.path().join("runtime.stderr"))?).spawn()?);
         for _ in 0..100 {
             if let Some(status) = self.child.as_mut().context("synthetic runtime child missing")?.try_wait()? {
                 anyhow::bail!("synthetic runtime exited: {status}");
@@ -72,6 +78,7 @@ impl Fixture {
         anyhow::bail!("synthetic runtime did not become ready")
     }
 
+    /// Reject port collisions instead of submitting commands to another runtime.
     fn owns_runtime(&self) -> anyhow::Result<bool> {
         let Some(child) = self.child.as_ref() else { return Ok(false); };
         let Ok(response) = ureq::get(&format!("http://127.0.0.1:{}/api/health", self.port))
@@ -83,6 +90,7 @@ impl Fixture {
         Ok(true)
     }
 
+    /// Execute a public client-only command after rechecking runtime ownership.
     fn run(&self, args: &[&str]) -> anyhow::Result<Value> {
         anyhow::ensure!(self.owns_runtime()?, "synthetic runtime is not ready");
         let mut all = vec!["--client-only", "--json"];
@@ -90,6 +98,7 @@ impl Fixture {
         Self::result(self.command(&all).output()?)
     }
 
+    /// Require a successful command and decode its public JSON envelope.
     fn result(output: Output) -> anyhow::Result<Value> {
         let value: Value = serde_json::from_slice(&output.stdout)?;
         anyhow::ensure!(output.status.success(), "synthetic command failed: {value}; {}",
@@ -97,22 +106,27 @@ impl Fixture {
         Ok(value)
     }
 
+    /// Append one trivial event using the public remember command.
     fn remember(&self, content: &str) -> anyhow::Result<Value> {
         self.run(&["remember", content, "--importance", "trivial"])
     }
 
+    /// Read the full saved entry using its public command contract.
     fn show(&self, id: &str) -> anyhow::Result<Value> {
         Ok(self.run(&["show", id])?["details"]["entry"].clone())
     }
 
+    /// Open only this fixture's local database for synthetic setup and assertions.
     fn store(&self) -> anyhow::Result<LocalStore> {
         LocalStore::open(&self.home.path().join("data/rsrs.db"))
     }
 
+    /// Seed a synthetic entry whose payload author and wire owner agree.
     fn seed(&self, entry: &MemoryEntry, deleted: bool) -> anyhow::Result<StoredMemory> {
         self.seed_with_owner(entry, deleted, &entry.user)
     }
 
+    /// Seed separate logical authors and routing owners without model downloads.
     fn seed_with_owner(&self, entry: &MemoryEntry, deleted: bool, wire_user: &str) -> anyhow::Result<StoredMemory> {
         let _defer = respire::core_sdk::defer_indexing();
         let mut stored = MemoryEngine::seal(&self.keys, &HashingEmbedder::default(), entry, wire_user)?;
@@ -121,6 +135,35 @@ impl Fixture {
         Ok(stored)
     }
 
+    /// Verify rejected identity cannot mutate records/outbox or disclose fixture secrets.
+    fn assert_author_rejection(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.owns_runtime()?, "synthetic runtime is not ready");
+        let before = serde_json::to_value(self.store()?.all(true)?)?;
+        let boundary = self.store()?.outgoing_boundary()?;
+        let outgoing = serde_json::to_value(self.store()?.outgoing()?)?;
+        let output = self.command(&["--client-only", "--json", "remember", "rejected-private-event",
+            "--importance", "trivial"]).output()?;
+        assert!(!output.status.success());
+        let value: Value = serde_json::from_slice(&output.stdout)?;
+        assert!(value["errors"].as_array().context("missing error array")?.iter().any(|error|
+            error.as_str().is_some_and(|message| message.contains("daily track author does not match this profile"))));
+        assert!(before == serde_json::to_value(self.store()?.all(true)?)?, "rejected append mutated rows");
+        assert_eq!(boundary, self.store()?.outgoing_boundary()?, "rejected append queued a sync operation");
+        assert!(outgoing == serde_json::to_value(self.store()?.outgoing()?)?, "rejected append changed pending sync bytes");
+        let emitted = format!("{}{}{}{}", String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            std::fs::read_to_string(self.home.path().join("runtime.stdout"))?,
+            std::fs::read_to_string(self.home.path().join("runtime.stderr"))?);
+        for private in [&self.secret, "foreign-private-author", "foreign-private-event", "rejected-private-event"] {
+            assert!(!emitted.contains(private), "rejection exposed private fixture data");
+        }
+        for (_, private) in &self.extra_env {
+            assert!(!emitted.contains(private), "rejection exposed synthetic fallback key material");
+        }
+        Ok(())
+    }
+
+    /// Stop only the verified runtime or the exact child process we spawned.
     fn stop(&mut self) {
         let owned = self.owns_runtime().unwrap_or(false);
         if let Some(mut child) = self.child.take() {
@@ -136,8 +179,12 @@ impl Fixture {
         }
     }
 }
-impl Drop for Fixture { fn drop(&mut self) { self.stop(); } }
+impl Drop for Fixture {
+    /// Reap the fixture runtime even when a test exits early.
+    fn drop(&mut self) { self.stop(); }
+}
 
+/// Match the child runtime's calendar-day boundary on the current platform.
 fn day() -> String {
     // Child TZ=UTC applies on Unix; Windows uses the OS local timezone.
     #[cfg(windows)]
@@ -146,10 +193,12 @@ fn day() -> String {
     let now = chrono::Utc::now();
     now.format("%Y-%m-%d").to_string()
 }
+/// Reproduce the public daily identity namespace for synthetic authors and dates.
 fn track_id(user: &str, day: &str) -> String {
     uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL,
         format!("activity-track/{user}/{day}").as_bytes()).to_string()
 }
+/// Build synthetic metadata whose preservation can be checked after appends.
 fn entry(id: &str, user: &str, title: &str, content: &str) -> MemoryEntry {
     MemoryEntry {
         id:id.into(), user:user.into(), title:title.into(), content:content.into(),
@@ -163,6 +212,7 @@ fn entry(id: &str, user: &str, title: &str, content: &str) -> MemoryEntry {
     }
 }
 
+/// Public retitling, including a blank title, must not break daily append identity.
 #[test]
 fn public_title_edit_and_blank_title_still_append_without_changing_metadata() -> anyhow::Result<()> {
     let mut fixture = Fixture::new()?;
@@ -192,6 +242,7 @@ fn public_title_edit_and_blank_title_still_append_without_changing_metadata() ->
     Ok(())
 }
 
+/// Stable and legacy tracks merge atomically without crossing author/day boundaries.
 #[test]
 fn canonical_identity_merges_legacy_tracks_without_touching_other_users_or_days() -> anyhow::Result<()> {
     let mut fixture = Fixture::new()?;
@@ -228,6 +279,7 @@ fn canonical_identity_merges_legacy_tracks_without_touching_other_users_or_days(
     Ok(())
 }
 
+/// Tombstoned content must stay deleted while legacy fallback and recreation work.
 #[test]
 fn deleted_stable_track_uses_legacy_fallback_and_deleted_history_is_not_resurrected() -> anyhow::Result<()> {
     let mut fixture = Fixture::new()?;
@@ -252,6 +304,7 @@ fn deleted_stable_track_uses_legacy_fallback_and_deleted_history_is_not_resurrec
     Ok(())
 }
 
+/// Concurrent clients must preserve every successful event exactly once.
 #[test]
 fn concurrent_same_day_client_commands_preserve_each_successful_addition_once() -> anyhow::Result<()> {
     let mut fixture = Fixture::new()?;
@@ -281,4 +334,70 @@ fn concurrent_same_day_client_commands_preserve_each_successful_addition_once() 
         assert_eq!(content.matches(&format!("pair-{pair}-event-{index}")).count(), 1);
     }}
     Ok(())
+}
+
+/// Old appends copied the routing owner into the encrypted author without changing ID.
+#[test]
+fn old_owner_normalized_diary_keeps_its_author_after_public_title_edit() -> anyhow::Result<()> {
+    let mut fixture = Fixture::new()?;
+    let session_path = fixture.home.path().join("data/session.json");
+    let mut session: Value = serde_json::from_slice(&std::fs::read(&session_path)?)?;
+    session["user"] = json!("synthetic-account-owner");
+    std::fs::write(session_path, serde_json::to_vec(&session)?)?;
+    let day = day();
+    let id = track_id("synthetic-diary", &day);
+    // This is the payload produced by dev.7 after an owner-normalizing pull + append.
+    let legacy = entry(&id, "synthetic-account-owner", &format!("活动轨迹 {day}"), "old-owner-event");
+    fixture.seed(&legacy, false)?;
+    fixture.seed(&entry("old-owner-legacy", "synthetic-account-owner", &format!("活动轨迹 {day}"), "old-owner-legacy-event"), false)?;
+    fixture.start()?;
+    fixture.run(&["update", &id, "--title", "Renamed old owner-normalized diary"])?;
+    fixture.remember("new-owner-event")?;
+    let saved = fixture.show(&id)?;
+    assert_eq!(saved["user"], "synthetic-account-owner");
+    assert_eq!(saved["title"], "Renamed old owner-normalized diary");
+    let content = saved["content"].as_str().context("synthetic response string missing")?;
+    for marker in ["old-owner-event", "old-owner-legacy-event", "new-owner-event"] {
+        assert_eq!(content.matches(marker).count(), 1);
+    }
+    Ok(())
+}
+
+/// Different payload authors cannot borrow a canonical ID or a matching wire owner.
+#[test]
+fn unrelated_canonical_author_fails_without_writes_or_private_output() -> anyhow::Result<()> {
+    let mut fixture = Fixture::new()?;
+    let day = day();
+    fixture.seed_with_owner(&entry(&track_id("synthetic-diary", &day), "foreign-private-author",
+        "Renamed foreign track", "foreign-private-event"), false, "synthetic-diary")?;
+    fixture.seed(&entry("legacy-must-survive", "synthetic-diary", &format!("活动轨迹 {day}"), "legacy-live-event"), false)?;
+    fixture.start()?;
+    fixture.assert_author_rejection()
+}
+
+/// Environment fallback keys must not inherit the failed local session's owner alias.
+#[test]
+fn environment_key_fallback_does_not_adopt_unlocked_profile_alias() -> anyhow::Result<()> {
+    let mut fixture = Fixture::new()?;
+    let session_path = fixture.home.path().join("data/session.json");
+    let mut session: Value = serde_json::from_slice(&std::fs::read(&session_path)?)?;
+    session["user"] = json!("foreign-private-author");
+    // Preserve a readable profile, but force local unlock to fail before env fallback.
+    session["wrapped_urk"] = json!("rsrs:v1:00");
+    std::fs::write(session_path, serde_json::to_vec(&session)?)?;
+    let salt = "13".repeat(16);
+    let password = "synthetic-fallback-password";
+    let account_secret = "synthetic-fallback-secret";
+    let kek = crypto::derive_rsrs_password_kek(password, account_secret, &salt)?;
+    let (nonce, wrapped) = crypto::wrap_key(&fixture.keys.urk, &kek)?;
+    fixture.extra_env = vec![("RSRS_PASS", password.into()), ("RSRS_SECRET", account_secret.into()),
+        ("RSRS_KDF_SALT", salt), ("RSRS_WRAPPED_URK", format!("{}{wrapped}", crypto::RSRS_PREFIX)),
+        ("RSRS_URK_NONCE", nonce)];
+    let day = day();
+    let id = track_id("synthetic-diary", &day);
+    fixture.seed(&entry(&id, "foreign-private-author", "Renamed unrelated profile", "foreign-private-event"), false)?;
+    fixture.start()?;
+    // A successful full read proves the environment keys can actually decrypt this vault.
+    assert_eq!(fixture.show(&id)?["user"], "foreign-private-author");
+    fixture.assert_author_rejection()
 }
