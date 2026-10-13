@@ -1,12 +1,28 @@
 {
   "schema": 1,
-  "authority": "Baseline cloud routes; GitHub transport/security is checked separately by dev-github-api-smoke.py; reviewed 2026-10-06",
+  "authority": "CLI baseline cloud API contract reviewed against server 7f0b107 on 2026-10-13; this is not complete browser/Passkey API coverage.",
   "expected_route_count": 66,
   "routes": [
-    { "method": "POST", "path": "/oauth/device/code", "group": "auth" },
-    { "method": "POST", "path": "/oauth/token", "group": "auth" },
-    { "method": "GET", "path": "/api/self/cli-authorization/{code}", "group": "user" },
-    { "method": "POST", "path": "/api/self/cli-authorization/{code}", "group": "user" },
+    {
+      "method": "POST",
+      "path": "/oauth/device/code",
+      "group": "auth"
+    },
+    {
+      "method": "POST",
+      "path": "/oauth/token",
+      "group": "auth"
+    },
+    {
+      "method": "GET",
+      "path": "/api/self/cli-authorization/{code}",
+      "group": "user"
+    },
+    {
+      "method": "POST",
+      "path": "/api/self/cli-authorization/{code}",
+      "group": "user"
+    },
     {
       "method": "GET",
       "path": "/health",
@@ -318,5 +334,58 @@
       "group": "admin"
     }
   ],
-  "server_source_sha": "63c3da9e64a4ce182bfd802518030b102dd362a3"
+  "server_source_sha": "7f0b10756011759e2960ffbeae8d61f15d337785",
+  "review": {
+    "previous_server_source_sha": "63c3da9e64a4ce182bfd802518030b102dd362a3",
+    "compare_url": "https://github.com/risense-ai/respire-server/compare/63c3da9e64a4ce182bfd802518030b102dd362a3...7f0b10756011759e2960ffbeae8d61f15d337785",
+    "baseline_routes_preserved": 66,
+    "canonical_server_operations": 84,
+    "changed_baseline_routes": [
+      "GET /api/self/vault",
+      "POST /api/self/vault"
+    ],
+    "changed_baseline_assertions": [
+      "stable account_id",
+      "initial key_generation",
+      "idempotent legacy write",
+      "generation advance on changed legacy write",
+      "same-URK rewrap generation guard",
+      "rejected operations preserve vault bytes"
+    ]
+  },
+  "separate_coverage": {
+    "github_transport": {
+      "suite": "dev-github-api-smoke.py",
+      "routes": [
+        "POST /oauth/github/start",
+        "POST /oauth/github/exchange",
+        "GET /api/self/github",
+        "POST /api/self/github/start",
+        "POST /api/self/github/exchange",
+        "POST /api/self/github/unbind",
+        "POST /api/self/github/vault"
+      ]
+    },
+    "existing_browser_only": {
+      "status": "not covered by this CLI baseline",
+      "routes": [
+        "GET /auth/salt",
+        "GET /api/self/memories"
+      ]
+    },
+    "passkey_and_vault_reset": {
+      "status": "not covered by this CLI baseline; separate Passkey acceptance is required",
+      "routes": [
+        "GET /api/self/passkeys",
+        "POST /api/self/passkeys/register/start",
+        "POST /api/self/passkeys/register/finish",
+        "POST /api/self/passkeys/register/test",
+        "POST /api/self/passkeys/register/commit",
+        "POST /api/self/passkeys/unlock/start",
+        "POST /api/self/passkeys/unlock/finish",
+        "POST /api/self/passkeys/remove",
+        "POST /api/self/vault/reset"
+      ]
+    }
+  }
 }

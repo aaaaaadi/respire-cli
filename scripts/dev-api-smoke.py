@@ -4,7 +4,8 @@
 Run: python3 scripts/dev-api-smoke.py --scope all --report <coverage.json>
 Requires GITHUB_ACTIONS=true, RSRS_DEV_SERVER_ADDR=https://api.dev.rsrs.rs,
 RSRS_DEV_API_ADMIN_APPROVED=true and secret RSRS_DEV_ADMIN_TOKEN.
-This supplements CLI smoke. Synthetic opaque ciphertext checks the server
+This checks the reviewed 66-operation CLI baseline, not all browser/Passkey APIs.
+Synthetic opaque ciphertext checks the server
 contract; actual client encryption/decryption belongs to the separate CLI run.
 """
 
@@ -27,6 +28,19 @@ import urllib.parse
 import urllib.request
 
 
+BASELINE_ROUTE_SHA256 = 'd9ae8f93cfb979ba626c90da3494e4d747e2b5a25548d99caa29c8cf97622864'
+REQUIRED_VAULT_ASSERTIONS = {
+    'wrapped-vault-save', 'wrapped-vault-roundtrip', 'identical-legacy-vault-write',
+    'identical-write-preserves-vault-and-generation', 'changed-legacy-vault-write',
+    'legacy-write-advances-generation', 'rewrap-missing-generation',
+    'rewrap-missing-generation-preserves-vault', 'rewrap-stale-generation',
+    'rewrap-stale-generation-preserves-vault', 'unsupported-vault-operation',
+    'unsupported-vault-operation-preserves-vault', 'same-urk-rewrap-current-generation',
+    'same-urk-rewrap-preserves-generation', 'readonly-vault-write-rejected',
+    'readonly-vault-write-preserves-state',
+}
+
+
 class SmokeFailure(Exception):
     """Only constant, non-sensitive reason codes may escape the request layer."""
 
@@ -42,6 +56,18 @@ def totp(secret):
     offset = digest[-1] & 15
     value = struct.unpack('>I', digest[offset:offset + 4])[0] & 0x7fffffff
     return f'{value % 1000000:06d}'
+
+
+def valid_vault_reply(reply, vault, account_id=None, key_generation=None):
+    """Require preserved recovery fields and the reviewed stable identity/generation schema."""
+    identity = reply.get('account_id')
+    generation = reply.get('key_generation')
+    return (all(reply.get(key) == value for key, value in vault.items())
+            and isinstance(identity, str)
+            and re.fullmatch('[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', identity) is not None
+            and type(generation) is int and 1 <= generation <= 9007199254740991
+            and (account_id is None or identity == account_id)
+            and (key_generation is None or generation == key_generation))
 
 
 class Smoke:
@@ -86,8 +112,12 @@ class Smoke:
             raise SmokeFailure('exact-server-sha-required')
         if self.contract.get('server_source_sha') != self.expected_server_sha:
             raise SmokeFailure('route-contract-server-revision-mismatch')
-        if self.contract.get('expected_route_count') != 66 or len(self.routes) != 66:
+        if (self.contract.get('expected_route_count') != 66 or len(self.routes) != 66
+                or len(self.contract.get('routes', [])) != 66):
             raise SmokeFailure('route-contract-count-mismatch')
+        inventory = '\n'.join(sorted(f"{r['method']} {r['path']} {r['group']}" for r in self.routes.values()))
+        if hashlib.sha256(inventory.encode()).hexdigest() != BASELINE_ROUTE_SHA256:
+            raise SmokeFailure('route-contract-inventory-mismatch')
 
     def key(self, method, path):
         clean = urllib.parse.urlsplit(path).path
@@ -209,6 +239,40 @@ class Smoke:
                        status=401 if empty_totp or not unauth else 400, predicate=lambda r: 'error' in r,
                        kind='negative', label='empty-default-totp-ticket' if empty_totp else 'bad-json' if unauth else 'missing-authorization')
 
+    def vault_contract(self, token):
+        """Exercise changed baseline vault semantics using only this run's synthetic account."""
+        vault = {'kdf_salt': secrets.token_hex(16), 'wrapped_urk': secrets.token_hex(32),
+                 'urk_nonce': secrets.token_hex(12), 'version': 4}
+        self.check('POST', '/api/self/vault', vault, token,
+                   predicate=lambda r: r.get('ok') is True, label='wrapped-vault-save')
+        original = self.check('GET', '/api/self/vault', token=token,
+                   predicate=lambda r: valid_vault_reply(r, vault, key_generation=1), label='wrapped-vault-roundtrip')
+        account_id = original['account_id']
+        self.check('POST', '/api/self/vault', vault, token,
+                   predicate=lambda r: r.get('ok') is True, label='identical-legacy-vault-write')
+        self.check('GET', '/api/self/vault', token=token,
+                   predicate=lambda r: r == original, label='identical-write-preserves-vault-and-generation')
+        changed = dict(vault, wrapped_urk=secrets.token_hex(32))
+        self.check('POST', '/api/self/vault', changed, token,
+                   predicate=lambda r: r.get('ok') is True, label='changed-legacy-vault-write')
+        current = self.check('GET', '/api/self/vault', token=token,
+                   predicate=lambda r: valid_vault_reply(r, changed, account_id, 2), label='legacy-write-advances-generation')
+        rewrapped = dict(changed, wrapped_urk=secrets.token_hex(32))
+        rejected = [
+            (dict(rewrapped, operation='rewrap_same_urk'), 'rewrap-missing-generation'),
+            (dict(rewrapped, operation='rewrap_same_urk', expected_key_generation=1), 'rewrap-stale-generation'),
+            (dict(rewrapped, operation='unsupported', expected_key_generation=2), 'unsupported-vault-operation'),
+        ]
+        for body, label in rejected:
+            self.check('POST', '/api/self/vault', body, token, status=400,
+                       predicate=lambda r: 'error' in r, kind='negative', label=label)
+            self.check('GET', '/api/self/vault', token=token,
+                       predicate=lambda r: r == current, label=label + '-preserves-vault')
+        self.check('POST', '/api/self/vault', dict(rewrapped, operation='rewrap_same_urk', expected_key_generation=2), token,
+                   predicate=lambda r: r.get('ok') is True, label='same-urk-rewrap-current-generation')
+        return self.check('GET', '/api/self/vault', token=token,
+                   predicate=lambda r: valid_vault_reply(r, rewrapped, account_id, 2), label='same-urk-rewrap-preserves-generation')
+
     def user_and_sync(self, a, b):
         token = a['token']
         self.check('GET', '/ready', predicate=lambda r: r.get('database') == 'ready' and r.get('ok') is True, label='database-readiness')
@@ -222,16 +286,17 @@ class Smoke:
                    predicate=lambda r: 'error' in r, kind='negative', label='wrong-password')
         token = a['token']
         self.check('GET', '/api/self', token=token, predicate=lambda r: r.get('user') == a['user'], label='own-identity')
-        vault = {'kdf_salt': secrets.token_hex(16), 'wrapped_urk': 'aa', 'urk_nonce': 'bb', 'version': 4}
-        self.check('POST', '/api/self/vault', vault, token, predicate=lambda r: r.get('ok') is True, label='wrapped-vault-save')
-        self.check('GET', '/api/self/vault', token=token,
-                   predicate=lambda r: all(r.get(k) == v for k, v in vault.items()), label='wrapped-vault-roundtrip')
+        vault_snapshot = self.vault_contract(token)
         self.check('GET', '/api/self/keys', token=token,
                    predicate=lambda r: r.get('user') == a['user'] and r.get('auth_salt') == a['salt'] and 'token_masked' in r,
                    label='own-key-summary')
         reader = self.check('POST', '/api/self/sessions', {'device_name': 'api-reader', 'readonly': True}, token,
                             predicate=lambda r: bool(r.get('token')) and bool(r.get('session_id')) and r.get('readonly') is True,
                             label='readonly-session-create')
+        self.check('POST', '/api/self/vault', vault_snapshot, reader['token'], status=403,
+                   predicate=lambda r: 'error' in r, kind='negative', label='readonly-vault-write-rejected')
+        self.check('GET', '/api/self/vault', token=token,
+                   predicate=lambda r: r == vault_snapshot, label='readonly-vault-write-preserves-state')
         other = self.check('POST', '/api/self/sessions', {'device_name': 'api-other'}, b['token'],
                            predicate=lambda r: bool(r.get('token')) and bool(r.get('session_id')), label='second-account-session')
         self.check('GET', '/api/self/sessions', token=token,
@@ -564,17 +629,22 @@ class Smoke:
         routes = list(self.routes.values())
         uncovered = [r['method'] + ' ' + r['path'] for r in routes if not r['positive']]
         negative_uncovered = [r['method'] + ' ' + r['path'] for r in routes if not r['negative']]
-        complete = error is None and not uncovered and not negative_uncovered and not self.users and not self.admins and not self.unconfirmed_creations and all(x['passed'] for x in self.cleanup_events)
+        observed_vault = {event['assertion'] for event in self.events if event['passed']
+                          and event['route'] in ('GET /api/self/vault', 'POST /api/self/vault')}
+        missing_vault = sorted(REQUIRED_VAULT_ASSERTIONS - observed_vault)
+        complete = error is None and not uncovered and not negative_uncovered and not missing_vault and not self.users and not self.admins and not self.unconfirmed_creations and all(x['passed'] for x in self.cleanup_events)
         workflow_sha = os.environ.get('GITHUB_SHA', '').lower()
-        result = {'schema': 1, 'scope': 'development-cloud-api', 'server': 'https://api.dev.rsrs.rs',
+        result = {'schema': 1, 'scope': 'development-cli-baseline-api', 'server': 'https://api.dev.rsrs.rs',
                   'namespace': self.namespace, 'complete': complete, 'error': error,
                   'server_sha_expected': self.expected_server_sha,
                   'server_sha_actual': self.actual_server_sha,
                   'contract_server_sha': self.contract.get('server_source_sha'),
+                  'separate_coverage': self.contract.get('separate_coverage', {}),
                   'cli_workflow_sha': workflow_sha if re.fullmatch('[0-9a-f]{40}', workflow_sha) else None,
                   'counts': {'routes': len(routes), 'positive_covered': len(routes) - len(uncovered),
                              'negative_covered': sum(bool(r['negative']) for r in routes), 'assertions': len(self.events)},
-                  'uncovered': uncovered, 'negative_uncovered': negative_uncovered, 'routes': routes, 'assertions': self.events,
+                  'uncovered': uncovered, 'negative_uncovered': negative_uncovered,
+                  'missing_vault_assertions': missing_vault, 'routes': routes, 'assertions': self.events,
                   'cleanup': {'events': self.cleanup_events, 'remaining_users': list(self.users), 'remaining_admins': sorted(self.admins),
                               'unconfirmed_creations': sorted(self.unconfirmed_creations)},
                   'not_run': ['shared-server-last-owner-guard', 'CLI encryption/decryption and legacy CLI fallback proxy'],
