@@ -21,6 +21,7 @@ ENV = {'GITHUB_ACTIONS': 'true', 'GITHUB_RUN_ID': '123', 'GITHUB_RUN_ATTEMPT': '
 
 
 def load(name, filename):
+    """Import a script by filename without invoking its command-line entry point."""
     spec = importlib.util.spec_from_file_location(name, ROOT / filename)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -34,11 +35,13 @@ github = load('github_api_contract', 'dev-github-api-smoke.py')
 class VaultModel(api.Smoke):
     """Synthetic HTTP-shaped model, not a claim of actual server acceptance."""
     def __init__(self, fault=None):
+        """Create isolated in-memory vault state with an optional deliberate regression."""
         super().__init__(argparse.Namespace(scope='all', report='unused'))
         self.vault = None
         self.fault = fault
 
     def request(self, method, path, body=None, token=None):
+        """Model reviewed vault HTTP semantics without contacting any service."""
         assert path == '/api/self/vault', 'model must not contact any service'
         if method == 'GET':
             result = dict(self.vault)
@@ -71,6 +74,7 @@ class VaultModel(api.Smoke):
 class ContractTests(unittest.TestCase):
     """No test obtains real secrets, creates remote accounts, or opens a network socket."""
     def setUp(self):
+        """Use synthetic configuration and forbid network access for every test."""
         self.env = mock.patch.dict(os.environ, ENV, clear=True)
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -79,9 +83,11 @@ class ContractTests(unittest.TestCase):
         self.addCleanup(self.network.stop)
 
     def smoke(self):
+        """Construct the actual baseline harness under the isolated test environment."""
         return api.Smoke(argparse.Namespace(scope='all', report='unused'))
 
     def test_reviewed_baseline_routes_and_all_explicit_exclusions(self):
+        """Preserve the original route fingerprint and account for separately scoped APIs."""
         smoke = self.smoke()
         smoke.preflight()
         self.assertEqual(smoke.contract['server_source_sha'], SHA)
@@ -100,12 +106,14 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(smoke.contract['review']['canonical_server_operations'], 84)
 
     def test_stale_or_unreviewed_server_sha_is_still_rejected(self):
+        """Require the exact source revision whose contract has been reviewed."""
         for expected in (OLD_SHA, 'a' * 40, '', 'not-a-sha'):
             with self.subTest(expected=expected), mock.patch.dict(os.environ, {'RSRS_DEV_SERVER_SHA': expected}):
                 with self.assertRaises(api.SmokeFailure):
                     self.smoke().preflight()
 
     def test_missing_duplicate_substituted_or_regrouped_routes_fail(self):
+        """Reject route inventory changes even when the apparent count stays constant."""
         for mutation in ('missing', 'duplicate', 'substituted', 'regrouped'):
             smoke = self.smoke()
             key = next(iter(smoke.routes))
@@ -121,6 +129,7 @@ class ContractTests(unittest.TestCase):
                 smoke.preflight()
 
     def test_existing_scope_address_approval_and_secret_gates_remain(self):
+        """Keep the existing Actions, destination, authorization and full-scope guards."""
         for field, value in [('GITHUB_ACTIONS', 'false'), ('RSRS_DEV_SERVER_ADDR', 'https://example.invalid'),
                              ('RSRS_DEV_API_ADMIN_APPROVED', 'false'), ('RSRS_DEV_ADMIN_TOKEN', '')]:
             with self.subTest(field=field), mock.patch.dict(os.environ, {field: value}):
@@ -132,6 +141,7 @@ class ContractTests(unittest.TestCase):
             smoke.preflight()
 
     def test_live_health_revision_gate_remains_strict(self):
+        """Reject a stale live server before recording assertions or creating fixtures."""
         smoke = self.smoke()
         response = mock.MagicMock()
         response.code = 200
@@ -143,6 +153,7 @@ class ContractTests(unittest.TestCase):
         self.assertFalse(smoke.events or smoke.users or smoke.admins)
 
     def test_separate_github_suite_inherits_reviewed_strict_preflight(self):
+        """Apply the same exact-revision gate to the separate GitHub transport suite."""
         smoke = github.GithubSmoke(argparse.Namespace(scope='all', report='unused'))
         smoke.preflight()
         smoke.expected_server_sha = OLD_SHA
@@ -150,6 +161,7 @@ class ContractTests(unittest.TestCase):
             smoke.preflight()
 
     def test_vault_sequence_checks_every_changed_semantic(self):
+        """Exercise required vault assertions without exposing opaque fields in events."""
         smoke = VaultModel()
         final = smoke.vault_contract('writer')
         self.assertEqual(final['account_id'], IDENTITY)
@@ -161,12 +173,14 @@ class ContractTests(unittest.TestCase):
         self.assertNotIn('synthetic-never-sent', serialized)
 
     def test_vault_regressions_are_detected(self):
+        """Ensure each deliberate schema or persistence defect fails the actual harness."""
         for fault in ('bad-identity', 'boolean-generation', 'rejected-write-mutates', 'wrong-rejection-status',
                       'legacy-generation-stuck', 'idempotent-generation-advances', 'rewrap-generation-advances'):
             with self.subTest(fault=fault), self.assertRaises(api.SmokeFailure):
                 VaultModel(fault).vault_contract('writer')
 
     def test_vault_schema_rejects_missing_or_wrong_types(self):
+        """Validate identity, integer generation and exact recovery-field preservation."""
         vault = {'kdf_salt': 'synthetic-salt', 'wrapped_urk': 'synthetic-wrap', 'urk_nonce': 'nonce', 'version': 4}
         valid = dict(vault, account_id=IDENTITY, key_generation=1)
         self.assertTrue(api.valid_vault_reply(valid, vault))
@@ -179,6 +193,7 @@ class ContractTests(unittest.TestCase):
         self.assertFalse(api.valid_vault_reply(valid, vault, key_generation=2))
 
     def test_old_route_only_success_cannot_satisfy_new_vault_review(self):
+        """Prevent legacy route-only coverage from satisfying the strengthened report."""
         smoke = self.smoke()
         for route in smoke.routes.values():
             route['positive'].append('old-success')

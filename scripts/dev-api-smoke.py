@@ -96,6 +96,7 @@ class Smoke:
         self.start = datetime.datetime.now(datetime.timezone.utc)
 
     def preflight(self):
+        """Reject unapproved environments or any drift from the reviewed route inventory."""
         if os.environ.get('GITHUB_ACTIONS') != 'true':
             raise SmokeFailure('github-actions-required')
         if self.base != 'https://api.dev.rsrs.rs':
@@ -274,6 +275,7 @@ class Smoke:
                    predicate=lambda r: valid_vault_reply(r, rewrapped, account_id, 2), label='same-urk-rewrap-preserves-generation')
 
     def user_and_sync(self, a, b):
+        """Exercise isolated account, vault, session and encrypted sync operations."""
         token = a['token']
         self.check('GET', '/ready', predicate=lambda r: r.get('database') == 'ready' and r.get('ok') is True, label='database-readiness')
         for path in ('/health', '/ready'):
@@ -626,6 +628,7 @@ class Smoke:
         del self.users[b['user']]
 
     def report(self, error):
+        """Write a sanitized result that requires complete route, vault and cleanup coverage."""
         routes = list(self.routes.values())
         uncovered = [r['method'] + ' ' + r['path'] for r in routes if not r['positive']]
         negative_uncovered = [r['method'] + ' ' + r['path'] for r in routes if not r['negative']]
