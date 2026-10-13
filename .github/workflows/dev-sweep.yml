@@ -253,7 +253,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Check all development API contracts
+      - name: Check all baseline CLI API contracts and GitHub transport
         env:
           RSRS_DEV_MAIL_ADDRESS: ${{ vars.RESPIRE_DEV_MAIL_ADDRESS }}
           RSRS_DEV_IMAP_HOST: ${{ vars.RESPIRE_DEV_IMAP_HOST }}
