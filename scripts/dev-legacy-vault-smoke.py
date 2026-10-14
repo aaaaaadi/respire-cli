@@ -99,7 +99,7 @@ class Smoke:
         self.report = {"status": "running", "source_sha": args.source_sha,
             "workflow_sha": os.environ.get("GITHUB_SHA"), "version": args.version,
             "binary_sha256": args.binary_sha256, "target": UPSTREAM, "cases": {},
-            "passed": False, "required_cases": list(("model_cpu_real", REQUIRED[2]) if args.auth_salt_only else REQUIRED),
+            "passed": False, "required_cases": list(("model_cpu_real", REQUIRED[2]) if getattr(args, "auth_salt_only", False) else REQUIRED),
             "dependency": "cryptography==46.0.3", "cloud_cleanup": {"passed": False, "events": [], "remaining_users": []}}
 
     def env(self, name, user=None):
@@ -305,6 +305,9 @@ class Smoke:
         require(old_login.get("user") == user and bool(old_login.get("token"))
             and self.api(dict(account, token=old_login["token"]), "GET", "/api/self").get("user") == user,
             "real_legacy_auth_login_failed")
+        # The pre-migration login creates its own random native credential alias.
+        # Track that exact owned alias as well as later migration/fresh logins.
+        self.keys.track_created_login(old_login, user, None if version == 1 else original_super, password)
         require(self.api(account, "GET", "/auth/salt?user=" + urllib.parse.quote(user))["salt"] == old_auth_salt,
             "ordinary_login_changed_auth_salt")
         source_config_path = source / "client.json"

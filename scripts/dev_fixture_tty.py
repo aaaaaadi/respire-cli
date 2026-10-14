@@ -1,12 +1,9 @@
 """Linux-only hidden-input driver for disposable synthetic CLI fixtures."""
-import fcntl
 import os
-import pty
 import selectors
 import signal
 import subprocess
 import sys
-import termios
 import time
 
 
@@ -14,6 +11,11 @@ def run_hidden(argv, *, prompts, cwd, env, timeout):
     """Feed ordered prompts over a no-echo controlling TTY, never argv/logs."""
     if not sys.platform.startswith("linux"):
         raise RuntimeError("fixture_tty_requires_linux")
+    # Native Windows profile smoke imports the legacy reporter for its crypto
+    # helpers, but never invokes this Linux-only terminal driver.
+    import fcntl
+    import pty
+    import termios
     if any(arg.split("=", 1)[0] in ("--pass", "--super", "--secret-key", "--new-super") for arg in argv):
         raise RuntimeError("fixture_secret_argument_forbidden")
     prompts = [(marker.encode(), answer.encode()) for marker, answer in prompts]

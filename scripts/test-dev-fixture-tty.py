@@ -10,6 +10,18 @@ import unittest
 from dev_fixture_tty import run_hidden
 
 
+def fixture_env(root):
+    """Use only fresh fixture directories and non-secret execution settings."""
+    env = {"PATH": os.defpath, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+    for name in ("HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
+            "APPDATA", "LOCALAPPDATA", "RSRS_DATA_DIR", "RSRS_BIN_DIR", "TMPDIR"):
+        path = Path(root) / name
+        path.mkdir(exist_ok=True)
+        env[name] = str(path)
+    env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=" + str(Path(root) / "missing-fixture-keyring")
+    return env
+
+
 @unittest.skipUnless(sys.platform.startswith("linux"), "Linux fixture driver")
 class HiddenInputTests(unittest.TestCase):
     def run_fixture(self, source, prompts, timeout=3):
@@ -18,7 +30,33 @@ class HiddenInputTests(unittest.TestCase):
             script = Path(root) / "fixture.py"
             script.write_text(source)
             return run_hidden([sys.executable, str(script)], prompts=prompts,
-                cwd=root, env=dict(os.environ), timeout=timeout)
+                cwd=root, env=fixture_env(root), timeout=timeout)
+
+    def test_native_profile_import_does_not_require_unix_modules(self):
+        """Windows profile migration can import shared helpers without Unix APIs."""
+        script = """import builtins, importlib.util, pathlib, sys
+original = builtins.__import__
+def guarded(name, *args, **kwargs):
+    if name in ('fcntl', 'pty', 'termios'):
+        raise ModuleNotFoundError(name)
+    return original(name, *args, **kwargs)
+builtins.__import__ = guarded
+path = pathlib.Path('scripts/dev-profile-migration-smoke.py')
+sys.path.insert(0, str(path.parent))
+spec = importlib.util.spec_from_file_location('profile_without_unix', path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+import tempfile
+from types import SimpleNamespace
+with tempfile.TemporaryDirectory() as directory:
+    args = SimpleNamespace(root=pathlib.Path(directory) / 'profile', source_sha='synthetic',
+        version='synthetic', binary_sha256='synthetic')
+    smoke = module.Smoke(args)
+    assert smoke.report['required_cases'] == list(module.REQUIRED)
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run([sys.executable, "-c", script], capture_output=True, env=fixture_env(directory))
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_ordered_hidden_input_and_json(self):
         """Preserve JSON while submitting passwords through a no-echo terminal."""
@@ -67,9 +105,25 @@ print(json.dumps({"status": "ok"}))
             script.write_text('import os,time\nopen("pid","w").write(str(os.getpid()))\nprint("unexpected prompt",flush=True)\ntime.sleep(20)')
             with self.assertRaisesRegex(RuntimeError, "fixture_tty_timeout"):
                 run_hidden([sys.executable, str(script)], prompts=[("password: ", "synthetic-password")],
-                    cwd=root, env=dict(os.environ), timeout=0.3)
+                    cwd=root, env=fixture_env(root), timeout=0.3)
             self.assertFalse(Path("/proc", pidfile.read_text()).exists())
         self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+
+    def test_timeout_kills_descendants_holding_output_pipes(self):
+        """A sleeping descendant cannot keep the driver or its output pipes alive."""
+        with tempfile.TemporaryDirectory() as root:
+            script = Path(root) / "fixture.py"
+            script.write_text("import subprocess,sys,time\nchild=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'])\nopen('child','w').write(str(child.pid))\ntime.sleep(30)")
+            with self.assertRaisesRegex(RuntimeError, "fixture_tty_timeout"):
+                run_hidden([sys.executable, str(script)], prompts=[], cwd=root,
+                    env=fixture_env(root), timeout=0.3)
+            status = Path("/proc", (Path(root) / "child").read_text(), "status")
+            for _ in range(50):
+                if not status.exists() or "State:\tZ" in status.read_text():
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("fixture descendant remained running after timeout")
 
     def test_success_requires_all_prompts(self):
         """A skipped authorization prompt must not silently pass."""
