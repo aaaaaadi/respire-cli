@@ -98,6 +98,7 @@ class ContractTests(unittest.TestCase):
         excluded = smoke.contract['separate_coverage']
         self.assertEqual([len(excluded[key]['routes']) for key in (
             'github_transport', 'existing_browser_only', 'passkey_and_vault_reset')], [7, 2, 10])
+        self.assertIn('POST /api/self/passkeys/cancel', excluded['passkey_and_vault_reset']['routes'])
         complete = set(routes)
         for group in excluded.values():
             self.assertFalse(complete.intersection(group['routes']))
