@@ -211,3 +211,31 @@ test('draft release is resolved from every list page with exactly one matching t
   assert.doesNotMatch(helper, /releases\/tags\//);
   assert.match(helper, /selectRelease\(pages\(`/);
 });
+
+
+test('alias job and parent receipt budgets cover both propagation waits and clean install', () => {
+  const root = new URL('../../', import.meta.url);
+  const helper = readFileSync(new URL('npm/scripts/release-publication.mjs', root), 'utf8').replace(/\r\n/g, '\n');
+  const child = readFileSync(new URL('.github/workflows/npm-alias.yml', root), 'utf8').replace(/\r\n/g, '\n');
+  const parent = readFileSync(new URL('.github/workflows/release.yml', root), 'utf8').replace(/\r\n/g, '\n');
+  const minutes = (text, pattern) => {
+    const match = text.match(pattern);
+    assert(match, 'The publication timeout must remain explicitly bound to its call or job');
+    return Number(match[1]);
+  };
+  const scoped = minutes(helper, /verifyPackages\(scoped\.packages, \{[^}]*timeoutMs: (\d+) \* 60 \* 1000/);
+  const alias = minutes(helper, /source\.channel, \{requireInstallIndex: true, timeoutMs: (\d+) \* 60 \* 1000/);
+  const install = minutes(helper, /\{env, timeout: (\d+) \* 60 \* 1000, stdio: 'inherit'\}/);
+  const job = minutes(child.split('  publish-integrated:')[1].split('\n  publish:')[0], /timeout-minutes: (\d+)/);
+  const receipt = minutes(helper, /async function awaitAlias\(\) \{[\s\S]*?Date\.now\(\) \+ (\d+) \* 60 \* 1000;/);
+  assert.equal(alias, scoped);
+  assert(scoped >= 30);
+  assert(job > scoped + alias + install, 'Job must leave room for setup and packaging');
+  assert(receipt > job, 'Receipt observer must outlive the publisher');
+  const observers = [...parent.matchAll(/timeout-minutes: (\d+)\n        env:\n          GH_TOKEN: \$\{\{ github\.token \}\}\n        run: node npm\/scripts\/release-publication\.mjs await-alias/g)];
+  assert.equal(observers.length, 2);
+  assert(observers.every(match => Number(match[1]) > receipt));
+  const recovery = minutes(parent.split('\n  dev6-publication-resume:')[1], /timeout-minutes: (\d+)/);
+  const revalidation = minutes(helper, /options\.timeoutMs \?\? (\d+) \* 60 \* 1000/);
+  assert(recovery > revalidation + receipt, 'Historical recovery needs revalidation and observation time');
+});

@@ -37,7 +37,7 @@ if (manifest.cliVersion !== version) {
 // rebuild or clear dist here: that would discard the evidence we just verified.
 if (doPublish) {
   const expected = readExpectedPacks(outDir, manifest, version);
-  for (const result of await publishScopedPackages(expected, manifest.npmScope, npmTag)) {
+  for (const result of await publishScopedPackages(expected, manifest.npmScope, npmTag, {timeoutMs: 30 * 60 * 1000})) {
     console.log(`npm ${result.name}@${version}: ${result.status}; registry tarball integrity verified`);
   }
   console.log('All scoped npm packages are published and readable');

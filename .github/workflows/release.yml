@@ -660,7 +660,7 @@ jobs:
           if-no-files-found: error
       - name: Require the matching short-package publisher and public install
         if: ${{ !(inputs.repair_dev12 || inputs.repair_dev14) }}
-        timeout-minutes: 46
+        timeout-minutes: 81
         env:
           GH_TOKEN: ${{ github.token }}
         run: node npm/scripts/release-publication.mjs await-alias
@@ -707,7 +707,7 @@ jobs:
     name: ${{ inputs.resume_dev6_publication && 'publish' || 'unused-dev6-publication-resume' }}
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.resume_dev6_publication
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     concurrency:
       group: cli-release-publication
       queue: max
@@ -749,7 +749,7 @@ jobs:
           path: scoped-ready.json
           if-no-files-found: error
       - name: Require the matching short-package publisher and public install
-        timeout-minutes: 46
+        timeout-minutes: 81
         env:
           GH_TOKEN: ${{ github.token }}
         run: node npm/scripts/release-publication.mjs await-alias

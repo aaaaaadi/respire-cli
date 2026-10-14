@@ -10,7 +10,7 @@ export async function publishScopedPackages(expected, umbrellaName, tag, options
   if (!umbrella || !platforms.length || platforms.some(receipt => receipt.version !== umbrella.version)) {
     throw new Error('Incomplete or mixed-version scoped publication batch');
   }
-  const publish = options.publishImpl || publishPackage;
+  const {publishImpl: publish = publishPackage, ...publicationOptions} = options;
   const results = new Map();
   let next = 0;
   let failed = false;
@@ -19,7 +19,7 @@ export async function publishScopedPackages(expected, umbrellaName, tag, options
     while (!failed && next < platforms.length) {
       const receipt = platforms[next++];
       try {
-        results.set(receipt.name, await publish(receipt.dir, receipt, tag));
+        results.set(receipt.name, await publish(receipt.dir, receipt, tag, publicationOptions));
       } catch (error) {
         failed = true;
         errors.push(error);
@@ -30,6 +30,6 @@ export async function publishScopedPackages(expected, umbrellaName, tag, options
   // or temporary-file cleanup after the job reports completion. No retries here.
   await Promise.all(Array.from({length: Math.min(4, platforms.length)}, worker));
   if (errors.length) throw new AggregateError(errors, 'Platform publication failed; umbrella was not published');
-  results.set(umbrella.name, await publish(umbrella.dir, umbrella, tag));
+  results.set(umbrella.name, await publish(umbrella.dir, umbrella, tag, publicationOptions));
   return expected.map(receipt => ({...results.get(receipt.name), name: receipt.name}));
 }

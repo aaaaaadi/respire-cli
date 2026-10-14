@@ -135,11 +135,12 @@ function artifact(runId, name, repository) {
     return read(path.join(directory, files[0]));
   } finally { rmSync(directory, {recursive: true, force: true}); }
 }
-async function verifyPackages(packages) {
-  const deadline = Date.now() + 15 * 60 * 1000;
+async function verifyPackages(packages, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 15 * 60 * 1000;
+  const deadline = Date.now() + timeoutMs;
   for (const expected of packages) {
-    if (Date.now() >= deadline) throw new Error('Public package verification exceeded 15 minutes');
-    await waitForPackage(expected, {timeoutMs: deadline - Date.now(), pollMs: 10000});
+    if (Date.now() >= deadline) throw new Error(`Public package verification exceeded ${timeoutMs / 60000} minutes`);
+    await waitForPackage(expected, {...options, timeoutMs: deadline - Date.now(), pollMs: 10000});
   }
 }
 /** Resolve drafts from the authenticated list, since tag lookup exposes published releases. */
@@ -210,13 +211,13 @@ async function publishAlias() {
   }
   assertActive(source);
   // Recheck all five public tarballs before publishing their thin entry point.
-  await verifyPackages(scoped.packages);
+  await verifyPackages(scoped.packages, {requireInstallIndex: true, timeoutMs: 30 * 60 * 1000});
   command('node', ['npm/scripts/pack-alias.mjs', '--version', source.version]);
   const packed = packPackage('npm/dist/rsrs-cli', process.env.RUNNER_TEMP);
   if (packed.name !== 'rsrs-cli' || packed.version !== source.version) throw new Error('Alias packing identity mismatch');
   const expected = packIdentity(packed);
   assertActive(source); // Last source-attempt check immediately before irreversible npm publication.
-  const result = await publishPackage('npm/dist/rsrs-cli', {...expected, dependencies: {'@rsrsai/cli': source.version}}, source.channel);
+  const result = await publishPackage('npm/dist/rsrs-cli', {...expected, dependencies: {'@rsrsai/cli': source.version}}, source.channel, {requireInstallIndex: true, timeoutMs: 30 * 60 * 1000});
   if (result.metadata.dependencies?.['@rsrsai/cli'] !== source.version) throw new Error('Alias dependency mismatch');
   // An isolated public install, without inherited npm credentials, cache, or user config.
   const directory = mkdtempSync(path.join(tmpdir(), 'rsrs-public-install-'));
@@ -247,7 +248,7 @@ async function publishAlias() {
 async function awaitAlias() {
   const scoped = validateScoped(read('scoped-ready.json'), manifest());
   const source = scoped.source;
-  const deadline = Date.now() + 45 * 60 * 1000;
+  const deadline = Date.now() + 80 * 60 * 1000;
   const createdAt = assertActive(source).created_at;
   const unrelatedCompleted = new Set();
   while (Date.now() < deadline) {
@@ -275,7 +276,7 @@ async function awaitAlias() {
     }
     await sleep(60000);
   }
-  throw new Error('Matching successful short-package publication/install receipt missing after 45 minutes; release remains draft');
+  throw new Error('Matching successful short-package publication/install receipt missing after 80 minutes; release remains draft');
 }
 function finalize() {
   const scoped = validateScoped(read('scoped-ready.json'), manifest());
