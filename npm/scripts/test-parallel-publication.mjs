@@ -111,3 +111,20 @@ test('real helper preserves immutable receipts, unique temp files, existing skip
   await publishScopedPackages(receipts, umbrella, 'dev', {publishImpl});
   assert.deepEqual([...submissions.values()], [1, 1, 1, 1]);
 });
+
+
+test('configured propagation options reach every platform and umbrella publisher', async () => {
+  const forwarded = {timeoutMs: 30 * 60 * 1000, pollMs: 10, requestTimeoutMs: 100};
+  const calls = [];
+  await publishScopedPackages(batch, umbrella, 'dev', {
+    ...forwarded,
+    publishImpl: async (dir, receipt, tag, options) => {
+      assert.equal(dir, receipt.dir);
+      assert.equal(tag, 'dev');
+      assert.deepEqual(options, forwarded);
+      calls.push(receipt.name);
+      return {status: 'existing'};
+    },
+  });
+  assert.deepEqual(calls, batch.map(r => r.name));
+});

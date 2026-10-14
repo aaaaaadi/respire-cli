@@ -217,7 +217,7 @@ async function publishAlias() {
   if (packed.name !== 'rsrs-cli' || packed.version !== source.version) throw new Error('Alias packing identity mismatch');
   const expected = packIdentity(packed);
   assertActive(source); // Last source-attempt check immediately before irreversible npm publication.
-  const result = await publishPackage('npm/dist/rsrs-cli', {...expected, dependencies: {'@rsrsai/cli': source.version}}, source.channel, {requireInstallIndex: true});
+  const result = await publishPackage('npm/dist/rsrs-cli', {...expected, dependencies: {'@rsrsai/cli': source.version}}, source.channel, {requireInstallIndex: true, timeoutMs: 30 * 60 * 1000});
   if (result.metadata.dependencies?.['@rsrsai/cli'] !== source.version) throw new Error('Alias dependency mismatch');
   // An isolated public install, without inherited npm credentials, cache, or user config.
   const directory = mkdtempSync(path.join(tmpdir(), 'rsrs-public-install-'));
@@ -248,7 +248,7 @@ async function publishAlias() {
 async function awaitAlias() {
   const scoped = validateScoped(read('scoped-ready.json'), manifest());
   const source = scoped.source;
-  const deadline = Date.now() + 60 * 60 * 1000;
+  const deadline = Date.now() + 80 * 60 * 1000;
   const createdAt = assertActive(source).created_at;
   const unrelatedCompleted = new Set();
   while (Date.now() < deadline) {
@@ -276,7 +276,7 @@ async function awaitAlias() {
     }
     await sleep(60000);
   }
-  throw new Error('Matching successful short-package publication/install receipt missing after 60 minutes; release remains draft');
+  throw new Error('Matching successful short-package publication/install receipt missing after 80 minutes; release remains draft');
 }
 function finalize() {
   const scoped = validateScoped(read('scoped-ready.json'), manifest());

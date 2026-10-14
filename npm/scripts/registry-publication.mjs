@@ -164,8 +164,12 @@ export async function checkPackage(expected, options = {}) {
       throw new PackageNotVisibleError(`Registry install index does not contain: ${label}`);
     }
     const indexed = index.versions[expected.version];
-    assertPackMatches({name: indexed?.name, version: indexed?.version,
-      integrity: indexed?.dist?.integrity, shasum: indexed?.dist?.shasum}, expected);
+    // The abbreviated contract permits no integrity field; exact metadata and
+    // downloaded bytes still have to match the verified SHA512 receipt.
+    if (indexed?.name !== expected.name || indexed.version !== expected.version || indexed.dist?.shasum !== expected.shasum ||
+        (indexed.dist.integrity !== undefined && indexed.dist.integrity !== expected.integrity)) {
+      throw new Error(`Registry install identity or digest mismatch: ${label}`);
+    }
     if (registryUrl(indexed.dist.tarball) !== registryUrl(metadata.dist.tarball)) throw new Error(`Registry install tarball mismatch: ${label}`);
     for (const field of ['dependencies', 'optionalDependencies']) {
       const entries = value => {

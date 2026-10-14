@@ -9,7 +9,7 @@ import {test} from 'node:test';
 import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {assertTagSafe, checkPackage, compareVersions, packPackage, publishPackage,
-  readExpectedPacks, waitForPackage} from './registry-publication.mjs';
+  readExpectedPacks, waitForPackage, PackageNotVisibleError} from './registry-publication.mjs';
 
 const bytes = Buffer.from('a deterministic packed package for offline tests');
 const digest = body => ({integrity: `sha512-${createHash('sha512').update(body).digest('base64')}`,
@@ -286,4 +286,116 @@ test('invalid npm JSON output shapes keep the identity-mismatch error', t => {
   for (const raw of [null, true, 'bad', {}, expected, [null], {bad: null}, {wrong: expected}, {a: expected, b: expected}]) {
     assert.throws(() => packPackage(f.dir, f.root, mockNpm({packOutput: () => raw})), /npm pack report identity mismatch/);
   }
+});
+
+
+function installRegistry({absent = 0, pending = 0, index404 = 0, index = metadata(), body = bytes, indexStatus = 200} = {}) {
+  let exactReads = 0, indexReads = 0;
+  const calls = [];
+  const root = `https://registry.npmjs.org/${encodeURIComponent(expected.name)}`;
+  return {calls, async fetchImpl(url, options) {
+    calls.push({url, options});
+    assert.equal(options.credentials, 'omit');
+    assert.equal(options.redirect, 'error');
+    assert.equal(options.headers.Authorization, undefined);
+    if (url.endsWith('/dist-tags')) return json({dev: '1.0.12-dev.8'});
+    if (url.endsWith('.tgz')) return new Response(body);
+    if (url === `${root}/${expected.version}`) return exactReads++ < absent ? missing() : json(metadata());
+    assert.equal(url, root);
+    assert.equal(options.headers.Accept, 'application/vnd.npm.install-v1+json');
+    indexReads++;
+    if (indexReads <= index404) return missing();
+    if (indexStatus !== 200) return new Response('', {status: indexStatus});
+    return json({name: expected.name, versions: indexReads <= pending ? {} : {[expected.version]: index}});
+  }};
+}
+
+test('install index may lag exact metadata; wait finishes before downloading bytes once', async () => {
+  for (const options of [{pending: 2}, {index404: 2}]) {
+    const mock = installRegistry(options);
+    const result = await waitForPackage(expected, {...mock, ...fastClock(), requireInstallIndex: true});
+    assert.equal(result.version, expected.version);
+    assert.equal(mock.calls.filter(c => c.options.headers.Accept.includes('install-v1')).length, 3);
+    assert.equal(mock.calls.filter(c => c.url.endsWith('.tgz')).length, 1);
+  }
+});
+
+test('a permanently absent install-index version times out without republishing an existing package', async t => {
+  const {dir} = fixture(t), npm = mockNpm(), mock = installRegistry({pending: Infinity});
+  await assert.rejects(publishPackage(dir, expected, 'dev', {
+    ...npm, ...mock, ...fastClock(), requireInstallIndex: true,
+  }), error => error instanceof PackageNotVisibleError && /timed out/.test(error.message));
+  assert.equal(npm.calls.filter(c => c.args[0] === 'publish').length, 0);
+  assert.equal(mock.calls.filter(c => c.url.endsWith('.tgz')).length, 0);
+});
+
+test('an accepted single publication waits for the install index and never resubmits', async t => {
+  const {dir} = fixture(t), npm = mockNpm(), mock = installRegistry({absent: 1, pending: 2});
+  const result = await publishPackage(dir, expected, 'dev', {
+    ...npm, ...mock, ...fastClock(), requireInstallIndex: true,
+  });
+  assert.equal(result.status, 'published');
+  assert.equal(npm.calls.filter(c => c.args[0] === 'publish').length, 1);
+  assert.equal(mock.calls.filter(c => c.options.headers.Accept.includes('install-v1')).length, 3);
+});
+
+test('an abbreviated index may omit integrity but actual SHA512 bytes remain mandatory', async () => {
+  const index = metadata(); delete index.dist.integrity;
+  await checkPackage(expected, {...installRegistry({index}), requireInstallIndex: true});
+  await assert.rejects(checkPackage(expected, {
+    ...installRegistry({index, body: Buffer.from('tampered package')}), requireInstallIndex: true,
+  }), /mismatch/);
+});
+
+test('provided install-index identity, digest and tarball conflicts fail before downloading', async () => {
+  const bad = [
+    m => m.name = 'wrong',
+    m => m.version = '0.0.0',
+    m => m.dist.shasum = '0'.repeat(40),
+    m => m.dist.integrity = digest(Buffer.from('different')).integrity,
+    m => m.dist.integrity = null,
+    m => m.dist.tarball = 'https://registry.npmjs.org/other.tgz',
+    m => m.dist.tarball = 'https://evil.invalid/other.tgz',
+  ];
+  for (const mutate of bad) {
+    const index = metadata(); mutate(index);
+    const mock = installRegistry({index});
+    await assert.rejects(checkPackage(expected, {...mock, requireInstallIndex: true}), /mismatch|Unsafe registry URL|Missing or invalid pack/);
+    assert.equal(mock.calls.filter(c => c.url.endsWith('.tgz')).length, 0);
+  }
+});
+
+test('present malformed install dependency maps fail while absent and empty maps match', async () => {
+  for (const field of ['dependencies', 'optionalDependencies']) {
+    for (const value of [null, [], 'bad', 0, false]) {
+      const index = metadata({[field]: value}), mock = installRegistry({index});
+      await assert.rejects(checkPackage(expected, {...mock, requireInstallIndex: true}), /dependency map/);
+      assert.equal(mock.calls.filter(c => c.url.endsWith('.tgz')).length, 0);
+    }
+    await checkPackage(expected, {...installRegistry({index: metadata({[field]: {}})}), requireInstallIndex: true});
+    await assert.rejects(checkPackage(expected, {
+      ...installRegistry({index: metadata({[field]: {extra: '*'}})}), requireInstallIndex: true,
+    }), new RegExp(`install ${field} mismatch`));
+  }
+});
+
+test('install-index HTTP and network errors are not treated as pending publication', async t => {
+  const {dir} = fixture(t);
+  for (const indexStatus of [401, 403, 429, 500, 503]) {
+    const npm = mockNpm();
+    await assert.rejects(publishPackage(dir, expected, 'dev', {
+      ...npm, ...installRegistry({indexStatus}), ...fastClock(), requireInstallIndex: true,
+    }), new RegExp(`Registry HTTP ${indexStatus}`));
+    assert.equal(npm.calls.filter(c => c.args[0] === 'publish').length, 0);
+  }
+  const mock = installRegistry(), root = `https://registry.npmjs.org/${encodeURIComponent(expected.name)}`;
+  let failures = 0;
+  await assert.rejects(waitForPackage(expected, {
+    ...fastClock(), requireInstallIndex: true,
+    fetchImpl: async (url, options) => {
+      if (url === root) {failures++; throw new Error('install-index connection failed');}
+      return mock.fetchImpl(url, options);
+    },
+  }), /install-index connection failed/);
+  assert.equal(failures, 1);
 });
