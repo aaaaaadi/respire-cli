@@ -168,7 +168,12 @@ export async function checkPackage(expected, options = {}) {
       integrity: indexed?.dist?.integrity, shasum: indexed?.dist?.shasum}, expected);
     if (registryUrl(indexed.dist.tarball) !== registryUrl(metadata.dist.tarball)) throw new Error(`Registry install tarball mismatch: ${label}`);
     for (const field of ['dependencies', 'optionalDependencies']) {
-      const entries = value => JSON.stringify(Object.entries(value || {}).sort(([a], [b]) => a.localeCompare(b)));
+      const entries = value => {
+        if (value !== undefined && (!value || typeof value !== 'object' || Array.isArray(value))) {
+          throw new Error(`Registry install ${field} must be a dependency map: ${label}`);
+        }
+        return JSON.stringify(Object.entries(value || {}).sort(([a], [b]) => a.localeCompare(b)));
+      };
       if (entries(indexed[field]) !== entries(metadata[field])) throw new Error(`Registry install ${field} mismatch: ${label}`);
     }
   }

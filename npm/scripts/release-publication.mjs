@@ -136,9 +136,10 @@ function artifact(runId, name, repository) {
   } finally { rmSync(directory, {recursive: true, force: true}); }
 }
 async function verifyPackages(packages, options = {}) {
-  const deadline = Date.now() + 15 * 60 * 1000;
+  const timeoutMs = options.timeoutMs ?? 15 * 60 * 1000;
+  const deadline = Date.now() + timeoutMs;
   for (const expected of packages) {
-    if (Date.now() >= deadline) throw new Error('Public package verification exceeded 15 minutes');
+    if (Date.now() >= deadline) throw new Error(`Public package verification exceeded ${timeoutMs / 60000} minutes`);
     await waitForPackage(expected, {...options, timeoutMs: deadline - Date.now(), pollMs: 10000});
   }
 }
@@ -210,7 +211,7 @@ async function publishAlias() {
   }
   assertActive(source);
   // Recheck all five public tarballs before publishing their thin entry point.
-  await verifyPackages(scoped.packages, {requireInstallIndex: true});
+  await verifyPackages(scoped.packages, {requireInstallIndex: true, timeoutMs: 30 * 60 * 1000});
   command('node', ['npm/scripts/pack-alias.mjs', '--version', source.version]);
   const packed = packPackage('npm/dist/rsrs-cli', process.env.RUNNER_TEMP);
   if (packed.name !== 'rsrs-cli' || packed.version !== source.version) throw new Error('Alias packing identity mismatch');
@@ -247,7 +248,7 @@ async function publishAlias() {
 async function awaitAlias() {
   const scoped = validateScoped(read('scoped-ready.json'), manifest());
   const source = scoped.source;
-  const deadline = Date.now() + 45 * 60 * 1000;
+  const deadline = Date.now() + 60 * 60 * 1000;
   const createdAt = assertActive(source).created_at;
   const unrelatedCompleted = new Set();
   while (Date.now() < deadline) {
@@ -275,7 +276,7 @@ async function awaitAlias() {
     }
     await sleep(60000);
   }
-  throw new Error('Matching successful short-package publication/install receipt missing after 45 minutes; release remains draft');
+  throw new Error('Matching successful short-package publication/install receipt missing after 60 minutes; release remains draft');
 }
 function finalize() {
   const scoped = validateScoped(read('scoped-ready.json'), manifest());

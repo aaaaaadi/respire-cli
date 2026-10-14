@@ -53,7 +53,8 @@ jobs:
     needs: await-scoped
     if: needs.await-scoped.outputs.eligible == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # 30m scoped index + 10m alias propagation + 10m clean install + setup.
+    timeout-minutes: 55
     concurrency:
       group: npm-rsrs-cli-publication
       queue: max
