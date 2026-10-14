@@ -34,6 +34,7 @@ static LIGHT_RUNNING: AtomicUsize = AtomicUsize::new(0);
 static WORKERS: AtomicUsize = AtomicUsize::new(1);
 static STOPPING: AtomicBool = AtomicBool::new(false);
 static JOB_TX: OnceLock<Mutex<Sender<Job>>> = OnceLock::new();
+static DISPATCH_THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
 const QUEUE_EXPIRED: &str = "request queue deadline exceeded; command was not started";
 static WRITE_TX: Mutex<Option<mpsc::SyncSender<WriteJob>>> = Mutex::new(None);
 static STATS_PENDING: AtomicUsize = AtomicUsize::new(0);
@@ -1514,6 +1515,7 @@ fn enqueue_job(
         deadline: Arc::clone(&deadline),
     })
     .map_err(|_| "runtime worker is gone".to_owned())?;
+    wake_dispatcher();
     Ok(deadline)
 }
 
@@ -1547,6 +1549,7 @@ fn execute_json(args: Vec<String>) -> std::result::Result<Value, String> {
 
 pub(crate) fn request_drain_exit() {
     STOPPING.store(true, Ordering::Release);
+    wake_dispatcher();
     SYNC_CV.notify_all();
     INDEX_CV.notify_all();
     std::thread::spawn(|| {
@@ -1746,6 +1749,25 @@ fn is_exclusive(args: &[String]) -> bool {
     )
 }
 
+fn wake_dispatcher() {
+    if let Some(thread) = DISPATCH_THREAD.get() { thread.unpark(); }
+}
+
+// The unpark token survives a completion between try_recv and park_timeout.
+// Keep the periodic check as a fallback for shutdown and queue expiry.
+fn receive_dispatch_job<T>(rx: &Receiver<T>, wait: Duration) -> Result<T, mpsc::RecvTimeoutError> {
+    match rx.try_recv() {
+        Ok(job) => return Ok(job),
+        Err(mpsc::TryRecvError::Disconnected) => return Err(mpsc::RecvTimeoutError::Disconnected),
+        Err(mpsc::TryRecvError::Empty) => {}
+    }
+    std::thread::park_timeout(wait);
+    rx.try_recv().map_err(|error| match error {
+        mpsc::TryRecvError::Empty => mpsc::RecvTimeoutError::Timeout,
+        mpsc::TryRecvError::Disconnected => mpsc::RecvTimeoutError::Disconnected,
+    })
+}
+
 struct RunningGuard {
     status: bool,
     light: bool,
@@ -1758,6 +1780,7 @@ impl Drop for RunningGuard {
         if self.status {
             RUNNING_STATUS.fetch_sub(1, Ordering::AcqRel);
         }
+        wake_dispatcher();
     }
 }
 
@@ -1771,6 +1794,7 @@ impl Drop for ClassifyGuard {
 
 fn dispatch_loop(rx: Receiver<Job>, limit: usize, idle: Option<Duration>, _lock: respire::lock::LibraryLock) {
     mark_worker();
+    let _ = DISPATCH_THREAD.set(std::thread::current());
     #[cfg(not(test))]
     respire_app::core_sdk::worker::enable();
     // Keep WAL open across requests: closing the last connection can briefly lock
@@ -1924,7 +1948,7 @@ fn dispatch_loop(rx: Receiver<Job>, limit: usize, idle: Option<Duration>, _lock:
         if STOPPING.load(Ordering::Acquire) {
             break;
         }
-        match rx.recv_timeout(Duration::from_millis(10)) {
+        match receive_dispatch_job(&rx, Duration::from_millis(10)) {
             Ok(job) => {
                 if job.stop {
                     break;
@@ -2337,6 +2361,10 @@ fn wait_daemon_ready(child: &mut std::process::Child, executable: &std::path::Pa
     }
     bail!("host runtime did not become ready")
 }
+
+#[cfg(test)]
+#[path = "rpc_dispatch_tests.rs"]
+mod dispatch_tests;
 
 #[cfg(test)]
 mod tests {
