@@ -4,7 +4,7 @@
 //! never `spawn`s another `rsrs` to re-invoke the CLI. `current_exe` is only
 //! used to copy the native binary into `<data_dir>/bin`. Spec: 2025-03-26.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -108,9 +108,24 @@ fn same_path(a: &Path, b: &Path) -> bool {
 }
 
 fn file_sha256(path: &Path) -> Result<[u8; 32], String> {
-    let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
+    let file = std::fs::File::open(path).map_err(|err| err.to_string())?;
+    reader_sha256(file)
+}
+
+fn reader_sha256(mut file: impl Read) -> Result<[u8; 32], String> {
     let mut hasher = Sha256::new();
-    hasher.update(&bytes);
+    // Executables include the static Core SDK. Bound transient memory rather
+    // than allocating one executable-sized Vec on every runtime health check.
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        hasher.update(&buffer[..count]);
+    }
     Ok(hasher.finalize().into())
 }
 
@@ -704,6 +719,65 @@ mod tests {
             "errors": [],
             "details": {}
         }))
+    }
+
+    #[test]
+    fn executable_hash_streams_all_bytes_and_preserves_refresh_detection() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let src = dir.path().join("source");
+        let dest = dir.path().join("dest");
+        for size in [0, 1, 65535, 65536, 65537, 3 * 65536 + 7] {
+            let data: Vec<u8> = (0..size).map(|index| (index % 251) as u8).collect();
+            std::fs::write(&src, &data).map_err(|error| error.to_string())?;
+            let expected: [u8; 32] = Sha256::digest(&data).into();
+            assert_eq!(file_sha256(&src)?, expected);
+            std::fs::write(&dest, &data).map_err(|error| error.to_string())?;
+            assert!(!bin_needs_refresh(&src, &dest)?);
+            if size > 0 {
+                let mut changed = data;
+                changed[size - 1] ^= 1;
+                std::fs::write(&dest, changed).map_err(|error| error.to_string())?;
+                assert!(bin_needs_refresh(&src, &dest)?);
+            }
+        }
+        std::fs::remove_file(&dest).map_err(|error| error.to_string())?;
+        assert!(bin_needs_refresh(&src, &dest)?);
+        assert!(file_sha256(&dest).is_err());
+        assert!(file_sha256(dir.path()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_hash_retries_interruptions_and_reports_mid_read_errors() -> Result<(), String> {
+        struct Reader { cursor: std::io::Cursor<Vec<u8>>, calls: usize, fail: bool, grow: bool }
+        impl Read for Reader {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                if self.calls == 1 { return Err(std::io::ErrorKind::Interrupted.into()); }
+                if self.cursor.position() >= 65536 && self.fail {
+                    return Err(std::io::Error::other("injected mid-read failure"));
+                }
+                // Deterministically model a source growing/truncating while read.
+                if self.cursor.position() == 65536 {
+                    if self.grow { self.cursor.get_mut().resize(150000, 7); }
+                    else { self.cursor.get_mut().truncate(70000); }
+                }
+                let until_boundary = if self.cursor.position() < 65536 {
+                    65536 - self.cursor.position() as usize
+                } else { 4096 };
+                let limit = out.len().min(4096).min(until_boundary);
+                self.cursor.read(&mut out[..limit])
+            }
+        }
+        let make = |fail, grow| Reader { cursor:std::io::Cursor::new(vec![3;100000]), calls:0, fail, grow };
+        for grow in [false, true] {
+            let mut reference = Vec::new();
+            make(false, grow).read_to_end(&mut reference).map_err(|error| error.to_string())?;
+            let expected: [u8; 32] = Sha256::digest(&reference).into();
+            assert_eq!(reader_sha256(make(false, grow))?, expected);
+        }
+        assert_eq!(reader_sha256(make(true, false)), Err("injected mid-read failure".into()));
+        Ok(())
     }
 
     #[test]

@@ -16,49 +16,55 @@ fn receive_payload<T>(rx: &Receiver<T>) -> T {
 }
 
 #[test]
-fn completion_token_before_wait_is_not_lost() {
+fn completion_token_before_wait_is_not_lost() -> Result<(), String> {
     let (ready, started) = mpsc::channel();
     let (done, finished) = mpsc::channel();
-    let thread = std::thread::spawn(move || {
+    let thread = std::thread::spawn(move || -> Result<(), String> {
         let (_tx, rx) = mpsc::channel::<()>();
-        ready.send(()).unwrap();
+        ready.send(()).map_err(|error| error.to_string())?;
         std::thread::current().unpark();
         assert!(matches!(receive_dispatch_job(&rx, FALLBACK), Err(mpsc::RecvTimeoutError::Timeout)));
-        done.send(()).unwrap();
+        done.send(()).map_err(|error| error.to_string())?;
+        Ok(())
     });
-    started.recv_timeout(WATCHDOG).expect("receiver thread not ready");
-    finished.recv_timeout(WATCHDOG).expect("completion unpark token was lost");
-    thread.join().unwrap();
+    started.recv_timeout(WATCHDOG).map_err(|error| format!("receiver thread not ready: {error}"))?;
+    finished.recv_timeout(WATCHDOG).map_err(|error| format!("completion unpark token was lost: {error}"))?;
+    thread.join().map_err(|_| "fixture receiver thread panicked".to_owned())??;
+    Ok(())
 }
 
 #[test]
-fn request_arrival_wakes_wait_and_keeps_payload() {
+fn request_arrival_wakes_wait_and_keeps_payload() -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
     let (ready, started) = mpsc::channel();
     let (done, finished) = mpsc::channel();
-    let thread = std::thread::spawn(move || {
-        ready.send(std::thread::current()).unwrap();
-        done.send(receive_payload(&rx)).unwrap();
+    let thread = std::thread::spawn(move || -> Result<(), String> {
+        ready.send(std::thread::current()).map_err(|error| error.to_string())?;
+        done.send(receive_payload(&rx)).map_err(|error| error.to_string())?;
+        Ok(())
     });
-    let handle = started.recv_timeout(WATCHDOG).expect("receiver thread not ready");
-    tx.send(37).unwrap();
+    let handle = started.recv_timeout(WATCHDOG).map_err(|error| format!("receiver thread not ready: {error}"))?;
+    tx.send(37).map_err(|error| error.to_string())?;
     handle.unpark();
-    assert_eq!(finished.recv_timeout(WATCHDOG).unwrap(), 37);
-    thread.join().unwrap();
+    assert_eq!(finished.recv_timeout(WATCHDOG).map_err(|error| error.to_string())?, 37);
+    thread.join().map_err(|_| "fixture receiver thread panicked".to_owned())??;
+    Ok(())
 }
 
 #[test]
-fn shutdown_wake_does_not_fabricate_job() {
+fn shutdown_wake_does_not_fabricate_job() -> Result<(), String> {
     let (_tx, rx) = mpsc::channel::<()>();
     let (ready, started) = mpsc::channel();
     let (done, finished) = mpsc::channel();
-    let thread = std::thread::spawn(move || {
-        ready.send(std::thread::current()).unwrap();
-        done.send(matches!(receive_dispatch_job(&rx, FALLBACK), Err(mpsc::RecvTimeoutError::Timeout))).unwrap();
+    let thread = std::thread::spawn(move || -> Result<(), String> {
+        ready.send(std::thread::current()).map_err(|error| error.to_string())?;
+        done.send(matches!(receive_dispatch_job(&rx, FALLBACK), Err(mpsc::RecvTimeoutError::Timeout))).map_err(|error| error.to_string())?;
+        Ok(())
     });
-    started.recv_timeout(WATCHDOG).expect("receiver thread not ready").unpark();
-    assert!(finished.recv_timeout(WATCHDOG).unwrap());
-    thread.join().unwrap();
+    started.recv_timeout(WATCHDOG).map_err(|error| format!("receiver thread not ready: {error}"))?.unpark();
+    assert!(finished.recv_timeout(WATCHDOG).map_err(|error| error.to_string())?);
+    thread.join().map_err(|_| "fixture receiver thread panicked".to_owned())??;
+    Ok(())
 }
 
 #[test]
@@ -69,16 +75,18 @@ fn channel_disconnect_keeps_terminal_semantics() {
 }
 
 #[test]
-fn job_queued_before_dispatcher_registration_needs_no_wake() {
+fn job_queued_before_dispatcher_registration_needs_no_wake() -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
-    tx.send(91).unwrap();
+    tx.send(91).map_err(|error| error.to_string())?;
     let (ready, started) = mpsc::channel();
     let (done, finished) = mpsc::channel();
-    let thread = std::thread::spawn(move || {
-        ready.send(()).unwrap();
-        done.send(receive_payload(&rx)).unwrap();
+    let thread = std::thread::spawn(move || -> Result<(), String> {
+        ready.send(()).map_err(|error| error.to_string())?;
+        done.send(receive_payload(&rx)).map_err(|error| error.to_string())?;
+        Ok(())
     });
-    started.recv_timeout(WATCHDOG).expect("receiver thread not ready");
-    assert_eq!(finished.recv_timeout(WATCHDOG).unwrap(), 91);
-    thread.join().unwrap();
+    started.recv_timeout(WATCHDOG).map_err(|error| format!("receiver thread not ready: {error}"))?;
+    assert_eq!(finished.recv_timeout(WATCHDOG).map_err(|error| error.to_string())?, 91);
+    thread.join().map_err(|_| "fixture receiver thread panicked".to_owned())??;
+    Ok(())
 }
