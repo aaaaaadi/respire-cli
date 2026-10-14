@@ -401,3 +401,34 @@ fn environment_key_fallback_does_not_adopt_unlocked_profile_alias() -> anyhow::R
     assert_eq!(fixture.show(&id)?["user"], "foreign-private-author");
     fixture.assert_author_rejection()
 }
+
+/// Important remember retains full bodies, synchronized fields, and outbox bytes.
+#[test]
+fn important_remember_pending_candidates_preserve_ciphertext_and_outbox() -> anyhow::Result<()> {
+    let mut fixture = Fixture::new()?;
+    let content = "synthetic orchard irrigation moisture sensor maintenance ".repeat(48);
+    let mut original = entry("important-candidate", "synthetic-diary", "Orchard maintenance", &content);
+    original.importance = "important".into();
+    original.parent_id.clear();
+    fixture.seed(&original, false)?;
+    fixture.start()?;
+    let before = serde_json::to_value(fixture.store()?.all(true)?)?;
+    let boundary = fixture.store()?.outgoing_boundary()?;
+    let outgoing = serde_json::to_value(fixture.store()?.outgoing()?)?;
+    anyhow::ensure!(fixture.owns_runtime()?, "synthetic runtime is not ready");
+    let output = fixture.command(&["--client-only", "--json", "remember", &content, "--importance", "important"]).output()?;
+    assert_eq!(output.status.code(), Some(2), "pending candidates use the public pending exit code");
+    let result: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["errors"], serde_json::json!([]));
+    assert_eq!(result["status"], "pending");
+    assert_eq!(result["summary"]["written"], false);
+    assert_eq!(result["summary"]["state"], "candidates");
+    assert_eq!(result["summary"]["merge_count"], 1);
+    assert!(result["actions"].as_array().context("candidate actions missing")?.iter().any(|action|
+        action.as_str().is_some_and(|text| text.contains("--merge-ids \"important-candidate\""))));
+    assert_eq!(fixture.show("important-candidate")?["content"], content);
+    assert!(before == serde_json::to_value(fixture.store()?.all(true)?)?, "candidate lookup mutated synchronized record fields");
+    assert_eq!(boundary, fixture.store()?.outgoing_boundary()?);
+    assert!(outgoing == serde_json::to_value(fixture.store()?.outgoing()?)?, "candidate lookup mutated outbox");
+    Ok(())
+}

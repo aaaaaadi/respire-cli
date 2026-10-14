@@ -12,8 +12,8 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).parent
-SHA = '7f0b10756011759e2960ffbeae8d61f15d337785'
-OLD_SHA = '63c3da9e64a4ce182bfd802518030b102dd362a3'
+SHA = '686f1d1e84721675906e792c71b96cde4772429e'
+OLD_SHA = '7f0b10756011759e2960ffbeae8d61f15d337785'
 IDENTITY = '11111111-2222-4333-8444-555555555555'
 ENV = {'GITHUB_ACTIONS': 'true', 'GITHUB_RUN_ID': '123', 'GITHUB_RUN_ATTEMPT': '1',
        'RSRS_DEV_SERVER_ADDR': 'https://api.dev.rsrs.rs', 'RSRS_DEV_SERVER_SHA': SHA,
@@ -97,13 +97,14 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(inventory.encode()).hexdigest(), api.BASELINE_ROUTE_SHA256)
         excluded = smoke.contract['separate_coverage']
         self.assertEqual([len(excluded[key]['routes']) for key in (
-            'github_transport', 'existing_browser_only', 'passkey_and_vault_reset')], [7, 2, 9])
+            'github_transport', 'existing_browser_only', 'passkey_and_vault_reset')], [7, 2, 10])
+        self.assertIn('POST /api/self/passkeys/cancel', excluded['passkey_and_vault_reset']['routes'])
         complete = set(routes)
         for group in excluded.values():
             self.assertFalse(complete.intersection(group['routes']))
             complete.update(group['routes'])
-        self.assertEqual(len(complete), 84)
-        self.assertEqual(smoke.contract['review']['canonical_server_operations'], 84)
+        self.assertEqual(len(complete), 85)
+        self.assertEqual(smoke.contract['review']['canonical_server_operations'], 85)
 
     def test_stale_or_unreviewed_server_sha_is_still_rejected(self):
         """Require the exact source revision whose contract has been reviewed."""
