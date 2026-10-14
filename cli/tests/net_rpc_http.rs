@@ -542,3 +542,99 @@ fn non_reading_peer_and_pipelined_responses_do_not_block_other_connections() -> 
     assert!(wire[second..].contains("\"server\":\"respire\""), "pipelined health reply missing");
     Ok(())
 }
+
+#[test]
+fn rpc_memory_revision_is_read_only_and_model_free() -> Result<(), String> {
+    let rt = start_internal_runtime()?;
+    let mut baseline = None;
+    for args in [
+        vec!["memory-revision", "--json"],
+        vec!["--client-only", "memory-revision", "--json"],
+        vec!["memory-revision"],
+    ] {
+        let output = Command::new(bin())
+            .args(args)
+            .env("RSRS_DATA_DIR", rt.dir.path())
+            .env("RSRS_RPC_PORT", rt.port.to_string())
+            .env_remove("RSRS_RPC_TOKEN")
+            .env("RSRS_JSON", "1")
+            .output()
+            .map_err(|err| err.to_string())?;
+        if !output.status.success() {
+            return Err(format!(
+                "revision failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&output.stdout).map_err(|err| err.to_string())?;
+        assert_eq!(envelope["command"], "memory-revision");
+        assert_eq!(envelope["status"], "ok");
+        assert_eq!(
+            envelope["summary"]["profile"],
+            rt.dir.path().to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            envelope["summary"]["revision"].as_str().unwrap_or("").len(),
+            32
+        );
+        if let Some(expected) = &baseline {
+            assert_eq!(&envelope["summary"], expected);
+        } else {
+            baseline = Some(envelope["summary"].clone());
+        }
+    }
+    assert!(!rt.dir.path().join("session.json").exists());
+    assert!(!rt.dir.path().join("model").exists());
+    Ok(())
+}
+
+#[test]
+fn rpc_memory_revision_does_not_initialize_after_off_start() -> Result<(), Box<dyn std::error::Error>> {
+    let rt = start_internal_runtime_with_mode("off")?;
+    let db = rt.dir.path().join("rsrs.db");
+    assert!(!db.exists());
+    fs::write(rt.dir.path().join("client.json"), r#"{"service_mode":"normal"}"#)?;
+    for index in 0..3 {
+        let reply: serde_json::Value = ureq::post(&format!("http://127.0.0.1:{}/api/rpc", rt.port))
+            .timeout(Duration::from_secs(3))
+            .send_json(serde_json::json!({"v":1,"id":format!("revision-off-start-{index}"),"method":"cli.exec","args":["--json","memory-revision"]}))?
+            .into_json()?;
+        assert_eq!(reply["ok"], false, "probe created an absent library: {reply}");
+        assert!(!db.exists());
+        assert!(!rt.dir.path().join("onememory.db").exists());
+        assert!(!rt.dir.path().join("session.json").exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn rpc_memory_revision_does_not_schedule_background_work() -> Result<(), Box<dyn std::error::Error>> {
+    let rt = start_internal_runtime()?;
+    let base = format!("http://127.0.0.1:{}", rt.port);
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        let health: serde_json::Value = ureq::get(&format!("{base}/api/health")).call()?.into_json()?;
+        if health["retrieval_index"]["state"] == "ready" && health["retrieval_index"]["scheduled"] == false { break; }
+        assert!(Instant::now() < until, "initial empty index did not settle: {health}");
+        thread::sleep(Duration::from_millis(20));
+    }
+    // A later unsolicited index kick would now fail on the deliberate ambiguity.
+    // This synthetic file is never opened as a database and contains no user data.
+    fs::write(rt.dir.path().join("onememory.db"), b"synthetic ambiguous path")?;
+    for index in 0..3 {
+        let reply: serde_json::Value = ureq::post(&format!("{base}/api/rpc"))
+            .timeout(Duration::from_secs(3))
+            .send_json(serde_json::json!({"v":1,"id":format!("revision-no-index-{index}"),"method":"cli.exec","args":["--json","memory-revision"]}))?
+            .into_json()?;
+        assert_eq!(reply["ok"], false);
+        thread::sleep(Duration::from_millis(100));
+        let health: serde_json::Value = ureq::get(&format!("{base}/api/health")).call()?.into_json()?;
+        assert_eq!(health["retrieval_index"]["state"], "ready", "probe scheduled indexing: {health}");
+        assert_eq!(health["retrieval_index"]["scheduled"], false);
+        assert_eq!(health["retrieval_index"]["running"], false);
+        assert!(!rt.dir.path().join("session.json").exists());
+    }
+    Ok(())
+}

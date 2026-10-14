@@ -58,6 +58,7 @@ Startup preserves the selected account and does not import old profiles automati
 | --- | --- |
 | [Session import](docs/session-import.md) | Extract coding-agent sessions into memories |
 | [Runtime](docs/runtime.md) | Host lifecycle and sandbox clients |
+| [Memory refresh](docs/memory-revision.md) | Read-only profile-scoped snapshot tokens |
 | [Inference](docs/inference.md) | Model installation and engines |
 | [Retrieval](docs/retrieval.md) | Retrieval modes and index migration |
 | [npm launcher](npm/README.md) | Package layout and platform selection |

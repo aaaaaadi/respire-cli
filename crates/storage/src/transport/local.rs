@@ -21,6 +21,8 @@ mod retrieval;
 mod resident;
 pub use resident::MemorySourceChanged;
 mod related;
+mod revision;
+pub use revision::read_memory_revision;
 mod sync;
 pub use grants::AccessGrant;
 pub use retrieval::IndexSourceChanged;
@@ -987,6 +989,7 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
             artifact BLOB NOT NULL, PRIMARY KEY(memory_id,model)
         );",
     )?;
+    connection.execute_batch(include_str!("local/revision_schema.sql"))?;
     Ok(())
 }
 

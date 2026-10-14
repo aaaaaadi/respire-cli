@@ -801,6 +801,15 @@ fn watch_queue(deadline: &Arc<crate::admission::QueueDeadline>, reply: &Reply) -
 }
 
 pub fn call_from_argv() -> Result<()> {
+    call_from_argv_with_start(true)
+}
+
+/// Poll the existing loopback runtime without lifecycle or recovery writes.
+pub fn call_existing_from_argv() -> Result<()> {
+    call_from_argv_with_start(false)
+}
+
+fn call_from_argv_with_start(auto_start: bool) -> Result<()> {
     let mut args: Vec<String> = std::env::args()
         .skip(1)
         .filter(|arg| arg != "--direct" && arg != "--client-only")
@@ -816,7 +825,7 @@ pub fn call_from_argv() -> Result<()> {
         }
         args.splice(insertion..insertion, progress_args);
     }
-    let response = call_method("cli.exec", args, true)?;
+    let response = call_method("cli.exec", args, auto_start)?;
     render_response(response, json)
 }
 
@@ -1644,7 +1653,7 @@ fn stop_process(code: i32) -> ! {
 /// Job slots for this process. `RSRS_RPC_PARALLELISM` wins, then
 /// `client.json` `rpc_parallelism`, otherwise OS-reported available parallelism.
 /// Explicit settings cannot exceed the CPUs available to this process.
-/// Two additional lightweight slots keep show/list/status responsive.
+/// Two additional lightweight slots keep show/list/status/revision responsive.
 /// Simple writes prepare concurrently and use short source-checked commits.
 /// Foreground and background ONNX sessions have independent serial queues.
 pub(crate) fn worker_limit() -> usize {
@@ -1936,7 +1945,7 @@ fn dispatch_loop(rx: Receiver<Job>, limit: usize, idle: Option<Duration>, _lock:
                         let _ = job.reply.send(Ok(captured));
                         continue;
                     }
-                } else if _store.is_none() && command_name(&job.args) != Some("agent-config") {
+                } else if _store.is_none() && !matches!(command_name(&job.args), Some("agent-config" | "memory-revision")) {
                     let gate = shared_exclusive();
                     let _held = gate.acquire(true);
                     let opened = if !respire::service::service_paused() {
@@ -1994,15 +2003,15 @@ fn dispatch_loop(rx: Receiver<Job>, limit: usize, idle: Option<Duration>, _lock:
         loop {
             let ordinary_available = RUNNING.load(Ordering::Acquire).saturating_sub(LIGHT_RUNNING.load(Ordering::Acquire)) < limit;
             let position = if LIGHT_RUNNING.load(Ordering::Acquire) < 2 {
-                pending.iter().position(|job| matches!(command_name(&job.args), Some("show" | "list" | "status")))
+                pending.iter().position(|job| matches!(command_name(&job.args), Some("show" | "list" | "status" | "memory-revision")))
             } else { None };
             let job = if let Some(position) = position { pending.remove(position) }
                 else if ordinary_available {
-                    pending.iter().position(|job| !matches!(command_name(&job.args), Some("show" | "list" | "status")))
+                    pending.iter().position(|job| !matches!(command_name(&job.args), Some("show" | "list" | "status" | "memory-revision")))
                         .and_then(|position| pending.remove(position))
                 } else { None };
             let Some(job) = job else { break; };
-            let light_job = matches!(command_name(&job.args), Some("show" | "list" | "status"));
+            let light_job = matches!(command_name(&job.args), Some("show" | "list" | "status" | "memory-revision"));
             if light_job { LIGHT_RUNNING.fetch_add(1, Ordering::AcqRel); }
             let status_job = is_status(&job.args);
             if status_job {
@@ -2021,8 +2030,9 @@ fn dispatch_loop(rx: Receiver<Job>, limit: usize, idle: Option<Duration>, _lock:
                     }
                     mark_worker();
                     let generation = sync_generation();
+                    let revision_probe = command_name(&job.args) == Some("memory-revision");
                     let captured = crate::capture_run(job.args);
-                    kick_index();
+                    if !revision_probe { kick_index(); }
                     let result = check_sync_context(generation).map(|_| captured).map_err(|error| format!("{error:#}"));
                     let _ = job.reply.send(result);
                 });
@@ -2390,6 +2400,7 @@ mod tests {
         assert!(is_exclusive(&["attach".into(), "id".into()]));
         assert!(!is_exclusive(&["recall".into(), "respire".into()]));
         assert!(!is_exclusive(&["status".into()]));
+        assert!(!is_exclusive(&["memory-revision".into()]));
         assert!(!is_exclusive(&["list".into()]));
         assert!(!is_exclusive(&["show".into(), "id".into()]));
         assert!(!is_exclusive(&["sync-history".into()]));
