@@ -202,6 +202,35 @@ async function awaitScoped() {
   }
   throw new Error('Release did not reach scoped-ready within four hours');
 }
+// Retry only a structured npm resolver miss for one of this release's pinned packages.
+// Publication is outside this boundary and must never be replayed.
+export async function waitForPublicInstall(install, expectedSpecs, options = {}) {
+  const now = options.now ?? Date.now;
+  const pause = options.sleep ?? sleep;
+  const timeoutMs = options.timeoutMs ?? 10 * 60 * 1000;
+  const deadline = now() + timeoutMs;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      return await install(deadline - now());
+    } catch (error) {
+      let report;
+      try { report = JSON.parse(String(error.stdout)); }
+      catch { throw error; }
+      if (error.status !== 1 || error.signal || error.code === 'ETIMEDOUT' ||
+          report?.error?.code !== 'ETARGET' ||
+          !expectedSpecs.some(spec => report.error.summary === `No matching version found for ${spec}.`)) throw error;
+      const delay = options.pollMs ?? 60000;
+      if (attempt === 3 || now() + delay >= deadline) throw error;
+      options.onRetry?.(error, attempt);
+      await pause(delay);
+      if (now() >= deadline) throw error;
+    }
+  }
+}
+export function publicInstallArgs(directory, cache, version) {
+  return ['install', '--prefix', directory, '--cache', cache, '--registry', 'https://registry.npmjs.org',
+    '--no-audit', '--no-fund', '--prefer-online', '--json', `rsrs-cli@${version}`];
+}
 async function publishAlias() {
   const scoped = validateScoped(read('scoped-ready.json'), manifest());
   const source = scoped.source;
@@ -228,7 +257,17 @@ async function publishAlias() {
       NPM_CONFIG_USERCONFIG: path.join(directory, 'empty.npmrc'), NPM_CONFIG_GLOBALCONFIG: path.join(directory, 'global.npmrc'),
       NPM_CONFIG_CACHE: path.join(directory, 'cache'), RSRS_DATA_DIR: path.join(directory, 'profile')});
     writeFileSync(env.NPM_CONFIG_USERCONFIG, ''); writeFileSync(env.NPM_CONFIG_GLOBALCONFIG, '');
-    command('npm', ['install', '--prefix', directory, '--cache', env.NPM_CONFIG_CACHE, '--registry', 'https://registry.npmjs.org', '--no-audit', '--no-fund', `rsrs-cli@${source.version}`], {env, timeout: 10 * 60 * 1000, stdio: 'inherit'});
+    const installOutput = await waitForPublicInstall(remaining => {
+      const installStarted = Date.now();
+      assertActive(source);
+      // Source validation also consumes the shared install deadline.
+      const timeout = remaining - (Date.now() - installStarted);
+      if (timeout <= 0) throw new Error('Public install deadline expired during source validation');
+      return command('npm', publicInstallArgs(directory, env.NPM_CONFIG_CACHE, source.version), {env, timeout});
+    }, [...scoped.packages, expected].map(p => `${p.name}@${p.version}`), {
+      onRetry: (error, attempt) => console.error(`Public install resolver miss (attempt ${attempt}/3): ${error.stderr}`),
+    });
+    process.stdout.write(installOutput);
     const alias = read(path.join(directory, 'node_modules/rsrs-cli/package.json'));
     const cli = read(path.join(directory, 'node_modules/@rsrsai/cli/package.json'));
     const native = read(path.join(directory, 'node_modules/@rsrsai/linux-x64-gnu/package.json'));

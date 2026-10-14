@@ -1,9 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {readFileSync, readdirSync} from 'node:fs';
+import {existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync} from 'node:fs';
+import {createServer} from 'node:http';
+import {tmpdir} from 'node:os';
+import path from 'node:path';
+import {promisify} from 'node:util';
 import {createHash} from 'node:crypto';
-import {execFileSync} from 'node:child_process';
-import {PUBLICATION_MAX_BUFFER, publicationCommand, scopedPublisherFinished, selectRelease, validateArtifact, assertTagCommit, assertDraft, assertSourceRun, validateAlias, validateScoped, validateSource, readyName, aliasName} from './release-publication.mjs';
+import {execFile, execFileSync} from 'node:child_process';
+import {waitForPublicInstall, publicInstallArgs, PUBLICATION_MAX_BUFFER, publicationCommand, scopedPublisherFinished, selectRelease, validateArtifact, assertTagCommit, assertDraft, assertSourceRun, validateAlias, validateScoped, validateSource, readyName, aliasName} from './release-publication.mjs';
 
 const m = JSON.parse(readFileSync(new URL('../artifact-manifest.json', import.meta.url)));
 const integrity = 'sha512-' + createHash('sha512').update('synthetic package').digest('base64');
@@ -225,7 +229,7 @@ test('alias job and parent receipt budgets cover both propagation waits and clea
   };
   const scoped = minutes(helper, /verifyPackages\(scoped\.packages, \{[^}]*timeoutMs: (\d+) \* 60 \* 1000/);
   const alias = minutes(helper, /source\.channel, \{requireInstallIndex: true, timeoutMs: (\d+) \* 60 \* 1000/);
-  const install = minutes(helper, /\{env, timeout: (\d+) \* 60 \* 1000, stdio: 'inherit'\}/);
+  const install = minutes(helper, /options\.timeoutMs \?\? (\d+) \* 60 \* 1000;\n  const deadline = now\(\)/);
   const job = minutes(child.split('  publish-integrated:')[1].split('\n  publish:')[0], /timeout-minutes: (\d+)/);
   const receipt = minutes(helper, /async function awaitAlias\(\) \{[\s\S]*?Date\.now\(\) \+ (\d+) \* 60 \* 1000;/);
   assert.equal(alias, scoped);
@@ -238,4 +242,118 @@ test('alias job and parent receipt budgets cover both propagation waits and clea
   const recovery = minutes(parent.split('\n  dev6-publication-resume:')[1], /timeout-minutes: (\d+)/);
   const revalidation = minutes(helper, /options\.timeoutMs \?\? (\d+) \* 60 \* 1000/);
   assert(recovery > revalidation + receipt, 'Historical recovery needs revalidation and observation time');
+});
+
+test('npm resolver visibility delay retries exact pinned packages inside one deadline', async () => {
+  let elapsed = 0, attempts = 0;
+  const remaining = [], logged = [];
+  const specs = [...scoped.packages, alias.alias].map(p => `${p.name}@${p.version}`);
+  const output = await waitForPublicInstall(timeout => {
+    remaining.push(timeout);
+    elapsed += 2;
+    if (++attempts <= 2) throw Object.assign(new Error('npm failed'), {status: 1,
+      stdout: JSON.stringify({error: {code: 'ETARGET', summary: `No matching version found for ${specs[attempts - 1]}.`}})});
+    return 'installed';
+  }, specs, {timeoutMs: 30, pollMs: 5, now: () => elapsed, sleep: async ms => {elapsed += ms;},
+    onRetry: (_, attempt) => logged.push(attempt)});
+  assert.equal(output, 'installed');
+  assert.deepEqual(remaining, [30, 23, 16]);
+  assert.deepEqual(logged, [1, 2]);
+});
+
+test('npm resolver failures remain bounded and preserve the original error', async () => {
+  const error = Object.assign(new Error('npm failed'), {status: 1,
+    stdout: JSON.stringify({error: {code: 'ETARGET', summary: `No matching version found for rsrs-cli@${version}.`}})});
+  for (const timeoutMs of [11, 30]) {
+    let elapsed = 0, attempts = 0;
+    await assert.rejects(waitForPublicInstall(() => {attempts++; throw error;}, [`rsrs-cli@${version}`],
+      {timeoutMs, pollMs: 5, now: () => elapsed, sleep: async ms => {elapsed += ms;}}), actual => actual === error);
+    assert.equal(attempts, 3);
+  }
+  let attempts = 0;
+  await assert.rejects(waitForPublicInstall(() => {attempts++; throw error;}, [`rsrs-cli@${version}`],
+    {timeoutMs: 5, pollMs: 5}), actual => actual === error);
+  assert.equal(attempts, 1);
+});
+
+test('foreign ETARGET, malformed JSON, integrity, authorization and process failures never retry', async () => {
+  const report = summary => JSON.stringify({error: {code: 'ETARGET', summary}});
+  for (const fields of [
+    {stdout: report('No matching version found for foreign@1.0.0.')},
+    {stdout: report(`No matching version found for rsrs-cli@1.2.3-dev.99.`)},
+    {stdout: 'invalid JSON'},
+    {stdout: JSON.stringify({error: {code: 'EINTEGRITY', summary: 'bad digest'}})},
+    {stdout: JSON.stringify({error: {code: 'E401', summary: 'unauthorized'}})},
+    {status: null, signal: 'SIGTERM', code: 'ETIMEDOUT', stdout: report(`No matching version found for rsrs-cli@${version}.`)},
+  ]) {
+    const error = Object.assign(new Error('npm failed'), {status: 1}, fields);
+    let attempts = 0;
+    await assert.rejects(waitForPublicInstall(() => {attempts++; throw error;}, [`rsrs-cli@${version}`]),
+      actual => actual === error);
+    assert.equal(attempts, 1);
+  }
+});
+
+test('real publication install opts into npm freshness and structured errors without changing its pin', () => {
+  const args = publicInstallArgs('/isolated/install', '/isolated/cache', version);
+  assert(args.includes('--prefer-online'));
+  assert(args.includes('--json'));
+  assert.equal(args.at(-1), `rsrs-cli@${version}`);
+  assert.equal(args[args.indexOf('--registry') + 1], 'https://registry.npmjs.org');
+});
+
+test('actual npm resolver recovers from an offline registry index delay with a fresh request', async t => {
+  const root = mkdtempSync(path.join(tmpdir(), 'rsrs-install-index-test-'));
+  t.after(() => rmSync(root, {recursive: true, force: true}));
+  const npmCli = [
+    path.join(path.dirname(process.execPath), 'node_modules/npm/bin/npm-cli.js'),
+    path.resolve(path.dirname(process.execPath), '../lib/node_modules/npm/bin/npm-cli.js'),
+  ].find(existsSync);
+  assert(npmCli, 'The test requires the npm installed beside Node');
+  const env = {...process.env};
+  for (const key of Object.keys(env)) if (/^(?:npm_config_|NODE_AUTH_TOKEN$|NPM_TOKEN$|GH_TOKEN$|GITHUB_TOKEN$|ACTIONS_ID_TOKEN_REQUEST_)/i.test(key)) delete env[key];
+  Object.assign(env, {HOME: root, USERPROFILE: root, NPM_CONFIG_CACHE: path.join(root, 'cache'),
+    NPM_CONFIG_USERCONFIG: path.join(root, 'empty.npmrc'), NPM_CONFIG_GLOBALCONFIG: path.join(root, 'global.npmrc')});
+  writeFileSync(env.NPM_CONFIG_USERCONFIG, ''); writeFileSync(env.NPM_CONFIG_GLOBALCONFIG, '');
+  const pkg = path.join(root, 'package');
+  mkdirSync(pkg);
+  writeFileSync(path.join(pkg, 'package.json'), JSON.stringify({name: 'rsrs-cli', version}));
+  const execute = promisify(execFile);
+  await execute(process.execPath, [npmCli, 'pack', '--ignore-scripts', '--json', '--pack-destination', root], {cwd: pkg, env, timeout: 30000});
+  const tarball = readFileSync(path.join(root, readdirSync(root).find(file => file.endsWith('.tgz'))));
+  let visible = false, indexRequests = 0, retries = 0, attempts = 0;
+  const server = createServer((request, response) => {
+    response.setHeader('Content-Type', 'application/json');
+    if (request.url === '/rsrs-cli') {
+      indexRequests++;
+      const metadata = {name: 'rsrs-cli', version, dist: {
+        tarball: `http://127.0.0.1:${server.address().port}/fixture.tgz`,
+        integrity: `sha512-${createHash('sha512').update(tarball).digest('base64')}`,
+        shasum: createHash('sha1').update(tarball).digest('hex')}};
+      response.end(JSON.stringify({name: 'rsrs-cli', 'dist-tags': {dev: version},
+        versions: visible ? {[version]: metadata} : {}}));
+    } else if (request.url === '/fixture.tgz') {
+      response.setHeader('Content-Type', 'application/octet-stream'); response.end(tarball);
+    } else { response.statusCode = 404; response.end('{}'); }
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => {server.close(resolve); server.closeAllConnections();}));
+  const args = publicInstallArgs(path.join(root, 'install'), env.NPM_CONFIG_CACHE, version);
+  args[args.indexOf('--registry') + 1] = `http://127.0.0.1:${server.address().port}`;
+  args.splice(1, 0, '--ignore-scripts');
+  await waitForPublicInstall(async timeout => {
+    attempts++;
+    try { return (await execute(process.execPath, [npmCli, ...args], {env, timeout})).stdout; }
+    catch (error) {
+      // execFileSync (production) calls this exit code status; execFile calls it code.
+      error.status = error.code; throw error;
+    }
+  }, [`rsrs-cli@${version}`], {timeoutMs: 30000, pollMs: 1, onRetry: error => {
+    assert.equal(JSON.parse(error.stdout).error.code, 'ETARGET');
+    retries++; visible = true;
+  }});
+  assert.equal(retries, 1);
+  assert.equal(attempts, 2);
+  assert(indexRequests >= 2, 'The retry must fetch the registry again rather than reuse stale cache');
+  assert.equal(JSON.parse(readFileSync(path.join(root, 'install/node_modules/rsrs-cli/package.json'))).version, version);
 });
