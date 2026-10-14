@@ -54,7 +54,7 @@ class ModelFixtureTests(unittest.TestCase):
                 "No such file (os error 2) private-fixture-password private-session-token Bearer private-bearer"
             ]}).encode(), b"")
             diagnostic = smoke.redacted_cli_error({"RSRS_DATA_DIR": str(root)}, result)
-            self.assertIn("os error 2", diagnostic)
+            self.assertIn("No such file (os error 2)", diagnostic)
             self.assertNotIn("private-", diagnostic)
             self.assertLessEqual(len(diagnostic), 1500)
 
@@ -68,7 +68,7 @@ class ModelFixtureTests(unittest.TestCase):
             "No such file (os error 2) private-fixture-password"
         ]}).encode(), b"")
         diagnostic = smoke.redacted_cli_error({}, result)
-        self.assertIn("os error 2", diagnostic)
+        self.assertIn("No such file (os error 2)", diagnostic)
         self.assertNotIn("private-fixture-password", diagnostic)
 
     def check_reporter_failure(self, filename):
@@ -96,7 +96,7 @@ class ModelFixtureTests(unittest.TestCase):
                 [str(smoke.args.binary), "--runtime-internal", "--stop"])
             smoke.save.assert_called()
             diagnostic = smoke.report["cli_failure"]["error"]
-            self.assertIn("os error 2", diagnostic)
+            self.assertIn("No such file (os error 2)", diagnostic)
             self.assertIn("[redacted]", diagnostic)
             self.assertNotIn("private-", json.dumps(smoke.report))
             self.assertLessEqual(len(diagnostic), 1500)
