@@ -102,7 +102,7 @@ async function get(raw, options, tarball = false) {
     : Math.min(requestedTimeout, Math.max(1, options.deadline - (options.now || Date.now)()));
   if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0) throw new Error('Invalid registry request timeout');
   const response = await (options.fetchImpl || globalThis.fetch)(url, {
-    method: 'GET', headers: {'Accept': 'application/json', 'Cache-Control': 'no-cache'},
+    method: 'GET', headers: {'Accept': options.accept || 'application/json', 'Cache-Control': 'no-cache'},
     credentials: 'omit', redirect: 'error', cache: 'no-store',
     signal: AbortSignal.timeout(Math.max(1, Math.ceil(requestTimeoutMs))),
   });
@@ -151,6 +151,27 @@ export async function checkPackage(expected, options = {}) {
   if (!metadata.dist || typeof metadata.dist.tarball !== 'string') throw new Error(`Registry dist missing: ${label}`);
   assertPackMatches({name: metadata.name, version: metadata.version,
     integrity: metadata.dist.integrity, shasum: metadata.dist.shasum}, expected);
+  if (options.requireInstallIndex) {
+    const indexResponse = await get(`${REGISTRY}/${encodeURIComponent(expected.name)}`, {
+      ...options, accept: 'application/vnd.npm.install-v1+json',
+    });
+    if (indexResponse.status === 404) throw new PackageNotVisibleError(`Registry install index is not visible: ${label}`);
+    const index = await indexResponse.json();
+    if (index.name !== expected.name || !index.versions || typeof index.versions !== 'object' || Array.isArray(index.versions)) {
+      throw new Error(`Registry install index is invalid: ${label}`);
+    }
+    if (!Object.hasOwn(index.versions, expected.version)) {
+      throw new PackageNotVisibleError(`Registry install index does not contain: ${label}`);
+    }
+    const indexed = index.versions[expected.version];
+    assertPackMatches({name: indexed?.name, version: indexed?.version,
+      integrity: indexed?.dist?.integrity, shasum: indexed?.dist?.shasum}, expected);
+    if (registryUrl(indexed.dist.tarball) !== registryUrl(metadata.dist.tarball)) throw new Error(`Registry install tarball mismatch: ${label}`);
+    for (const field of ['dependencies', 'optionalDependencies']) {
+      const entries = value => JSON.stringify(Object.entries(value || {}).sort(([a], [b]) => a.localeCompare(b)));
+      if (entries(indexed[field]) !== entries(metadata[field])) throw new Error(`Registry install ${field} mismatch: ${label}`);
+    }
+  }
   await verifyTarball(metadata, expected, options);
   return metadata;
 }

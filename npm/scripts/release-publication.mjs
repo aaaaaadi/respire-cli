@@ -135,11 +135,11 @@ function artifact(runId, name, repository) {
     return read(path.join(directory, files[0]));
   } finally { rmSync(directory, {recursive: true, force: true}); }
 }
-async function verifyPackages(packages) {
+async function verifyPackages(packages, options = {}) {
   const deadline = Date.now() + 15 * 60 * 1000;
   for (const expected of packages) {
     if (Date.now() >= deadline) throw new Error('Public package verification exceeded 15 minutes');
-    await waitForPackage(expected, {timeoutMs: deadline - Date.now(), pollMs: 10000});
+    await waitForPackage(expected, {...options, timeoutMs: deadline - Date.now(), pollMs: 10000});
   }
 }
 /** Resolve drafts from the authenticated list, since tag lookup exposes published releases. */
@@ -210,13 +210,13 @@ async function publishAlias() {
   }
   assertActive(source);
   // Recheck all five public tarballs before publishing their thin entry point.
-  await verifyPackages(scoped.packages);
+  await verifyPackages(scoped.packages, {requireInstallIndex: true});
   command('node', ['npm/scripts/pack-alias.mjs', '--version', source.version]);
   const packed = packPackage('npm/dist/rsrs-cli', process.env.RUNNER_TEMP);
   if (packed.name !== 'rsrs-cli' || packed.version !== source.version) throw new Error('Alias packing identity mismatch');
   const expected = packIdentity(packed);
   assertActive(source); // Last source-attempt check immediately before irreversible npm publication.
-  const result = await publishPackage('npm/dist/rsrs-cli', {...expected, dependencies: {'@rsrsai/cli': source.version}}, source.channel);
+  const result = await publishPackage('npm/dist/rsrs-cli', {...expected, dependencies: {'@rsrsai/cli': source.version}}, source.channel, {requireInstallIndex: true});
   if (result.metadata.dependencies?.['@rsrsai/cli'] !== source.version) throw new Error('Alias dependency mismatch');
   // An isolated public install, without inherited npm credentials, cache, or user config.
   const directory = mkdtempSync(path.join(tmpdir(), 'rsrs-public-install-'));
