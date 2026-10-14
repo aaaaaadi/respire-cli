@@ -1,14 +1,41 @@
 name: CLI CI
 on:
   workflow_dispatch:
+    inputs:
+      version_upgrade_only:
+        description: Verify only the approved DEV12 to DEV13 version upgrade using existing GNU artifacts
+        type: boolean
+        default: false
+      native_published_only:
+        description: Test real M3 inference and global engine settings on published dev.5 and dev.7 only
+        type: boolean
+        default: false
+      artifact_run:
+        description: Existing release validation run with the GNU artifact
+        required: false
+        type: string
+      artifact_source:
+        description: Exact source SHA recorded in that binary artifact
+        required: false
+        type: string
+      version:
+        description: Exact artifact version
+        required: false
+        type: string
   push:
-    branches: [main]
+    branches: [main, 'fix/prompt-*']
   pull_request:
     branches: [main]
 permissions:
   contents: read
+  actions: read
+concurrency:
+  group: cli-ci-${{ github.ref }}-${{ inputs.native_published_only || false }}-${{ inputs.artifact_run || 'source' }}
+  cancel-in-progress: true
 jobs:
   platform-build:
+    # Release builds all four targets. Keep the separate compile matrix manual.
+    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.native_published_only && !inputs.artifact_run && !inputs.version_upgrade_only }}
     name: Compile (${{ matrix.target }})
     strategy:
       fail-fast: false
@@ -16,18 +43,12 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
           - os: macos-latest
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -67,33 +88,35 @@ jobs:
       - name: Verify musl CPU inference
         if: contains(matrix.target, '-musl')
         env:
-          ONEMEMORY_ENGINE: cpu
-          ONEMEMORY_DATA_DIR: ${{ runner.temp }}/musl-probe
-          ONEMEMORY_MODEL_DIR: ${{ runner.temp }}/musl-probe/model
+          RSRS_ENGINE: cpu
+          RSRS_DATA_DIR: ${{ runner.temp }}/musl-probe
+          RSRS_M3_DIR: ${{ runner.temp }}/musl-probe/model
         run: |
           set -euo pipefail
           exe=target/ci/${{ matrix.target }}/release/rsrs
-          "$exe" --direct model install-bge --json
+          "$exe" --direct model install-m3 --json
           "$exe" --direct model probe --json
       - name: Verify glibc CPU inference
         if: contains(matrix.target, '-gnu')
         env:
-          ONEMEMORY_ENGINE: cpu
-          ONEMEMORY_DATA_DIR: ${{ runner.temp }}/glibc-probe
-          ONEMEMORY_MODEL_DIR: ${{ runner.temp }}/glibc-probe/model
+          RSRS_ENGINE: cpu
+          RSRS_DATA_DIR: ${{ runner.temp }}/glibc-probe
+          RSRS_M3_DIR: ${{ runner.temp }}/glibc-probe/model
         run: |
           set -euo pipefail
           exe=target/ci/${{ matrix.target }}/debug/rsrs
-          "$exe" --direct model install-bge --json
+          "$exe" --direct model install-m3 --json
           "$exe" --direct model probe --json
   check:
+    if: ${{ !inputs.native_published_only && !inputs.artifact_run && !inputs.version_upgrade_only }}
     runs-on: ubuntu-latest
     env:
-      ONEMEMORY_ENGINE: cpu
+      RSRS_ENGINE: cpu
       # Several existing tests change process-global data-dir/language variables.
       # Their own parallel-request checks still create concurrent client threads.
-      RESPIRE_CORE_TEST_MODE: '1'
+      RSRS_CORE_TEST_MODE: '1'
       RUST_TEST_THREADS: '1'
+      RUST_MIN_STACK: '16777216'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -113,14 +136,221 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
-      - run: cargo check --workspace --locked
-      - run: cargo test --workspace --locked
+      # respire tests run once through llvm-cov below.
+      - run: cargo test --workspace --exclude respire --locked
       - name: CLI line coverage ≥ 90% (exclude entry points, UI and network adapters)
         run: |
           cargo llvm-cov --locked -p respire --fail-under-lines 90 \
-            --ignore-filename-regex '(main\.rs|web\.rs|rpc\.rs|runtime_(policy|error|http)\.rs|inject_tui\.rs|shell\.rs|/shell/|/core/|model_(install|progress)\.rs|space\.rs|update_check\.rs|classify(_config)?\.rs|recall_select\.rs)'
+            --ignore-filename-regex '(main\.rs|web\.rs|rpc\.rs|runtime_(policy|error|http)\.rs|extract_tui\.rs|inject_tui\.rs|shell\.rs|/shell/|/core/|model_(install|progress)\.rs|space\.rs|update_check\.rs|classify(_config)?\.rs|recall_select\.rs)'
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - run: node --check npm/scripts/pack.mjs
+      - run: node --check npm/scripts/release-notes.mjs
       - run: node npm/scripts/check-manifest.mjs
+      - run: node npm/scripts/test-wrapper.mjs
+      - run: node --test npm/scripts/test-registry-publication.mjs npm/scripts/test-release-publication.mjs npm/scripts/test-dev6-publication-recovery.mjs npm/scripts/test-parallel-publication.mjs
+      - run: node --test scripts/test-stage-core-runtime.mjs
+      - run: python3 scripts/test-dev-smoke-gate.py
+      - run: python3 scripts/test-dev-api-contract.py
+      - run: python3 scripts/test-dev-model-fixture.py
+      - run: python3 scripts/test-core-payload-lifetime.py
+
+  native-published-m3:
+    if: ${{ inputs.native_published_only && !inputs.version_upgrade_only }}
+    name: Published M3 (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install cryptography
+      - uses: actions/cache@v4
+        with:
+          path: native-model
+          key: pinned-m3-fp16-4de13258303883538bd53b696b452bf8099f0858
+      - name: Fetch the pinned model and exact published runtime bundles
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p native-model/onnx native-published
+          for file in tokenizer.json onnx/model_fp16.onnx; do
+            if [ ! -f "native-model/$file" ]; then
+              curl --fail --location --retry 2 --connect-timeout 10 --max-time 900 \
+                "https://huggingface.co/Xenova/bge-m3/resolve/4de13258303883538bd53b696b452bf8099f0858/$file" \
+                --output "native-model/$file.partial"
+              mv "native-model/$file.partial" "native-model/$file"
+            fi
+          done
+          for version in 1.0.11-dev.5 1.0.11-dev.7; do
+            extension=''; if [[ "$TARGET" == *windows* ]]; then extension='.exe'; fi
+            gh release download "v$version" --repo risense-ai/respire-cli --dir "native-published/$version" \
+              --pattern "rsrs-$TARGET$extension" --pattern "rsrs-$TARGET-runtime.tar.gz" --pattern "cli-build-$TARGET.json"
+            tar -xzf "native-published/$version/rsrs-$TARGET-runtime.tar.gz" -C "native-published/$version"
+            if [ -z "$extension" ]; then chmod +x "native-published/$version/rsrs-$TARGET"; fi
+          done
+      - name: Validate artifact hashes and real main to alternate to main inference
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          python <<'PY'
+          import hashlib,json,os,pathlib,subprocess,sys
+          target=os.environ['TARGET']; binaries=[]
+          for version in ['1.0.11-dev.5','1.0.11-dev.7']:
+              root=pathlib.Path('native-published')/version
+              report=json.loads((root/f'cli-build-{target}.json').read_text())
+              assert report['version']==version and report['target']==target
+              for field in ['binary','runtime']:
+                  with (root/report[field+'_file']).open('rb') as stream:
+                      assert hashlib.file_digest(stream,'sha256').hexdigest()==report[field+'_sha256']
+              binaries.extend(['--binary',str(root/report['binary_file'])])
+          subprocess.run([sys.executable,'scripts/test-real-m3-account-switch.py',*binaries,
+              '--model-dir','native-model','--model-file','model_fp16.onnx','--output-dir','native-model-results'],check=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          retention-days: 1
+          name: native-published-m3-${{ matrix.target }}
+          path: native-model-results/real-account-return-verification.json
+          if-no-files-found: warn
+
+  gnu-login-recovery:
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.artifact_run != '' || inputs.version_upgrade_only) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CLI_TARGET: x86_64-unknown-linux-gnu
+      CLI_SHA: ${{ inputs.artifact_source }}
+      CLI_VERSION: ${{ inputs.version }}
+      ARTIFACT_RUN: ${{ inputs.artifact_run }}
+      VERSION_UPGRADE_ONLY: ${{ inputs.version_upgrade_only }}
+      NATIVE_PUBLISHED_ONLY: ${{ inputs.native_published_only }}
+      RSRS_DEV_SERVER_ADDR: ${{ vars.RESPIRE_DEV_SERVER_ADDR }}
+      RSRS_DEV_SERVER_SHA: ${{ vars.RESPIRE_DEV_SERVER_SHA }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate existing artifact identity
+        run: |
+          node -e 'if (!/^[0-9]+$/.test(process.env.ARTIFACT_RUN) || !/^[a-f0-9]{40}$/.test(process.env.CLI_SHA) || !/^\d+\.\d+\.\d+-dev\.\d+$/.test(process.env.CLI_VERSION)) throw Error("Invalid artifact identity")'
+          node -e 'if (process.env.VERSION_UPGRADE_ONLY === "true" && (process.env.CLI_VERSION !== "1.0.11-dev.13" || process.env.CLI_SHA !== "d8314480e10a27767544f781083e35c8e85657f0" || process.env.ARTIFACT_RUN !== "37725760668" || process.env.NATIVE_PUBLISHED_ONLY !== "false")) throw Error("Only the approved DEV12 to DEV13 artifact upgrade is allowed")'
+          node npm/scripts/set-build-version.mjs "$CLI_VERSION"
+      - uses: actions/download-artifact@v4
+        with:
+          name: cli-release-x86_64-unknown-linux-gnu
+          path: validated-cli
+          run-id: ${{ inputs.artifact_run }}
+          github-token: ${{ github.token }}
+      - name: Extract the checksum-verified binary
+        run: node npm/scripts/extract-artifact.mjs validated-cli candidate
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/release-probe/models/bge-m3
+          key: release-m3-quantized-0826f8c1-gnu-recovery
+      - name: Prepare the model only in the owned test directory
+        env:
+          RSRS_DATA_DIR: ${{ runner.temp }}/release-probe
+          RSRS_M3_DIR: ${{ runner.temp }}/release-probe/models/bge-m3
+          RSRS_ENGINE: cpu
+          RSRS_NO_AUTOSYNC: '1'
+          RSRS_UPDATE_CHECK: '0'
+        run: candidate/rsrs --direct model install-m3 --json
+      - name: Run the existing interruption and complete migration verification
+        if: ${{ !inputs.version_upgrade_only }}
+        run: |
+          python3 -m venv "$RUNNER_TEMP/recovery-python"
+          "$RUNNER_TEMP/recovery-python/bin/pip" install --only-binary=:all: cryptography==46.0.3
+          binary="$(realpath candidate/rsrs)"
+          checksum="$(sha256sum "$binary" | cut -d ' ' -f 1)"
+          "$RUNNER_TEMP/recovery-python/bin/python" scripts/dev-login-interruption-smoke.py --binary "$binary" --binary-sha256 "$checksum" --version "$CLI_VERSION" --source-sha "$CLI_SHA" --root "$RUNNER_TEMP/gnu-login-interruption" --model-dir "$RUNNER_TEMP/release-probe/models/bge-m3"
+      - name: Diagnose existing legacy vault cloud migration
+        if: ${{ !inputs.version_upgrade_only }}
+        run: |
+          binary="$(realpath candidate/rsrs)"
+          checksum="$(sha256sum "$binary" | cut -d ' ' -f 1)"
+          "$RUNNER_TEMP/recovery-python/bin/python" scripts/dev-legacy-vault-smoke.py --binary "$binary" --binary-sha256 "$checksum" --version "$CLI_VERSION" --source-sha "$CLI_SHA" --root "$RUNNER_TEMP/gnu-legacy-vault"
+      - name: Verify the existing real DEV12 to DEV13 upgrade case
+        if: inputs.version_upgrade_only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/dev12-assets" "$RUNNER_TEMP/dev12-seed" "$RUNNER_TEMP/dev13-owned-upgrade"
+          gh release download v1.0.11-dev.12 --repo risense-ai/respire-cli --dir "$RUNNER_TEMP/dev12-assets" \
+            --pattern rsrs-x86_64-unknown-linux-gnu --pattern rsrs-x86_64-unknown-linux-gnu-runtime.tar.gz \
+            --pattern cli-build-x86_64-unknown-linux-gnu.json
+          node npm/scripts/set-build-version.mjs 1.0.11-dev.12
+          CLI_VERSION=1.0.11-dev.12 node npm/scripts/extract-artifact.mjs "$RUNNER_TEMP/dev12-assets" "$RUNNER_TEMP/dev12-seed"
+          node npm/scripts/set-build-version.mjs "$CLI_VERSION"
+          node - <<'NODE'
+          const fs=require('fs'),path=require('path');
+          for(const directory of ['candidate',path.join(process.env.RUNNER_TEMP,'dev12-seed')]){
+            const runtime=JSON.parse(fs.readFileSync(path.join(directory,'core-runtime.json'),'utf8'));
+            if(runtime.target!=='x86_64-unknown-linux-gnu'||runtime.sdk_version!=='1.0.2-dev.4') throw new Error('Upgrade requires the unchanged verified Core SDK');
+          }
+          NODE
+          python3 -m venv "$RUNNER_TEMP/recovery-python"
+          "$RUNNER_TEMP/recovery-python/bin/pip" install --only-binary=:all: cryptography==46.0.3 psutil==7.1.0
+          binary="$(realpath candidate/rsrs)"
+          script="$(realpath scripts/test-real-m3-account-switch.py)"
+          cd "$RUNNER_TEMP/dev13-owned-upgrade"
+          "$RUNNER_TEMP/recovery-python/bin/python" "$script" --binary "$binary" \
+            --seed-binary "$RUNNER_TEMP/dev12-seed/rsrs" --expect-supervised-worker \
+            --model-dir "$RUNNER_TEMP/release-probe/models/bge-m3" \
+            --legacy-model-dir "$RUNNER_TEMP/release-probe/models/bge-m3" --legacy-model-file model_quantized.onnx \
+            --output-dir "$RUNNER_TEMP/dev13-version-upgrade"
+          "$RUNNER_TEMP/recovery-python/bin/python" - <<'PY'
+          import hashlib,json,os,pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])
+          reports=json.loads((root/'dev13-version-upgrade/real-account-return-verification.json').read_text())
+          assert len(reports)==1
+          report=reports[0]
+          assert all(report.get(key) is True for key in ['passed','real_model','in_process_checked','global_engine_preserved','distinct_vault_keys','source_and_keys_unchanged','compatible_index_reused','forced_restart_checked','old_rpc_checked'])
+          assert report['initial_generation_changes'] and all(value is False for value in report['initial_generation_changes'].values()),'version-only upgrade rebuilt compatible indexes'
+          safe={key:report[key] for key in ['binary_sha256','passed','real_model','model_file','engine','in_process_checked','global_engine_preserved','distinct_vault_keys','source_and_keys_unchanged','compatible_index_reused','forced_restart_checked','old_rpc_checked','old_rpc_authenticated','initial_generation_changes']}
+          safe.update(source_sha=os.environ['CLI_SHA'],version=os.environ['CLI_VERSION'],artifact_run=os.environ['ARTIFACT_RUN'],seed_version='1.0.11-dev.12',sdk_version='1.0.2-dev.4',seed_binary_sha256=hashlib.sha256((root/'dev12-seed/rsrs').read_bytes()).hexdigest())
+          (root/'dev13-version-upgrade/version-upgrade-coverage.json').write_text(json.dumps(safe,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: ${{ success() && inputs.version_upgrade_only }}
+        with:
+          retention-days: 1
+          name: dev13-version-upgrade
+          path: ${{ runner.temp }}/dev13-version-upgrade/version-upgrade-coverage.json
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() && !inputs.version_upgrade_only }}
+        with:
+          retention-days: 1
+          name: gnu-login-interruption
+          path: |
+            ${{ runner.temp }}/gnu-login-interruption/
+            ${{ runner.temp }}/gnu-legacy-vault/legacy-vault-coverage.json
+          if-no-files-found: ignore

@@ -30,17 +30,72 @@ struct Progress {
     total: Option<u64>,
     started: Instant,
     updated: Instant,
+    idle_timeout: bool,
     cancelled: bool,
 }
 
 pub struct Operation;
 
+#[derive(Debug)]
+pub enum OperationStopped {
+    Cancelled,
+    TimedOut,
+    IdleTimedOut,
+}
+
+impl std::fmt::Display for OperationStopped {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Cancelled => "model operation cancelled",
+            Self::TimedOut => "model operation timed out after 30 minutes",
+            Self::IdleTimedOut => "model operation made no progress for 30 minutes",
+        })
+    }
+}
+
+impl std::error::Error for OperationStopped {}
+
+fn check_progress(progress: &Progress) -> Result<()> {
+    if progress.cancelled {
+        return Err(OperationStopped::Cancelled.into());
+    }
+    if progress.idle_timeout {
+        if progress.updated.elapsed().as_secs() >= 1800 {
+            return Err(OperationStopped::IdleTimedOut.into());
+        }
+    } else if progress.started.elapsed().as_secs() >= 1800 {
+        return Err(OperationStopped::TimedOut.into());
+    }
+    Ok(())
+}
+
 impl Operation {
+    /// Download duration depends on bandwidth. Keep progressing downloads alive.
+    pub fn begin_download() -> Result<Self> {
+        Self::try_begin_with_idle_timeout("verify", true)?
+            .ok_or_else(|| anyhow!("another model operation is running"))
+    }
     pub fn begin(phase: &str) -> Result<Self> {
+        Self::try_begin(phase)?.ok_or_else(|| anyhow!("another model operation is running"))
+    }
+
+    /// Reserve the model slot without waiting, with the foreground total budget.
+    pub fn try_begin(phase: &str) -> Result<Option<Self>> {
+        Self::try_begin_with_idle_timeout(phase, false)
+    }
+
+    /// Large libraries may take hours; only a lack of progress pauses indexing.
+    pub fn try_begin_background_index() -> Result<Option<Self>> {
+        Self::try_begin_with_idle_timeout("index-load", true)
+    }
+
+    fn try_begin_with_idle_timeout(phase: &str, idle_timeout: bool) -> Result<Option<Self>> {
         let mut slot = CURRENT
             .lock()
             .map_err(|_| anyhow!("model progress lock poisoned"))?;
-        anyhow::ensure!(slot.is_none(), "another model operation is running");
+        if slot.is_some() {
+            return Ok(None);
+        }
         *slot = Some(Progress {
             id: TASK_ID
                 .with_borrow(|id| id.clone())
@@ -51,11 +106,25 @@ impl Operation {
             total: None,
             started: Instant::now(),
             updated: Instant::now(),
+            idle_timeout,
             cancelled: false,
         });
         TRACKED.set(true);
-        Ok(Self)
+        Ok(Some(Self))
     }
+}
+
+pub fn status() -> Result<Value> {
+    let slot = CURRENT.lock().map_err(|_| anyhow!("model progress lock poisoned"))?;
+    Ok(match slot.as_ref() {
+        Some(progress) => json!({
+            "active": true, "id": progress.id, "phase": progress.phase,
+            "item": progress.item, "done": progress.done, "total": progress.total,
+            "elapsed": progress.started.elapsed().as_secs(),
+            "idle": progress.updated.elapsed().as_secs(), "cancelled": progress.cancelled,
+        }),
+        None => json!({"active": false}),
+    })
 }
 
 impl Drop for Operation {
@@ -75,11 +144,7 @@ pub fn update(phase: &str, item: &str, done: u64, total: Option<u64>) -> Result<
         .lock()
         .map_err(|_| anyhow!("model progress lock poisoned"))?;
     if let Some(progress) = slot.as_mut() {
-        anyhow::ensure!(!progress.cancelled, "model operation cancelled");
-        anyhow::ensure!(
-            progress.started.elapsed().as_secs() < 1800,
-            "model operation timed out after 30 minutes"
-        );
+        check_progress(progress)?;
         if progress.phase != phase || progress.item != item || progress.done != done {
             progress.updated = Instant::now();
         }
@@ -96,16 +161,9 @@ pub fn check() -> Result<()> {
         let slot = CURRENT
             .lock()
             .map_err(|_| anyhow!("model progress lock poisoned"))?;
-        anyhow::ensure!(
-            !slot.as_ref().is_some_and(|p| p.cancelled),
-            "model operation cancelled"
-        );
-        anyhow::ensure!(
-            !slot
-                .as_ref()
-                .is_some_and(|p| p.started.elapsed().as_secs() >= 1800),
-            "model operation timed out after 30 minutes"
-        );
+        if let Some(progress) = slot.as_ref() {
+            check_progress(progress)?;
+        }
     }
     Ok(())
 }
@@ -118,7 +176,7 @@ pub fn control(task_id: &str, cancel: bool) -> Result<Value> {
         return Ok(json!({"active":false}));
     };
     if p.id != task_id {
-        return Ok(json!({"active":false}));
+        return Ok(json!({"active":true,"stale":true}));
     }
     if cancel {
         p.cancelled = true;

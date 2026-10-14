@@ -1,11 +1,12 @@
 //! keystore — super-password (v4 single-factor key) storage.
 //!
-//! Priority: persistent Secret Service on Linux, then its volatile kernel store;
-//! Keychain/Credential Manager elsewhere; finally env ONEMEMORY_SUPER.
+//! Read priority: explicit nonempty RSRS_SUPER, then native credentials.
+//! Native priority: persistent Secret Service on Linux, then its volatile kernel
+//! store; Keychain/Credential Manager elsewhere.
 //! > none. Plaintext is never written to session.json from v4 on — a disk copy cannot decrypt.
-//! Headless servers (no keyring) use ONEMEMORY_SUPER or pass --super each time.
+//! Headless servers (no keyring) use RSRS_SUPER or pass --super each time.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 
 const SERVICE: &str = "rsrs";
 const VAULT_SERVICE: &str = "rsrs";
@@ -124,7 +125,7 @@ fn credential_account(user: &str) -> String {
         };
         if session_user == account {
             if let Some(alias) = session["keyring_account"].as_str().filter(|alias| {
-                alias.starts_with("legacy-")
+                (alias.starts_with("legacy-") || alias.starts_with("login-"))
                     && alias
                         .chars()
                         .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
@@ -138,6 +139,11 @@ fn credential_account(user: &str) -> String {
 
 /// Import into a separate namespace. Existing credentials are never overwritten.
 pub(crate) fn import_credential(account: &str, slot: &str, value: &str) -> Result<&'static str> {
+    import_credential_checkpoint(account, slot, value, |_| Ok(()))
+}
+
+/// Record the selected backend before a credential can be created.
+pub(crate) fn import_credential_checkpoint(account: &str, slot: &str, value: &str, mut checkpoint: impl FnMut(&str) -> Result<()>) -> Result<&'static str> {
     let label = format!("{slot}:{account}");
     if read_credentials(VAULT_SERVICE, &label)
         .iter()
@@ -149,6 +155,7 @@ pub(crate) fn import_credential(account: &str, slot: &str, value: &str) -> Resul
     }
     for backend in backends() {
         let entry = credential_entry(VAULT_SERVICE, &label, *backend)?;
+        let mut created = false;
         match entry.get_password() {
             Ok(existing) if existing != value => {
                 return Err(anyhow!(
@@ -157,9 +164,11 @@ pub(crate) fn import_credential(account: &str, slot: &str, value: &str) -> Resul
             }
             Ok(_) => {}
             Err(keyring::Error::NoEntry) => {
+                checkpoint(backend.name())?;
                 if entry.set_password(value).is_err() {
                     continue;
                 }
+                created = true;
             }
             Err(keyring::Error::Ambiguous(_))
             | Err(keyring::Error::BadEncoding(_))
@@ -168,21 +177,46 @@ pub(crate) fn import_credential(account: &str, slot: &str, value: &str) -> Resul
             }
             Err(_) => continue,
         }
-        let readback = credential_entry(VAULT_SERVICE, &label, *backend)?;
-        match readback.get_password() {
+        let readback = credential_entry(VAULT_SERVICE, &label, *backend)
+            .and_then(|entry| entry.get_password().map_err(Into::into));
+        match readback {
             Ok(found) if found == value => {
                 if backend.name() == "kernel" {
                     eprintln!("warning: migrated credentials use the volatile Linux kernel keyring; original keys were preserved; restore or re-import them into an available Secret Service store for reboot-safe storage");
                 }
                 return Ok(backend.name());
             }
-            Ok(_) => return Err(anyhow!("migration keyring readback mismatch")),
-            Err(_) => continue,
+            Ok(_) => {
+                if created {
+                    entry.delete_credential().context("remove new credential after readback mismatch")?;
+                }
+                return Err(anyhow!("migration keyring readback mismatch"));
+            },
+            Err(_) => {
+                if created {
+                    match entry.delete_credential() {
+                        Ok(()) | Err(keyring::Error::NoEntry) => {},
+                        Err(error) => return Err(anyhow!("credential readback failed and its new entry could not be removed: {error}")),
+                    }
+                }
+                continue;
+            },
         }
     }
     Err(anyhow!(
         "migration keyring write/readback failed; no snapshot was published"
     ))
+}
+
+/// Remove only the entry created by this login when its transaction rolls back.
+pub(crate) fn remove_imported(account: &str, slot: &str, backend_name: &str) -> Result<()> {
+    let backend = backends().iter().find(|backend| backend.name() == backend_name)
+        .ok_or_else(|| anyhow!("credential backend is unavailable during login rollback"))?;
+    let entry = credential_entry(VAULT_SERVICE, &format!("{slot}:{account}"), *backend)?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(anyhow!("login credential rollback failed: {error}")),
+    }
 }
 
 /// Classification settings are global per endpoint, unlike per-library vaults.
@@ -247,16 +281,14 @@ pub fn delete_login_pass(user: &str) {
     delete_label(&format!("pass:{}", credential_account(user)));
 }
 
-/// Load super password: OS keyring → env ONEMEMORY_SUPER → None.
-/// Any failure of entry()/get_password() (headless, no keyring) must fall through to the env var.
+/// Load super password: explicit nonempty RSRS_SUPER → OS keyring → None.
+/// Headless login supplies its verified key through the environment; an old
+/// credential for the same user must not replace that explicitly selected key.
 pub fn load_super(user: &str) -> Option<String> {
-    let from_ring = read_credentials(SERVICE, &format!("super:{}", credential_account(user)))
-        .into_iter()
-        .next();
-    from_ring.or_else(|| {
-        std::env::var("ONEMEMORY_SUPER")
-            .ok()
-            .filter(|s| !s.is_empty())
+    crate::env::var("RSRS_SUPER").ok().filter(|s| !s.is_empty()).or_else(|| {
+        read_credentials(SERVICE, &format!("super:{}", credential_account(user)))
+            .into_iter()
+            .next()
     })
 }
 
@@ -297,13 +329,13 @@ mod host_tests {
     #[test]
     fn load_super_falls_back_to_env() {
         let _guard = crate::test_lock::guard();
-        let saved = std::env::var("ONEMEMORY_SUPER").ok();
-        std::env::set_var("ONEMEMORY_SUPER", "env-super");
+        let saved = crate::env::var("RSRS_SUPER").ok();
+        std::env::set_var("RSRS_SUPER", "env-super");
         let got = load_super("no-such-user-zzzz");
         assert_eq!(got.as_deref(), Some("env-super"));
         match saved {
-            Some(v) => std::env::set_var("ONEMEMORY_SUPER", v),
-            None => std::env::remove_var("ONEMEMORY_SUPER"),
+            Some(v) => std::env::set_var("RSRS_SUPER", v),
+            None => std::env::remove_var("RSRS_SUPER"),
         }
     }
 }
@@ -324,7 +356,7 @@ pub fn load_classify_key(backend: &str) -> Option<String> {
         } else {
             "TYPESAFE_API_KEY"
         };
-        std::env::var(var).ok().filter(|s| !s.is_empty())
+        crate::env::var(var).ok().filter(|s| !s.is_empty())
     })
 }
 

@@ -55,6 +55,7 @@ impl std::error::Error for SyncBoundaryChanged {}
 
 /// Controls local consistency phases independently from network calls.
 pub trait SyncControl {
+    fn progress(&self, _phase: &str) {}
     fn boundary_changed(&self) -> Result<()> {
         Ok(())
     }
@@ -92,6 +93,7 @@ pub fn sync_controlled(
     let started = std::time::Instant::now();
     let mut stats = SyncStats::default();
     let cached_epoch = control.local(|| local.meta_get("sync_v2_epoch"))?;
+    control.progress("capabilities");
     let cached_support = control.local(|| local.meta_get("sync_v2_resolution_support"))?;
     let capability =
         if let Some(epoch) = cached_epoch.filter(|_| cached_support.as_deref() == Some("1")) {
@@ -149,7 +151,9 @@ pub fn sync_controlled(
                 epoch: cap.epoch.clone(),
                 items,
             };
+            control.progress("push");
             let reply = control.remote(|| remote.push_v2(&request))?;
+            control.progress("apply");
             stats.pushed +=
                 control.local(|| local.acknowledge(&request.items, &reply.results, false))?;
         }
@@ -157,6 +161,7 @@ pub fn sync_controlled(
             pull_pages(keys, local, remote, control, &cap.epoch, false, &mut stats)?;
         }
         let mut materialized_after = String::new();
+        control.progress("materialize");
         while let Some(next) =
             control.local(|| local.materialize_received_batch(keys, &materialized_after))?
         {
@@ -166,6 +171,7 @@ pub fn sync_controlled(
             pull_resolution_pages(local, remote, control, &cap.epoch)?;
         }
         let mut classified_after = 0;
+        control.progress("conflicts");
         while let Some(next) = control.local(|| {
             local.classify_conflicts_batch(keys, cap.conflict_resolution, classified_after)
         })? {
@@ -206,9 +212,11 @@ pub fn sync_controlled(
         let cursor = control
             .local(|| local.meta_get("sync_cursor"))?
             .and_then(|s| s.parse().ok());
+        control.progress("pull");
         let reply = control.remote(|| remote.fetch_rev(cursor))?;
         stats.remote_total = reply.total as usize;
         stats.remote_alive = reply.alive as usize;
+        control.progress("apply");
         stats.pulled += control.local(|| local.apply_legacy(keys, reply.blobs, reply.cursor))?;
         let mut sent = false;
         loop {
@@ -218,6 +226,7 @@ pub fn sync_controlled(
             }
             sent = true;
             let blobs: Vec<_> = items.iter().map(|o| o.blob.clone()).collect();
+            control.progress("push");
             let replaced = control.remote(|| remote.put_batch(&blobs))?;
             if replaced.len() != items.len() {
                 anyhow::bail!("batch response length mismatch");
@@ -235,6 +244,7 @@ pub fn sync_controlled(
             stats.pushed += control.local(|| local.acknowledge(&items, &receipts, true))?;
         }
         if sent {
+            control.progress("pull");
             let again = control.remote(|| remote.fetch_rev(Some(reply.cursor)))?;
             stats.remote_total = again.total as usize;
             stats.remote_alive = again.alive as usize;
@@ -242,6 +252,7 @@ pub fn sync_controlled(
                 control.local(|| local.apply_legacy(keys, again.blobs, again.cursor))?;
         }
     }
+    control.progress("verify");
     (stats.pending, stats.conflicts, stats.undecodable) = control.local(|| local.sync_counts())?;
     (
         stats.conflict_history,
@@ -249,7 +260,7 @@ pub fn sync_controlled(
         stats.historical_conflicts,
         stats.resolving_conflicts,
     ) = control.local(|| local.conflict_metrics())?;
-    if std::env::var_os("ONEMEMORY_SYNC_TIMING").is_some() {
+    if crate::env::var_os("RSRS_SYNC_TIMING").is_some() {
         eprintln!(
             "sync protocol={} elapsed_ms={} pulled={} pushed={} pending={} conflicts={}",
             stats.protocol,
@@ -320,10 +331,12 @@ fn pull_pages(
         None
     };
     loop {
+        control.progress("pull");
         let page = control.remote(|| remote.pull_v2(epoch, after, until, snapshot))?;
         if page.epoch != epoch || until.is_some_and(|h| h != page.until) {
             anyhow::bail!("server page snapshot changed");
         }
+        control.progress("apply");
         stats.pulled += control.local(|| local.apply_page(keys, &page, snapshot))?;
         stats.remote_total = page.total as usize;
         stats.remote_alive = page.alive as usize;
@@ -356,11 +369,11 @@ pub fn build_remote_from_env() -> Result<RemoteTransport> {
         }
     }
     // 2) env vars
-    let addr = std::env::var("ONEMEMORY_ADDR").map_err(|_| {
-        anyhow::anyhow!("sync needs ONEMEMORY_ADDR (server address) or a prior register/login")
+    let addr = crate::env::var("RSRS_ADDR").map_err(|_| {
+        anyhow::anyhow!("sync needs RSRS_ADDR (server address) or a prior register/login")
     })?;
-    let token = std::env::var("ONEMEMORY_TOKEN")
-        .map_err(|_| anyhow::anyhow!("sync needs ONEMEMORY_TOKEN"))?;
+    let token = crate::env::var("RSRS_TOKEN")
+        .map_err(|_| anyhow::anyhow!("sync needs RSRS_TOKEN"))?;
     Ok(RemoteTransport::new(
         crate::transport::remote::RemoteConfig {
             address: addr,
@@ -381,7 +394,7 @@ pub fn remote_configured() -> bool {
             }
         }
     }
-    std::env::var("ONEMEMORY_ADDR")
+    crate::env::var("RSRS_ADDR")
         .map(|a| !a.trim().is_empty())
         .unwrap_or(false)
 }
@@ -424,6 +437,9 @@ mod tests {
 
     fn entry(id: &str, content: &str) -> MemoryEntry {
         MemoryEntry {
+            supersedes: String::new(),
+            superseded_by: String::new(),
+            see_also: Vec::new(),
             id: id.to_owned(),
             kind: Kind::Context,
             tags: vec!["t".to_owned()],
@@ -533,18 +549,18 @@ mod tests {
 
     fn remote_configured_flag() -> anyhow::Result<()> {
         // Isolate: temp HOME (no session.json), only test the env-var branch
-        let saved_home = std::env::var("HOME").ok();
+        let saved_home = crate::env::var("HOME").ok();
         let dir = tempfile::tempdir()?;
         std::env::set_var("HOME", dir.path());
-        let saved = std::env::var("ONEMEMORY_ADDR").ok();
-        std::env::remove_var("ONEMEMORY_ADDR");
+        let saved = crate::env::var("RSRS_ADDR").ok();
+        std::env::remove_var("RSRS_ADDR");
         assert!(!remote_configured());
-        std::env::set_var("ONEMEMORY_ADDR", "http://x");
+        std::env::set_var("RSRS_ADDR", "http://x");
         assert!(remote_configured());
         // restore
         match saved {
-            Some(v) => std::env::set_var("ONEMEMORY_ADDR", v),
-            None => std::env::remove_var("ONEMEMORY_ADDR"),
+            Some(v) => std::env::set_var("RSRS_ADDR", v),
+            None => std::env::remove_var("RSRS_ADDR"),
         }
         match saved_home {
             Some(v) => std::env::set_var("HOME", v),

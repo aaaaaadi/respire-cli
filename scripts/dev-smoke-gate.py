@@ -21,12 +21,26 @@ MIGRATION = {"model_cpu_real", "onememory_multiaccount_wal_migrated", "respire_c
              "legacy_keys_migrated_without_super_override", "legacy_api_defaults_rewritten",
              "migration_repeated_start_idempotent", "migration_interrupted_restart_recovered",
              "existing_rsrs_preserved_and_legacy_imported", "migrated_outbox_sync_and_independent_decrypt",
-             "migration_incompatible_primary_keys_rejected", "migration_symlink_root_rejected", "migration_client_only_does_not_write"}
+             "migration_incompatible_primary_keys_rejected", "migration_symlink_root_rejected", "migration_client_only_does_not_write",
+             "startup_does_not_migrate", "migration_source_order_and_backup_only_idempotent"}
 
 
 def require(value, code):
     if not value:
         raise RuntimeError(code)
+
+
+def business_summary(observations, mapping):
+    names = [row["action"] for row in observations]
+    passed = {row["action"] for row in observations if row.get("passed") is True}
+    retired = {row["action"] for row in observations if row.get("removed_by_requirement") is True}
+    expected = [row["action"] for row in mapping["actions"]]
+    require(len(names) == len(set(names)) and len(expected) == len(set(expected))
+            and set(names) == set(expected), "business_summary_action_mismatch")
+    require(not passed & retired and len(passed) + len(retired) == len(names), "business_summary_partition_mismatch")
+    require(len(passed) == mapping["retained"] and len(retired) == mapping["removed_by_requirement"],
+            "business_summary_contract_mismatch")
+    return {"passed": True, "observed": len(passed), "removed_by_requirement": len(retired)}
 
 
 def read(path):
@@ -72,7 +86,7 @@ def verify(args, result):
     base = read(args.cli_report)
     identity(base, args, version="observed_version")
     require(base.get("expected_version") == args.version, "base_expected_version_mismatch")
-    require(base.get("server") == "https://dev.rsrs.rs", "base_server_mismatch")
+    require(base.get("server") == "https://api.dev.rsrs.rs", "base_server_mismatch")
     require(base.get("base_complete") is True and base.get("failed") == 0
             and not base.get("required_missing"), "cli_base_incomplete")
     catalog = base.get("catalog", {})
@@ -130,6 +144,18 @@ def verify(args, result):
 
     verify_migration(args, result)
 
+    interruption = read(args.login_interruption)
+    identity(interruption, args)
+    require(interruption.get("passed") is True and interruption.get("runtime_cleanup", {}).get("passed") is True,
+            "login_interruption_incomplete")
+    cases(interruption, {"before_publish_SIGINT_retry", "after_publish_SIGINT_retry", "pre_journal_DEV4_recovery"},
+          "login_interruption_cases_missing")
+    recovered = interruption["cases"]["pre_journal_DEV4_recovery"]
+    require(all(recovered.get(field) is True for field in ("public_original_profile_migration",
+            "full_library_reencrypted", "original_source_preserved", "original_factors_preserved")),
+            "DEV4_original_profile_migration_not_proven")
+    result["components"]["login_interruption"] = {"passed": True, "required_observed": 3}
+
     mapping = read(Path(__file__).with_name("dev-runtime-business-coverage.json"))
     original = read(Path(__file__).with_name("dev-local-api-coverage.json"))["actions"]
     actions = mapping["actions"]
@@ -140,7 +166,7 @@ def verify(args, result):
     suites = {"cli": base_observed, "runtime": {name for name, row in runtime.get("cases", {}).items() if row.get("passed") is True},
               "ai_inject": {name for name, row in ai.get("cases", {}).items() if row.get("passed") is True},
               "legacy_vault": {name for name, row in legacy.get("cases", {}).items() if row.get("passed") is True}}
-    retired = {"list_system_fonts", "pick_save_file", "pick_open_file", "pick_directory", "task_status", "db_stamp"}
+    retired = {"list_system_fonts", "pick_save_file", "pick_open_file", "pick_directory", "task_status", "db_stamp", "rerank_model_status", "rerank_model_install"}
     observations = []
     for action in actions:
         if action["action"] in retired:
@@ -152,7 +178,7 @@ def verify(args, result):
                                  for item in evidence), "business_observation_missing:" + action["action"])
         observations.append({"action": action["action"], "passed": True, "evidence": evidence})
     result["business_actions"] = observations
-    result["components"]["business_equivalence"] = {"passed": True, "observed": 66, "removed_by_requirement": 6}
+    result["components"]["business_equivalence"] = business_summary(observations, mapping)
     result["complete"] = True
     result["conditional_unverified"] = catalog.get("conditional_unverified", [])
     result["excluded_not_implemented"] = catalog.get("excluded_not_implemented", [])
@@ -162,7 +188,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("cli-report", "profile-migration", "report"):
         parser.add_argument("--" + name, type=Path, required=True)
-    for name in ("outbox", "ai-inject", "runtime", "legacy-vault"):
+    for name in ("outbox", "ai-inject", "runtime", "legacy-vault", "login-interruption"):
         parser.add_argument("--" + name, type=Path)
     parser.add_argument("--migration-only", action="store_true",
                         help="Verify this native platform's base and migration only; not the full supplemental gate.")

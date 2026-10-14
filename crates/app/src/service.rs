@@ -23,6 +23,20 @@ use crate::transport::MemoryTransport;
 mod merge;
 pub use merge::merge_entries;
 
+/// Shared candidate receipt contract for agent and client consumers.
+pub fn write_decision_actions() -> &'static [&'static str] {
+    &[
+        "① duplicate (bool)：两文同一事实且无新增细节？成立时 merge-ids 合并；先查子孙、先备份。",
+        "② contradiction (bool)：同时点上互斥？成立时合并，以新者为准并留弃因。",
+        "③ obsolete (bool)：新文明确取代旧文？成立时 update 旧条，尾注取代关系，不删旧文。",
+        "④ linkable (bool)：相连有助日后召回？成立时用 --parent 挂因果。",
+        "⑤ representation (keep_separate|merge|promote|uncertain)：该分开、合并、升格还是存疑？各留／合写综合版／重复事件升格为规律条／存疑缓办。",
+        "逐问回答后择一执行：update ＞ merge ＞ parent ＞ force；候选回执不表示已写入。",
+    ]
+}
+mod related;
+pub use related::{store_related, remap_relations};
+
 static RUNTIME_PROFILE: OnceLock<PathBuf> = OnceLock::new();
 
 /// A runtime keeps ownership of its boot library until host-managed restart.
@@ -61,6 +75,56 @@ fn check_runtime_profile(path: &Path) -> Result<()> {
 }
 
 static AUTO_SYNC_NOTIFY: OnceLock<fn()> = OnceLock::new();
+static INDEX_NOTIFY: OnceLock<fn()> = OnceLock::new();
+
+pub fn install_index_notifier(notify: fn()) {
+    let _ = INDEX_NOTIFY.set(notify);
+}
+
+/// Missing artifacts are durable work; the runtime notification only wakes its worker.
+pub fn notify_index() {
+    if let Some(notify) = INDEX_NOTIFY.get() {
+        notify();
+    }
+}
+
+#[derive(Debug)]
+pub struct IndexPending;
+
+impl std::fmt::Display for IndexPending {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("local retrieval index is being prepared; retry after indexing completes")
+    }
+}
+
+impl std::error::Error for IndexPending {}
+
+/// Validate the actual snapshot sent to Core, including its opaque index artifacts.
+pub fn require_candidates_ready(store: &LocalStore, candidates: &[crate::StoredMemory]) -> Result<()> {
+    if !store.candidates_index_ready(candidates)? {
+        notify_index();
+        return Err(IndexPending.into());
+    }
+    Ok(())
+}
+
+/// Recall stays available while synchronized sources await background indexing.
+/// Only current, source-checked artifacts may participate in semantic retrieval.
+pub fn recall_candidates(store: &LocalStore) -> Result<(Vec<crate::StoredMemory>, usize)> {
+    let candidates = store.all(false)?;
+    let (ready, pending): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|memory| !memory.local_artifact.is_empty());
+    let pending_count = pending.len();
+    if pending_count > 0 {
+        notify_index();
+        if ready.is_empty() {
+            return Err(IndexPending.into());
+        }
+    }
+    require_candidates_ready(store, &ready)?;
+    Ok((ready, pending_count))
+}
 
 /// The resident runtime installs its single durable-outbox worker notifier.
 pub fn install_autosync_notifier(notify: fn()) {
@@ -89,10 +153,7 @@ impl App {
             .map_err(|e| anyhow!("session not unlocked ({e}) — register/login or keygen first"))?;
         let store = open_store()?;
         let embedder = BgeEmbedder::load_model(&store.retrieval_model()?)?;
-        // Derived indexes migrate from decrypted entries once per source generation.
-        if store.index_pending(&store.retrieval_model()?)? {
-            store.rebuild_index(&keys, &embedder, &store.retrieval_model()?)?;
-        }
+        notify_index();
         Ok(Self {
             keys,
             store,
@@ -113,9 +174,10 @@ impl App {
         })
     }
 
-    /// List recent (combined-score order, same as CLI list).
+    /// List using Core's combined-score order; CLI list uses metadata ordering.
     pub fn list(&self, limit: usize) -> Result<Vec<MemoryEntry>> {
         let candidates = self.store.all(false)?;
+        require_candidates_ready(&self.store, &candidates)?;
         let q = MemoryQuery::default().limit(limit);
         MemoryEngine::recall_local(&self.keys, &self.embedder, &candidates, &q)
     }
@@ -127,16 +189,15 @@ impl App {
         limit: usize,
         kind: Option<Kind>,
     ) -> Result<Vec<ScoredEntry>> {
-        self.store.rebuild_index(&self.keys, &self.embedder, &self.store.retrieval_model()?)?;
         let mut q = MemoryQuery::new(query).limit(limit);
         if let Some(k) = kind {
             q = q.of_kind(k);
         }
-        let candidates = self.store.all(false)?;
+        let (candidates, _) = recall_candidates(&self.store)?;
         let ranked =
             MemoryEngine::recall_local_scored(&self.keys, &self.embedder, &candidates, &q)?;
         for (score, e) in &ranked {
-            let _ = self.store.bump_recall_count(&e.id);
+            if !readonly_mode() && !off_mode() { let _ = self.store.bump_recall_count(&e.id); }
             let _ = score;
         }
         Ok(ranked
@@ -295,11 +356,13 @@ impl App {
     /// Ask the private Core for candidate actions; persistence stays in the application.
     pub fn candidates(&self, content: &str) -> Result<CandidateReport> {
         let all = self.store.all(false)?;
+        require_candidates_ready(&self.store, &all)?;
         candidate_report(&self.keys, &self.embedder, &all, content)
     }
 
     /// Store a memory (after picking one of three): force write / parent as cause / merge_ids merge (delete old, store new, rehang children, inherit first item's parent).
     pub fn create(&self, req: &CreateReq) -> Result<MemoryEntry> {
+        anyhow::ensure!(req.merge_ids.is_none() || (req.supersedes.is_none() && req.see_also.is_empty()), "merge and associations are mutually exclusive");
         let stamp = now_stamp();
         let title = if req.title.trim().is_empty() {
             derive_title(&req.content)
@@ -314,6 +377,9 @@ impl App {
             final_parent = resolve_prefix(&all, &final_parent).unwrap_or_default();
         }
         let mut entry = MemoryEntry {
+            supersedes: String::new(),
+            superseded_by: String::new(),
+            see_also: Vec::new(),
             id,
             kind: Kind::from_str(&req.kind),
             tags: split_tags(&req.tags),
@@ -346,6 +412,8 @@ impl App {
                 req.parent.as_deref().unwrap_or_default(),
                 false,
             )?;
+        } else if req.supersedes.is_some() || !req.see_also.is_empty() {
+            store_related(&self.keys,&self.store,&self.embedder,&mut entry,req.supersedes.as_deref(),&req.see_also)?;
         } else {
             let stored = MemoryEngine::seal(&self.keys, &self.embedder, &entry, &entry.user)?;
             self.store.put(&stored)?;
@@ -407,7 +475,7 @@ impl App {
         let stored = all
             .iter()
             .find(|m| m.id == id)
-            .ok_or_else(|| anyhow!("not found #{id}"))?;
+            .ok_or_else(|| crate::input_error::InputError(format!("not found #{id}")))?;
         let mut entry = MemoryEngine::open(&self.keys, stored)?;
         if !stored.deleted {
             return Ok(entry);
@@ -427,11 +495,11 @@ impl App {
         let child = resolve_prefix(&all, id)?;
         let parent_full = resolve_prefix(&all, parent)?;
         if child == parent_full {
-            anyhow::bail!("cannot attach to self");
+            return Err(crate::input_error::InputError("cannot attach to self".into()).into());
         }
         for anc in self.store.ancestor_chain(&parent_full)? {
             if anc == child {
-                anyhow::bail!("cycle: new parent is a descendant of this entry");
+                return Err(crate::input_error::InputError("cycle: new parent is a descendant of this entry".into()).into());
             }
         }
         reparent(&self.keys, &self.store, &child, &parent_full)?;
@@ -590,6 +658,8 @@ pub struct CreateReq {
     pub emotion: Option<f32>,
     pub parent: Option<String>,
     pub merge_ids: Option<Vec<String>>,
+    pub supersedes: Option<String>,
+    pub see_also: Vec<String>,
     pub force: bool,
     /// importance (two-tier): important (main library) | trivial (diary); default trivial (normal retired)
     pub importance: Option<String>,
@@ -758,11 +828,11 @@ pub fn expand_tilde(v: &str) -> PathBuf {
     PathBuf::from(v)
 }
 
-/// Resolve `ONEMEMORY_DATA_DIR` to an absolute path (None if unset or empty).
+/// Resolve `RSRS_DATA_DIR` to an absolute path (None if unset or empty).
 /// Semantics: the env var names the profile root — the `main` profile is that root, space profiles live under its `accounts/`,
 /// and client.json lives there too (an isolated instance must not write config into the real user dir).
 pub fn env_root_dir() -> Option<PathBuf> {
-    let v = std::env::var("ONEMEMORY_DATA_DIR").ok()?;
+    let v = crate::env::var("RSRS_DATA_DIR").ok()?;
     let v = v.trim();
     if v.is_empty() {
         return None;
@@ -776,13 +846,14 @@ pub fn env_root_dir() -> Option<PathBuf> {
 /// client.json path is special: it itself decides data_dir, so **usually** we always read the copy in the default dir
 /// (otherwise after changing data_dir the new dir has no client.json and config locks itself).
 ///
-/// **Exception (2026-09-20)**: when `ONEMEMORY_DATA_DIR` is set, client.json is read from that root
+/// **Exception (2026-09-20)**: when `RSRS_DATA_DIR` is set, client.json is read from that root
 /// (`<root>/client.json`). Why: that env var is the only isolation entry for tests/multi-lib; if config still landed in the real
 /// user dir, an isolated instance switching profiles would write the real client.json and pollute the user env (hit twice:
 /// after teardown the real library status became "user local, 0 entries" until data_dir was cleared by hand).
 /// An isolated root carries its own client.json — config follows the library — and cannot self-lock, because
 /// data_dir is decided by the env var (in-tree first), not this file.
-fn client_config_path() -> PathBuf {
+/// Host profile transactions preserve the complete configuration on failure.
+pub fn client_config_path() -> PathBuf {
     if let Some(root) = env_root_dir() {
         return root.join("client.json");
     }
@@ -808,7 +879,7 @@ fn write_client_config(data: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-// ── data dir (client.json data_dir → ONEMEMORY_DATA_DIR → ~/.rsrs) ──
+// ── data dir (client.json data_dir → RSRS_DATA_DIR → ~/.rsrs) ──
 // For tests and multi-lib maintenance: changing data_dir switches the whole library (db/session/lock follow).
 // Order: env var wins (one-shot override for CI/tests) → client.json data_dir → default ~/.rsrs.
 
@@ -818,7 +889,7 @@ pub fn default_data_dir() -> PathBuf {
         .join(".rsrs")
 }
 
-/// Main-profile dir: `ONEMEMORY_DATA_DIR` when isolated, else default `~/.rsrs`.
+/// Main-profile dir: `RSRS_DATA_DIR` when isolated, else default `~/.rsrs`.
 /// **Every "back to main" path must use this**, not a hard `default_data_dir()` — otherwise an isolated instance
 /// switching back to main would land in the real user dir (hit 2026-09-20).
 pub fn main_data_dir() -> PathBuf {
@@ -827,11 +898,11 @@ pub fn main_data_dir() -> PathBuf {
 
 /// Effective data dir. Empty/missing fall back to default — never panics.
 ///
-/// Order: `ONEMEMORY_DATA_DIR` (test/CI one-shot) > client.json data_dir > default.
+/// Order: `RSRS_DATA_DIR` (test/CI one-shot) > client.json data_dir > default.
 ///
-/// **Exception (2026-09-20)**: if client.json data_dir sits inside the `ONEMEMORY_DATA_DIR` tree,
+/// **Exception (2026-09-20)**: if client.json data_dir sits inside the `RSRS_DATA_DIR` tree,
 /// prefer it. Why: `space use` writes client.json data_dir, which always lives under
-/// that root (`accounts_root()` also follows ONEMEMORY_DATA_DIR); if the env var still always won,
+/// that root (`accounts_root()` also follows RSRS_DATA_DIR); if the env var still always won,
 /// switching spaces in isolation would **silently fail** — session falls back to the root, the space profile is empty (hit in tests).
 /// Semantically the env var names the root; switching moves inside the root; they do not conflict.
 pub fn data_dir() -> PathBuf {
@@ -881,7 +952,7 @@ pub fn set_data_dir(dir: &str) -> Result<()> {
 // ── multi-account profiles on one machine: each account has its own data dir (library/keys/session switch with data_dir) ──
 // Profile root is accounts/ under the default dir (**does not follow client.json data_dir** — otherwise after a switch
 // accounts_root would become <profile>/accounts and other profiles would vanish).
-// But **when ONEMEMORY_DATA_DIR is set it must follow** (fixed 2026-09-20): that var is the only isolation entry
+// But **when RSRS_DATA_DIR is set it must follow** (fixed 2026-09-20): that var is the only isolation entry
 // for tests/multi-lib; if the profile root still landed in real HOME, isolated space profiles polluted the user dir (hit:
 // a web isolation instance created work/sales under ~/.rsrs/accounts).
 // Scene: several accounts on one machine (work/personal/test); login no longer needs logout --full to wipe key material.
@@ -926,7 +997,7 @@ pub fn account_list() -> Result<serde_json::Value> {
         names.sort();
         for n in names {
             let dir = accounts_root().join(&n);
-            if !dir.join("session.json").exists() && !dir.join("onememory.db").exists() {
+            if !dir.join("session.json").exists() && !database_path(&dir)?.exists() {
                 continue;
             }
             rows.push(serde_json::json!({
@@ -971,10 +1042,10 @@ pub fn account_remove(name: &str) -> Result<()> {
     require_profile_change_host()?;
     let dir = account_dir(name)?;
     if !dir.exists() {
-        anyhow::bail!("no such account profile: {}", dir.display());
+        return Err(crate::input_error::InputError(format!("no such account profile: {}", dir.display())).into());
     }
     if data_dir() == dir {
-        anyhow::bail!("this profile is in use — run rsrs account use <other> before deleting");
+        return Err(crate::input_error::InputError("this profile is in use — run rsrs account use <other> before deleting".into()).into());
     }
     std::fs::remove_dir_all(&dir)?;
     Ok(())
@@ -983,7 +1054,7 @@ pub fn account_remove(name: &str) -> Result<()> {
 // ── maintenance counter (auto-triggers memory resort) ──
 // data_dir/maintenance.json: writes_since_resort write count (remember/merge success +1),
 // at threshold the store output prints a broom alert — the AI then runs §3.8 resort; resort --go success zeros it.
-// Default threshold 30; env ONEMEMORY_RESORT_HINT can override (tests).
+// Default threshold 30; env RSRS_RESORT_HINT can override (tests).
 
 pub fn maintenance_path() -> PathBuf {
     data_dir().join("maintenance.json")
@@ -996,7 +1067,7 @@ pub fn counter_bump(path: &Path) -> Result<(u64, u64)> {
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .unwrap_or_else(|| serde_json::json!({}));
     let n = v["writes_since_resort"].as_u64().unwrap_or(0) + 1;
-    let threshold = std::env::var("ONEMEMORY_RESORT_HINT")
+    let threshold = crate::env::var("RSRS_RESORT_HINT")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|t| *t > 0)
@@ -1120,6 +1191,13 @@ pub fn read_agent_config() -> serde_json::Value {
 }
 
 pub fn write_agent_config_key(key: &str, value: &serde_json::Value) -> Result<()> {
+    if matches!(key, "memory_off" | "readonly") {
+        let enabled = value.as_bool().ok_or_else(|| anyhow!("{key} must be true or false"))?;
+        return set_workspace_mode(if !enabled { "normal" } else if key == "memory_off" { "off" } else { "readonly" });
+    }
+    if key == "workspace_mode" {
+        return set_workspace_mode(value.as_str().ok_or_else(|| anyhow!("workspace_mode must be normal, readonly or off"))?);
+    }
     if key == "recall_mode" && !matches!(value.as_str(), Some("fast" | "quality")) {
         anyhow::bail!("recall_mode must be fast or quality");
     }
@@ -1143,7 +1221,10 @@ pub fn write_agent_config_key(key: &str, value: &serde_json::Value) -> Result<()
 /// member `space join` sets local agent.json `readonly=true`;
 /// the server also refuses writes by session token (belt and braces — the client can be bypassed).
 pub fn readonly_mode() -> bool {
-    read_agent_config()["readonly"].as_bool().unwrap_or(false)
+    readonly_team() || match device_service_mode().as_deref() {
+        Some(mode) => mode == "readonly",
+        None => read_agent_config()["readonly"].as_bool().unwrap_or(false),
+    }
 }
 
 /// Read-only **source=team**: written on space join --readonly (personal self-set read-only has no this key).
@@ -1155,11 +1236,26 @@ pub fn readonly_team() -> bool {
         .unwrap_or(false)
 }
 
-/// Personal space **temporarily off**: agent.json `memory_off=true`. Off refuses both read and write (see main's
-/// off gate); inject source becomes the off notice (the AI stops calling memory commands). Unlike team read-only (server token
-/// enforced) — off is **local self-set**; the owner restores with one agent-config.
+/// Device disable mode suppresses memory reads and writes until explicitly changed.
+/// Existing account-local flags remain compatible when no device mode has been saved.
+fn device_service_mode() -> Option<String> {
+    read_client_config().and_then(|config| config["service_mode"].as_str()
+        .filter(|mode| matches!(*mode, "normal" | "readonly" | "off")).map(str::to_owned))
+}
+
 pub fn off_mode() -> bool {
-    read_agent_config()["memory_off"].as_bool().unwrap_or(false)
+    match device_service_mode().as_deref() {
+        Some(mode) => mode == "off",
+        None => read_agent_config()["memory_off"].as_bool().unwrap_or(false),
+    }
+}
+
+/// Pause device memory work without confusing a team's read-only access with a device setting.
+pub fn service_paused() -> bool {
+    off_mode() || match device_service_mode().as_deref() {
+        Some(mode) => mode == "readonly",
+        None => !readonly_team() && read_agent_config()["readonly"].as_bool().unwrap_or(false),
+    }
 }
 
 /// Workspace three-state (GUI/status): off > readonly > normal.
@@ -1173,25 +1269,16 @@ pub fn workspace_mode() -> &'static str {
     }
 }
 
-/// Set workspace three-state: normal = both flags false; readonly = read-only on, off off; off = off on.
-/// Touches local agent.json only; team read-only still has server token enforcement.
+/// Device service mode lives beside the active-profile pointer, never in an account.
+/// Existing team permissions remain effective even when the device returns to normal.
 pub fn set_workspace_mode(mode: &str) -> Result<()> {
-    match mode {
-        "normal" => {
-            write_agent_config_key("memory_off", &serde_json::json!(false))?;
-            write_agent_config_key("readonly", &serde_json::json!(false))?;
-            write_agent_config_key("readonly_team", &serde_json::json!(false))?;
-        }
-        "readonly" => {
-            write_agent_config_key("memory_off", &serde_json::json!(false))?;
-            write_agent_config_key("readonly", &serde_json::json!(true))?;
-        }
-        "off" => {
-            write_agent_config_key("memory_off", &serde_json::json!(true))?;
-        }
-        other => anyhow::bail!("unknown mode `{other}` — choose: normal | readonly | off"),
+    if !matches!(mode, "normal" | "readonly" | "off") {
+        return Err(crate::input_error::InputError(format!("unknown mode `{mode}` — choose: normal | readonly | off")).into());
     }
-    Ok(())
+    let mut config = read_client_config().unwrap_or_else(|| serde_json::json!({}));
+    anyhow::ensure!(config.is_object(), "client config must be an object");
+    config["service_mode"] = serde_json::json!(mode);
+    write_client_config(&config)
 }
 
 /// Read-only gate: write commands must pass this. Err aborts (message is for the user and the AI).
@@ -1200,7 +1287,7 @@ pub fn ensure_writable() -> Result<()> {
         let hint = if readonly_team() {
             "read-only is enforced by the server via the session token; editing local agent.json has no effect. To write, ask the space owner for a read-write session and run rsrs space join."
         } else {
-            "this is a personal read-only flag; clear it with `agent-config --set readonly=false`."
+            "restore normal service on this device with `agent-config --set workspace_mode=normal`."
         };
         return Err(anyhow!(
             "this space is read-only — recall/list/show/diary/tree are allowed; write/edit/delete are not.\n  {hint}"
@@ -1290,7 +1377,7 @@ pub struct MemoryRevision {
 pub fn memory_revision() -> Result<MemoryRevision> {
     let root = data_dir();
     check_runtime_profile(&root)?;
-    let revision = crate::transport::local::read_memory_revision(&root.join("onememory.db"))?;
+    let revision = crate::transport::local::read_memory_revision(&database_path(&root)?)?;
     Ok(MemoryRevision {
         profile: root.to_string_lossy().into_owned(),
         revision,
@@ -1391,11 +1478,11 @@ pub fn set_server_addr(addr: &str) -> Result<()> {
     write_client_config(&data)
 }
 
-/// Auto-sync switch: ONEMEMORY_NO_AUTOSYNC env wins (set and not 0 → off);
+/// Auto-sync switch: RSRS_NO_AUTOSYNC env wins (set and not 0 → off);
 /// then client.json autosync (the client "auto-sync after write" toggle);
 /// default = on (if remote is configured, auto-sync; backward compatible).
 pub fn autosync_enabled() -> bool {
-    if std::env::var("ONEMEMORY_NO_AUTOSYNC").is_ok_and(|v| v != "0") {
+    if crate::env::var("RSRS_NO_AUTOSYNC").is_ok_and(|v| v != "0") {
         return false;
     }
     read_client_config()
@@ -1433,8 +1520,8 @@ pub fn set_cure_auto(on: bool) -> Result<()> {
     write_client_config(&data)
 }
 
-/// Saved RPC worker cap (`client.json` `rpc_parallelism`). `None` means follow CPU count, never above 4. Writes still queue.
-/// The runtime never runs more than 4 jobs at once. `0` is stored as absent.
+/// Saved RPC compute worker limit (`client.json` `rpc_parallelism`), bounded by available CPU parallelism.
+/// Two extra lightweight read slots remain available. `0` is stored as absent.
 /// The resident runtime reads this only at start.
 pub fn rpc_parallelism_setting() -> Option<usize> {
     read_client_config()
@@ -1644,11 +1731,13 @@ impl App {
 
 /// Export all plaintext memories as JSON (backup/migrate).
 pub fn export_json(path: &std::path::Path) -> Result<usize> {
-    let app = App::open()?;
-    let blobs = app.store.all(false)?;
+    crate::input_error::validate_output_parent(path)?;
+    let keys = auth::load_local_session()?;
+    let store = open_store()?;
+    let blobs = store.all(false)?;
     let mut items = Vec::new();
     for s in &blobs {
-        let e = MemoryEngine::open(&app.keys, s)?;
+        let e = MemoryEngine::open(&keys, s)?;
         items.push(serde_json::to_value(&e)?);
     }
     std::fs::write(path, serde_json::to_string_pretty(&items)?)?;
@@ -1670,6 +1759,12 @@ impl Default for ImportTags {
 
 #[derive(serde::Deserialize)]
 struct ImportItem {
+    #[serde(default)]
+    supersedes: String,
+    #[serde(default)]
+    superseded_by: String,
+    #[serde(default)]
+    see_also: Vec<String>,
     #[serde(default)]
     id: String,
     #[serde(default, alias = "type")]
@@ -1707,8 +1802,7 @@ pub struct ImportReport {
 
 /// Import a copy: validate parent chains first, mint all new ids, then atomic write, then one auto-sync.
 pub fn import_json(path: &std::path::Path) -> Result<ImportReport> {
-    let text =
-        std::fs::read_to_string(path).map_err(|e| anyhow!("failed to read import file: {e}"))?;
+    let text = crate::input_error::read_file(path, "import file")?;
     let items: Vec<ImportItem> =
         serde_json::from_str(&text).map_err(|e| anyhow!("failed to parse import JSON: {e}"))?;
     let mut report = ImportReport {
@@ -1762,6 +1856,9 @@ pub fn import_json(path: &std::path::Path) -> Result<ImportReport> {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| created_at.clone());
         entries.push(MemoryEntry {
+            supersedes: item.supersedes,
+            superseded_by: item.superseded_by,
+            see_also: item.see_also,
             id: uuid::Uuid::new_v4().to_string(),
             kind: Kind::from_str(&kind),
             tags: match item.tags {
@@ -1799,6 +1896,8 @@ pub fn import_json(path: &std::path::Path) -> Result<ImportReport> {
         done.extend(chain);
     }
     let new_ids: Vec<_> = entries.iter().map(|entry| entry.id.clone()).collect();
+    let relation_ids: HashMap<String,String> = old_ids.iter().map(|(id,i)| (id.clone(),new_ids[*i].clone())).collect();
+    remap_relations(&mut entries,&relation_ids)?;
     for entry in &mut entries {
         if entry.parent_id.is_empty() {
             continue;
@@ -1868,6 +1967,9 @@ pub fn export_subtree_payload(root_prefix: &str) -> Result<(crate::share::ShareP
             .get(id)
             .and_then(|s| MemoryEngine::open(&keys, s).ok())
             .map(|entry| MemoryEntry {
+                supersedes: entry.supersedes,
+                superseded_by: entry.superseded_by,
+                see_also: entry.see_also,
                 id: entry.id,
                 kind: Kind::from_str(entry.kind.as_str()),
                 tags: entry.tags,
@@ -1914,8 +2016,7 @@ pub fn export_subtree_payload(root_prefix: &str) -> Result<(crate::share::ShareP
 
 /// Read a share file → payload.
 pub fn read_share_file(path: &std::path::Path) -> Result<crate::share::SharePayload> {
-    let text =
-        std::fs::read_to_string(path).map_err(|e| anyhow!("failed to read share file: {e}"))?;
+    let text = crate::input_error::read_file(path, "share file")?;
     crate::share::decode(&text)
 }
 
@@ -1933,6 +2034,7 @@ pub fn share_candidates_with(
     let store = open_store()?;
     let all = store.all(false)?;
     let query = crate::share::mount_query(payload);
+    require_candidates_ready(&store, &all)?;
     let report = candidate_report(&keys, embedder, &all, &query)?;
     let mut out: Vec<serde_json::Value> = Vec::new();
     for (bucket, verdict) in [
@@ -1991,6 +2093,7 @@ pub fn import_share_payload(
     // (e.g. hanging the shared subtree under a same-topic local entry as a supplement) — same as attach skipping store-judge.
     if !force && parent.is_empty() {
         let all = store.all(false)?;
+        require_candidates_ready(&store, &all)?;
         let mut conflicts: Vec<serde_json::Value> = Vec::new();
         for it in &payload.items {
             let q = if it.content.trim().is_empty() {
@@ -2093,6 +2196,9 @@ pub fn import_share_payload(
             it.updated_at.clone()
         };
         entries.push(MemoryEntry {
+            supersedes: it.supersedes.clone(),
+            superseded_by: it.superseded_by.clone(),
+            see_also: it.see_also.clone(),
             id: new_ids[i].clone(),
             kind: Kind::from_str(&kind),
             tags: it.tags.clone(),
@@ -2111,6 +2217,9 @@ pub fn import_share_payload(
             importance: importance.to_owned(),
         });
     }
+    let relation_ids: HashMap<String,String> = payload.items.iter().zip(new_ids.iter())
+        .filter(|(item,_)| !item.content.trim().is_empty()).map(|(item,id)| (item.id.clone(),id.clone())).collect();
+    remap_relations(&mut entries,&relation_ids)?;
     let report = ImportReport {
         imported: entries.len(),
         skipped,
@@ -2138,7 +2247,8 @@ pub fn import_share_payload(
 
 /// SQLite consistent snapshot, including committed WAL; dest must be a new file, never overwrite existing data.
 pub fn backup_db(dest: &std::path::Path) -> Result<PathBuf> {
-    let src = data_dir().join("onememory.db");
+    crate::input_error::validate_output_parent(dest)?;
+    let src = database_path(&data_dir())?;
     let connection =
         rusqlite::Connection::open_with_flags(&src, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let target = dest
@@ -2178,6 +2288,7 @@ pub fn backup_db(dest: &std::path::Path) -> Result<PathBuf> {
 pub fn defrag_report(min: f32, top: usize) -> Result<crate::memory::defrag::Report> {
     let app = App::open()?;
     let list = tree_scope_list(&app.store.all(false)?);
+    require_candidates_ready(&app.store, &list)?;
     crate::memory::defrag::analyze(&list, min).map(|mut r| {
         r.clusters.truncate(top);
         r
@@ -2277,6 +2388,7 @@ impl App {
     /// Ask Core for tree adjustments; `go` applies the returned parent changes and syncs.
     pub fn tree_float(&self, go: bool, min_hits: i64) -> Result<TreeFloatReport> {
         let all = self.store.all(false)?;
+        require_candidates_ready(&self.store, &all)?;
         let cands = float_up_candidates(&all, min_hits)?;
         let mut items = Vec::new();
         for (child_id, new_parent) in &cands {
@@ -2320,10 +2432,12 @@ impl App {
 
     /// Request tree suggestions with a user-selected similarity floor.
     pub fn tree_cure_with_min(&self, top: usize, min_sim: f32) -> Result<TreeCureReport> {
+        let candidates = self.store.all(false)?;
+        require_candidates_ready(&self.store, &candidates)?;
         respire_core_sdk::execute(
             "tree_cure",
             serde_json::json!({
-                "snapshots":respire_core_sdk::metadata_snapshots(&self.store.all(false)?), "top":top, "min":min_sim,
+                "snapshots":respire_core_sdk::metadata_snapshots(&candidates), "top":top, "min":min_sim,
             }),
         )
     }
@@ -2353,10 +2467,32 @@ pub fn deepen_plan(
     root_prefix: &str,
     min_sim: f32,
 ) -> Result<(String, DeepenPlan)> {
+    let candidates = store.all(false)?;
+    let root_id = resolve_prefix(&candidates, root_prefix)?;
+    let direct: HashSet<&str> = candidates.iter()
+        .filter(|entry| entry.local_parent_id == root_id)
+        .map(|entry| entry.id.as_str()).collect();
+    let mut descendants = HashSet::new();
+    let mut pending: Vec<&str> = direct.iter().copied().collect();
+    while let Some(parent) = pending.pop() {
+        for entry in candidates.iter().filter(|entry| entry.local_parent_id == parent) {
+            if descendants.insert(entry.id.as_str()) {
+                pending.push(entry.id.as_str());
+            }
+        }
+    }
+    // Core's deepen contract requires at least 15 children and a mostly flat root.
+    if direct.len() < 15 || descendants.len() * 3 > direct.len() * 2 {
+        return Err(crate::input_error::InputError(format!(
+            "this root is not flat ({} direct children, {} in the grandchild chain) — hierarchy already exists or too few entries to deepen",
+            direct.len(), descendants.len(),
+        )).into());
+    }
+    require_candidates_ready(store, &candidates)?;
     respire_core_sdk::execute(
         "deepen_plan",
         serde_json::json!({
-            "snapshots":respire_core_sdk::metadata_snapshots(&store.all(false)?), "root":root_prefix, "min":min_sim,
+            "snapshots":respire_core_sdk::metadata_snapshots(&candidates), "root":root_prefix, "min":min_sim,
         }),
     )
 }
@@ -2389,6 +2525,9 @@ pub fn deepen_apply<E: crate::memory::search::Embedder>(
     let mut moved = 0usize;
     for (sub, title) in plan.sub_roots.iter().zip(titles) {
         let node = MemoryEntry {
+            supersedes: String::new(),
+            superseded_by: String::new(),
+            see_also: Vec::new(),
             id: uuid::Uuid::new_v4().to_string(),
             kind: Kind::Context,
             tags: {
@@ -2494,12 +2633,12 @@ pub fn split_exec<E: crate::memory::search::Embedder>(
     spec: &SplitSpec,
 ) -> Result<usize> {
     if spec.items.is_empty() {
-        anyhow::bail!("split spec has no children");
+        return Err(crate::input_error::InputError("split spec has no children".into()).into());
     }
     if spec.summary.is_none() && spec.items.len() == 1 {
-        anyhow::bail!(
-            "a single child without keeping the outline is a rewrite — edit instead of split"
-        );
+        return Err(crate::input_error::InputError(
+            "a single child without keeping the outline is a rewrite — edit instead of split".into()
+        ).into());
     }
     let user = entry.user.clone();
     let all = store.all(true)?;
@@ -2511,6 +2650,9 @@ pub fn split_exec<E: crate::memory::search::Embedder>(
         };
         let stamp = now_stamp();
         let child = MemoryEntry {
+            supersedes: String::new(),
+            superseded_by: String::new(),
+            see_also: Vec::new(),
             id: uuid::Uuid::new_v4().to_string(),
             kind: Kind::from_str(&op.kind),
             tags: {
@@ -2562,7 +2704,7 @@ pub fn open_store_with_profile() -> Result<(PathBuf, LocalStore)> {
     let root = data_dir();
     check_runtime_profile(&root)?;
     respire_core_sdk::set_index_root(&root)?;
-    let db = root.join("onememory.db");
+    let db = database_path(&root)?;
     let store = if RUNTIME_PROFILE.get().is_some() {
         LocalStore::open_existing(&db)
     } else {
@@ -2571,8 +2713,27 @@ pub fn open_store_with_profile() -> Result<(PathBuf, LocalStore)> {
     Ok((root, store))
 }
 
+/// Initialize the runtime's owned library after normal service is restored.
+/// Disabled startup deliberately leaves a new database uncreated.
+pub fn initialize_runtime_store() -> Result<LocalStore> {
+    anyhow::ensure!(!service_paused(), "database initialization requires normal service");
+    let root = data_dir();
+    check_runtime_profile(&root)?;
+    respire_core_sdk::set_index_root(&root)?;
+    LocalStore::open(&database_path(&root)?)
+}
+
+/// New libraries use rsrs.db; opening an existing library never renames it.
+pub fn database_path(root: &Path) -> Result<PathBuf> {
+    let current = root.join("rsrs.db");
+    let legacy = root.join("onememory.db");
+    anyhow::ensure!(!(current.exists() && legacy.exists()),
+        "both rsrs.db and the legacy database exist; select the intended library explicitly");
+    Ok(if current.exists() || !legacy.exists() { current } else { legacy })
+}
+
 pub fn home_dir() -> Result<PathBuf> {
-    if let Ok(home) = std::env::var("HOME") {
+    if let Ok(home) = crate::env::var("HOME") {
         if !home.trim().is_empty() {
             return Ok(PathBuf::from(home));
         }
@@ -2627,7 +2788,7 @@ pub fn now_stamp() -> String {
 }
 
 pub fn current_user() -> String {
-    std::env::var("ONEMEMORY_USER").unwrap_or_else(|_| "local".to_owned())
+    crate::env::var("RSRS_USER").unwrap_or_else(|_| "local".to_owned())
 }
 
 /// Filter candidates: trim, drop empty, take the first non-empty (an env var set to empty is also dropped —
@@ -2646,8 +2807,8 @@ fn first_non_empty<I: IntoIterator<Item = String>>(vals: I) -> Option<String> {
 pub fn host_name() -> Option<String> {
     first_non_empty([
         std::fs::read_to_string("/etc/hostname").unwrap_or_default(),
-        std::env::var("COMPUTERNAME").unwrap_or_default(),
-        std::env::var("HOSTNAME").unwrap_or_default(),
+        crate::env::var("COMPUTERNAME").unwrap_or_default(),
+        crate::env::var("HOSTNAME").unwrap_or_default(),
         whoami::hostname().unwrap_or_default(),
     ])
 }
@@ -2715,8 +2876,8 @@ pub fn resolve_prefix(all: &[crate::memory::model::StoredMemory], prefix: &str) 
         .collect();
     match hits.len() {
         1 => Ok(hits[0].clone()),
-        0 => anyhow::bail!("no such entry: {prefix}"),
-        n => anyhow::bail!("prefix is not unique ({n} hits): {prefix}"),
+        0 => Err(crate::input_error::InputError(format!("no such entry: {prefix}")).into()),
+        n => Err(crate::input_error::InputError(format!("prefix is not unique ({n} hits): {prefix}")).into()),
     }
 }
 
@@ -2913,8 +3074,8 @@ mod tests {
     fn session_info_v4_recognizes_wrapped_urk_as_local_keys() -> anyhow::Result<()> {
         let _guard = crate::test_lock::guard();
         let dir = tempfile::tempdir()?;
-        let saved_dir = std::env::var("ONEMEMORY_DATA_DIR").ok();
-        std::env::set_var("ONEMEMORY_DATA_DIR", dir.path());
+        let saved_dir = crate::env::var("RSRS_DATA_DIR").ok();
+        std::env::set_var("RSRS_DATA_DIR", dir.path());
         // v4 shape: wrap material only, no user/token/plaintext keys (keygen output looks like this)
         std::fs::write(
             dir.path().join("session.json"),
@@ -2933,8 +3094,8 @@ mod tests {
         );
         assert!(!si.has_token, "offline mode has no token");
         match saved_dir {
-            Some(v) => std::env::set_var("ONEMEMORY_DATA_DIR", v),
-            None => std::env::remove_var("ONEMEMORY_DATA_DIR"),
+            Some(v) => std::env::set_var("RSRS_DATA_DIR", v),
+            None => std::env::remove_var("RSRS_DATA_DIR"),
         }
         Ok(())
     }
@@ -2943,8 +3104,8 @@ mod tests {
     fn resume_session_skips_the_form_when_the_wrap_exists() -> anyhow::Result<()> {
         let _guard = crate::test_lock::guard();
         let dir = tempfile::tempdir()?;
-        let saved_dir = std::env::var("ONEMEMORY_DATA_DIR").ok();
-        std::env::set_var("ONEMEMORY_DATA_DIR", dir.path());
+        let saved_dir = crate::env::var("RSRS_DATA_DIR").ok();
+        std::env::set_var("RSRS_DATA_DIR", dir.path());
         std::fs::write(
             dir.path().join("session.json"),
             serde_json::to_vec(&serde_json::json!({
@@ -2958,8 +3119,8 @@ mod tests {
         )?;
         let got = resume_session()?;
         match saved_dir {
-            Some(v) => std::env::set_var("ONEMEMORY_DATA_DIR", v),
-            None => std::env::remove_var("ONEMEMORY_DATA_DIR"),
+            Some(v) => std::env::set_var("RSRS_DATA_DIR", v),
+            None => std::env::remove_var("RSRS_DATA_DIR"),
         }
         if got["resumed"] != true {
             anyhow::bail!("wrapped key should resume without a form");
@@ -2977,12 +3138,12 @@ mod tests {
     fn resume_session_fills_the_public_server_when_nothing_is_stored() -> anyhow::Result<()> {
         let _guard = crate::test_lock::guard();
         let dir = tempfile::tempdir()?;
-        let saved_dir = std::env::var("ONEMEMORY_DATA_DIR").ok();
-        std::env::set_var("ONEMEMORY_DATA_DIR", dir.path());
+        let saved_dir = crate::env::var("RSRS_DATA_DIR").ok();
+        std::env::set_var("RSRS_DATA_DIR", dir.path());
         let got = resume_session()?;
         match saved_dir {
-            Some(v) => std::env::set_var("ONEMEMORY_DATA_DIR", v),
-            None => std::env::remove_var("ONEMEMORY_DATA_DIR"),
+            Some(v) => std::env::set_var("RSRS_DATA_DIR", v),
+            None => std::env::remove_var("RSRS_DATA_DIR"),
         }
         if got["need_login"] != true {
             anyhow::bail!("empty profile should still need a login password");
@@ -3095,6 +3256,9 @@ mod tests {
 
     fn test_entry(content: &str) -> MemoryEntry {
         MemoryEntry {
+            supersedes: String::new(),
+            superseded_by: String::new(),
+            see_also: Vec::new(),
             id: "test-1".into(),
             kind: Kind::Context,
             tags: vec![],
@@ -3113,18 +3277,18 @@ mod tests {
         }
     }
 
-    /// Auto-sync switch contract: ONEMEMORY_NO_AUTOSYNC non-empty and not 0 means off (every write path must use this).
+    /// Auto-sync switch contract: RSRS_NO_AUTOSYNC non-empty and not 0 means off (every write path must use this).
     #[test]
     fn autosync_disabled_by_env_is_off() {
         let _guard = crate::test_lock::guard();
-        let saved = std::env::var("ONEMEMORY_NO_AUTOSYNC").ok();
-        std::env::set_var("ONEMEMORY_NO_AUTOSYNC", "1");
+        let saved = crate::env::var("RSRS_NO_AUTOSYNC").ok();
+        std::env::set_var("RSRS_NO_AUTOSYNC", "1");
         assert!(!autosync_enabled(), "auto-sync must be off when set to 1");
-        std::env::set_var("ONEMEMORY_NO_AUTOSYNC", "yes");
+        std::env::set_var("RSRS_NO_AUTOSYNC", "yes");
         assert!(!autosync_enabled(), "any non-zero value must turn it off");
         match saved {
-            Some(v) => std::env::set_var("ONEMEMORY_NO_AUTOSYNC", v),
-            None => std::env::remove_var("ONEMEMORY_NO_AUTOSYNC"),
+            Some(v) => std::env::set_var("RSRS_NO_AUTOSYNC", v),
+            None => std::env::remove_var("RSRS_NO_AUTOSYNC"),
         }
     }
 
@@ -3135,8 +3299,8 @@ mod tests {
     #[test]
     fn split_exec_lands_children_and_summary() -> anyhow::Result<()> {
         let _guard = crate::test_lock::guard();
-        let saved = std::env::var("ONEMEMORY_NO_AUTOSYNC").ok();
-        std::env::set_var("ONEMEMORY_NO_AUTOSYNC", "1");
+        let saved = crate::env::var("RSRS_NO_AUTOSYNC").ok();
+        std::env::set_var("RSRS_NO_AUTOSYNC", "1");
         let dir = tempfile::tempdir()?;
         let store = LocalStore::open(&dir.path().join("t.db"))?;
         let keys = crate::memory::SessionKeys::from_urk([7u8; 32])?;
@@ -3192,8 +3356,8 @@ mod tests {
         };
         assert!(split_exec(&keys, &embedder, &store, &entry, &spec2).is_ok());
         match saved {
-            Some(v) => std::env::set_var("ONEMEMORY_NO_AUTOSYNC", v),
-            None => std::env::remove_var("ONEMEMORY_NO_AUTOSYNC"),
+            Some(v) => std::env::set_var("RSRS_NO_AUTOSYNC", v),
+            None => std::env::remove_var("RSRS_NO_AUTOSYNC"),
         }
         Ok(())
     }
@@ -3245,26 +3409,55 @@ mod tests {
     fn workspace_and_agent_config_roundtrip() -> anyhow::Result<()> {
         let _guard = crate::test_lock::guard();
         let dir = tempfile::tempdir()?;
-        let saved = std::env::var("ONEMEMORY_DATA_DIR").ok();
-        std::env::set_var("ONEMEMORY_DATA_DIR", dir.path());
+        let saved = crate::env::var("RSRS_DATA_DIR").ok();
+        std::env::set_var("RSRS_DATA_DIR", dir.path());
         assert_eq!(workspace_mode(), "normal");
         assert_eq!(diary_mode(), "concise");
+        write_client_config(&serde_json::json!({"api_base":"https://fixture.invalid", "custom":"preserved"}))?;
         set_workspace_mode("readonly")?;
         assert_eq!(workspace_mode(), "readonly");
+        assert!(service_paused());
         assert!(readonly_mode());
         assert!(ensure_writable().is_err());
+        account_use("work")?;
+        assert_eq!(workspace_mode(), "readonly", "device mode survives account switching");
+        assert_eq!(read_client_config().ok_or_else(|| anyhow::anyhow!("missing client config"))?["custom"], "preserved");
         set_workspace_mode("off")?;
         assert_eq!(workspace_mode(), "off");
         assert!(off_mode());
+        account_use("main")?;
+        assert_eq!(workspace_mode(), "off");
+        let before = std::fs::read(client_config_path())?;
+        assert!(set_workspace_mode("nope").is_err());
+        assert_eq!(std::fs::read(client_config_path())?, before);
         set_workspace_mode("normal")?;
         assert_eq!(workspace_mode(), "normal");
         assert!(ensure_writable().is_ok());
+        write_agent_config_key("memory_off", &serde_json::json!(true))?;
+        assert_eq!(workspace_mode(), "off");
+        write_agent_config_key("memory_off", &serde_json::json!(false))?;
+        write_agent_config_key("readonly", &serde_json::json!(true))?;
+        assert_eq!(workspace_mode(), "readonly");
+        write_agent_config_key("readonly", &serde_json::json!(false))?;
+        assert_eq!(workspace_mode(), "normal");
+        write_agent_config_key("readonly_team", &serde_json::json!(true))?;
+        set_workspace_mode("normal")?;
+        assert_eq!(workspace_mode(), "readonly", "normal mode cannot lift shared-space permissions");
+        assert!(!service_paused(), "team read-only access must still pull and index shared memory");
+        assert!(ensure_writable().is_err());
+        set_workspace_mode("readonly")?;
+        assert!(service_paused(), "device read-only mode must pause even a shared-space replica");
+        std::fs::write(agent_config_path(), serde_json::to_vec(&serde_json::json!({"readonly":true,"readonly_team":true}))?)?;
+        write_client_config(&serde_json::json!({"custom":"preserved"}))?;
+        assert!(!service_paused(), "legacy shared-space flags are account permissions, not device mode");
+        set_workspace_mode("normal")?;
+        write_agent_config_key("readonly_team", &serde_json::json!(false))?;
         write_agent_config_key("diary_mode", &serde_json::json!("verbose"))?;
         assert_eq!(diary_mode(), "verbose");
         assert!(set_workspace_mode("nope").is_err());
         match saved {
-            Some(v) => std::env::set_var("ONEMEMORY_DATA_DIR", v),
-            None => std::env::remove_var("ONEMEMORY_DATA_DIR"),
+            Some(v) => std::env::set_var("RSRS_DATA_DIR", v),
+            None => std::env::remove_var("RSRS_DATA_DIR"),
         }
         Ok(())
     }
@@ -3273,8 +3466,8 @@ mod tests {
     fn accounts_list_use_remove() -> anyhow::Result<()> {
         let _guard = crate::test_lock::guard();
         let dir = tempfile::tempdir()?;
-        let saved = std::env::var("ONEMEMORY_DATA_DIR").ok();
-        std::env::set_var("ONEMEMORY_DATA_DIR", dir.path());
+        let saved = crate::env::var("RSRS_DATA_DIR").ok();
+        std::env::set_var("RSRS_DATA_DIR", dir.path());
         let listed = account_list()?;
         assert_eq!(listed["accounts"][0]["name"], "main");
         let used = account_use("work")?;
@@ -3286,8 +3479,8 @@ mod tests {
         account_remove("work")?;
         assert!(account_remove("missing").is_err());
         match saved {
-            Some(v) => std::env::set_var("ONEMEMORY_DATA_DIR", v),
-            None => std::env::remove_var("ONEMEMORY_DATA_DIR"),
+            Some(v) => std::env::set_var("RSRS_DATA_DIR", v),
+            None => std::env::remove_var("RSRS_DATA_DIR"),
         }
         Ok(())
     }
@@ -3310,6 +3503,56 @@ mod tests {
             kind: "context".to_owned(),
             ..CreateReq::default()
         }
+    }
+
+    #[test]
+    fn recall_keeps_indexed_memories_available_during_sync() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let app = test_app(dir.path())?;
+        let (empty, pending) = recall_candidates(&app.store)?;
+        assert!(empty.is_empty());
+        assert_eq!(pending, 0);
+        let indexed = app.create(&important("indexed", "rust memory"))?;
+        let mut incoming = app.create(&important("incoming", "rust memory"))?;
+        incoming.updated_at = "2099-01-01T00:00:00Z".into();
+        incoming.content = "synchronized rust memory".into();
+        let mut source = MemoryEngine::seal(&app.keys,
+            &crate::memory::search::HashingEmbedder::default(), &incoming, "fixture")?;
+        source.local_artifact.clear();
+        app.store.put_synced(&source)?;
+        let (ready, pending) = recall_candidates(&app.store)?;
+        assert_eq!(pending, 1);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, indexed.id);
+        let hits = app.search("rust memory", 10, None)?;
+        assert!(hits.iter().any(|hit| hit.entry.id == indexed.id));
+        assert!(hits.iter().all(|hit| hit.entry.id != incoming.id));
+        assert_eq!(app.store.rebuild_index_with_progress(
+            &app.keys, &crate::memory::search::HashingEmbedder::default(), "m3", |_, _| Ok(())
+        )?, 1);
+        let (ready, pending) = recall_candidates(&app.store)?;
+        assert_eq!(ready.len(), 2);
+        assert_eq!(pending, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn recall_preserves_all_pending_and_corrupt_index_errors() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let app = test_app(dir.path())?;
+        let mut memory = app.create(&important("source", "rust memory"))?;
+        memory.updated_at = "2099-01-01T00:00:00Z".into();
+        let mut source = MemoryEngine::seal(&app.keys,
+            &crate::memory::search::HashingEmbedder::default(), &memory, "fixture")?;
+        source.local_artifact.clear();
+        app.store.put_synced(&source)?;
+        let error = recall_candidates(&app.store).err()
+            .ok_or_else(|| anyhow!("all-pending recall succeeded"))?;
+        assert!(error.downcast_ref::<IndexPending>().is_some());
+        source.local_artifact = b"invalid artifact".to_vec();
+        app.store.put_inner(&source, false)?;
+        assert!(recall_candidates(&app.store).is_err());
+        Ok(())
     }
 
     #[test]
@@ -3359,19 +3602,42 @@ mod tests {
     }
 
     #[test]
+    fn rejected_associations_restore_and_attach_are_input_errors_without_writes() -> anyhow::Result<()> {
+        let _guard = crate::test_lock::guard();
+        let dir = tempfile::tempdir()?;
+        let app = test_app(dir.path())?;
+        let diary = app.create(&CreateReq { title: "diary".into(), content: "diary body".into(), ..CreateReq::default() })?;
+        let parent = app.create(&important("parent", "parent body"))?;
+        let child = app.create(&CreateReq { parent: Some(parent.id.clone()), ..important("child", "child body") })?;
+        let before = serde_json::to_value(app.store.all(true)?)?;
+        let supersede = app.create(&CreateReq { supersedes: Some(diary.id.clone()), ..important("replacement", "replacement body") });
+        let link = app.create(&CreateReq { see_also: vec![diary.id.clone()], ..important("linked", "linked body") });
+        for error in [supersede.err(), link.err(), app.restore("deadbeef").err(), app.attach(&child.id, &child.id).err(), app.attach(&parent.id, &child.id).err()] {
+            let error = error.ok_or_else(|| anyhow!("invalid input was accepted"))?;
+            assert!(error.downcast_ref::<crate::input_error::InputError>().is_some(), "{error:#}");
+        }
+        assert_eq!(serde_json::to_value(app.store.all(true)?)?, before);
+        // A cryptographic failure is still a runtime error, not malformed command input.
+        let wrong = App { keys: crate::memory::SessionKeys::from_urk([9; 32])?, store: app.store, embedder: app.embedder };
+        let error = wrong.restore(&child.id).err().ok_or_else(|| anyhow!("wrong key was accepted"))?;
+        assert!(error.downcast_ref::<crate::input_error::InputError>().is_none());
+        Ok(())
+    }
+
+    #[test]
     fn status_light_and_titles() -> anyhow::Result<()> {
         let _guard = crate::test_lock::guard();
         let dir = tempfile::tempdir()?;
-        let saved = std::env::var("ONEMEMORY_DATA_DIR").ok();
-        std::env::set_var("ONEMEMORY_DATA_DIR", dir.path());
+        let saved = crate::env::var("RSRS_DATA_DIR").ok();
+        std::env::set_var("RSRS_DATA_DIR", dir.path());
         let info = status_light()?;
         assert_eq!(info.local_total, 0);
         assert_eq!(derive_title("【经验】first line\nsecond"), "first line");
         assert_eq!(derive_title(""), "(untitled)");
         assert!(diary_mode() == "concise" || diary_mode() == "verbose");
         match saved {
-            Some(v) => std::env::set_var("ONEMEMORY_DATA_DIR", v),
-            None => std::env::remove_var("ONEMEMORY_DATA_DIR"),
+            Some(v) => std::env::set_var("RSRS_DATA_DIR", v),
+            None => std::env::remove_var("RSRS_DATA_DIR"),
         }
         Ok(())
     }

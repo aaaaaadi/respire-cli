@@ -18,7 +18,7 @@ on:
       model:
         description: 'Embedding model to validate on the requested hardware'
         type: choice
-        options: [legacy, m3]
+        options: [m3]
         default: m3
 permissions:
   contents: read
@@ -44,19 +44,18 @@ jobs:
       - name: Install model and validate actual inference
         shell: pwsh
         env:
-          ONEMEMORY_ENGINE: ${{ inputs.engine }}
-          ONEMEMORY_DATA_DIR: ${{ runner.temp }}/om-hardware-${{ github.run_id }}
-          ONEMEMORY_MODEL_DIR: ${{ runner.temp }}/om-hardware-${{ github.run_id }}/model
-          ONEMEMORY_M3_DIR: ${{ runner.temp }}/om-hardware-${{ github.run_id }}/m3
+          RSRS_ENGINE: ${{ inputs.engine }}
+          RSRS_DATA_DIR: ${{ runner.temp }}/om-hardware-${{ github.run_id }}
+          RSRS_M3_DIR: ${{ runner.temp }}/om-hardware-${{ github.run_id }}/m3
           PROBE_MODEL: ${{ inputs.model }}
-          ONEMEMORY_ORT_PROFILE: ${{ runner.temp }}/om-hardware-profile-${{ github.run_id }}
-          ONEMEMORY_ORT_DEBUG: '1'
+          RSRS_ORT_PROFILE: ${{ runner.temp }}/om-hardware-profile-${{ github.run_id }}
+          RSRS_ORT_DEBUG: '1'
           INSTALL_PROVIDERS: ${{ inputs.install_providers }}
         run: |
           $ErrorActionPreference = 'Stop'
           $name = if ($IsWindows) { 'rsrs.exe' } else { 'rsrs' }
           $exe = Join-Path 'target/hardware/release' $name
-          $install = if ($env:PROBE_MODEL -eq 'm3') { 'install-m3' } else { 'install-bge' }
+          $install = if ($env:PROBE_MODEL -eq 'm3') { 'install-m3' } else { 'install-m3' }
           & $exe --direct model $install --json
           if ($LASTEXITCODE -ne 0) { throw 'Model installation failed' }
           if ($IsWindows -and $env:INSTALL_PROVIDERS -eq 'true') {
@@ -67,7 +66,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Hardware inference or CPU comparison failed' }
           $raw
           $probe = ($raw | ConvertFrom-Json).summary
-          $pattern = switch ($env:ONEMEMORY_ENGINE) {
+          $pattern = switch ($env:RSRS_ENGINE) {
             'npu' { '^(Npu:|CoreML CPUAndNeuralEngine)' }
             'gpu' { '^(Gpu:|CoreML CPUAndGPU)' }
             'cpu' { '^CPU$' }
@@ -78,5 +77,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
+          retention-days: 1
           name: accelerator-${{ inputs.runner }}-${{ inputs.engine }}
           path: ${{ runner.temp }}/om-hardware-profile-${{ github.run_id }}*.json

@@ -38,18 +38,18 @@ pub const OWNER_FILE: &str = "space_owner.json";
 pub fn validate_space_name(name: &str) -> Result<()> {
     let n = name.trim();
     if n.is_empty() {
-        return Err(anyhow!("space name must not be empty"));
+        return Err(respire_app::input_error::InputError("space name must not be empty".into()).into());
     }
     if n.len() > 40 {
-        return Err(anyhow!("space name too long (<=40 bytes)"));
+        return Err(respire_app::input_error::InputError("space name too long (<=40 bytes)".into()).into());
     }
     if !n
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
-        return Err(anyhow!(
+        return Err(respire_app::input_error::InputError(format!(
             "space name allows only letters/digits/-/_, got \"{name}\""
-        ));
+        )).into());
     }
     Ok(())
 }
@@ -60,7 +60,7 @@ pub fn validate_space_name(name: &str) -> Result<()> {
 /// before register, so every directory under accounts/ counts as a space.
 pub fn space_list() -> Result<serde_json::Value> {
     let current = data_dir();
-    // "primary" = the space-profile root (`ONEMEMORY_DATA_DIR` or its default), **not** current -
+    // "primary" = the space-profile root (`RSRS_DATA_DIR` or its default), **not** current -
     // current may already be a space profile after a switch. Treating current as main makes
     // the main row always "current" and the real profile look inactive (2026-09-20: GUI showed
     // "current: main   teamA").
@@ -99,14 +99,15 @@ pub fn space_create(name: &str) -> Result<serde_json::Value> {
     validate_space_name(name)?;
     let n = name.trim();
     if n == "main" {
-        return Err(anyhow!(
+        return Err(respire_app::input_error::InputError(
             "\"main\" is reserved for the primary profile; pick another space name"
-        ));
+                .into()
+        ).into());
     }
     if account_dir(n)?.exists() {
-        return Err(anyhow!(
+        return Err(respire_app::input_error::InputError(format!(
             "space \"{n}\" already exists - pick another name, or run rsrs space use {n}"
-        ));
+        )).into());
     }
     let v = account_use(n)?;
     let dir = std::path::Path::new(v["dir"].as_str().unwrap_or("")).to_path_buf();
@@ -150,7 +151,7 @@ pub fn space_invite(note: Option<&str>, readonly: bool) -> Result<serde_json::Va
         return Err(anyhow!("this profile has no token - login/register first"));
     }
     let super_pass = crate::keystore::load_super(&user).ok_or_else(|| {
-        anyhow!("cannot load this space's super password (not in the keyring and ONEMEMORY_SUPER is unset) - login --super <code> to store it")
+        anyhow!("cannot load this space's super password (not in the keyring and RSRS_SUPER is unset) - login --super <code> to store it")
     })?;
     let name = space_name_of(&dir).unwrap_or_else(|| user.clone());
 
@@ -192,7 +193,7 @@ pub fn parse_invite(code: &str) -> Result<serde_json::Value> {
     let raw = code.trim();
     let hexed = raw.strip_prefix(INVITE_PREFIX).unwrap_or(raw);
     if hexed.is_empty() || hexed.len() % 2 != 0 {
-        return Err(anyhow!("invite code format is wrong (odd length)"));
+        return Err(respire_app::input_error::InputError("invite code format is wrong (odd length)".into()).into());
     }
     let cs: Vec<char> = hexed.chars().collect();
     let mut bytes = Vec::with_capacity(cs.len() / 2);
@@ -200,34 +201,41 @@ pub fn parse_invite(code: &str) -> Result<serde_json::Value> {
         let s: String = pair.iter().collect();
         bytes.push(
             u8::from_str_radix(&s, 16)
-                .map_err(|_| anyhow!("invite code contains illegal characters"))?,
+                .map_err(|_| respire_app::input_error::InputError("invite code contains illegal characters".into()))?,
         );
     }
-    let text = String::from_utf8(bytes).map_err(|_| anyhow!("invite code is not valid text"))?;
+    let text = String::from_utf8(bytes).map_err(|_| respire_app::input_error::InputError("invite code is not valid text".into()))?;
     let v: serde_json::Value =
-        serde_json::from_str(&text).map_err(|_| anyhow!("invite code failed to parse"))?;
+        serde_json::from_str(&text).map_err(|_| respire_app::input_error::InputError("invite code failed to parse".into()))?;
     for k in ["space", "addr", "user", "token", "super"] {
         if v[k].as_str().unwrap_or("").trim().is_empty() {
-            return Err(anyhow!(
+            return Err(respire_app::input_error::InputError(format!(
                 "invite code missing field \"{k}\" - the code may be truncated"
-            ));
+            )).into());
         }
     }
     Ok(v)
 }
 
+/// Validate user input before a host stops its current runtime.
+pub fn validate_join(code: &str) -> Result<serde_json::Value> {
+    let value = parse_invite(code)?;
+    let name = value["space"].as_str().unwrap_or("").trim();
+    validate_space_name(name)?;
+    if account_dir(name)?.exists() {
+        return Err(respire_app::input_error::InputError(format!(
+            "this machine already has space \"{name}\"; choose another space or remove the old profile explicitly"
+        )).into());
+    }
+    Ok(value)
+}
+
 /// Join a space: decode invite -> create profile -> fetch vault with the member token -> write session -> super password into the keyring.
 pub fn space_join(code: &str) -> Result<serde_json::Value> {
     respire_app::service::require_profile_change_host()?;
-    let v = parse_invite(code)?;
+    let v = validate_join(code)?;
     let name = v["space"].as_str().unwrap_or("").trim().to_owned();
-    validate_space_name(&name)?;
     let dir = account_dir(&name)?;
-    if dir.exists() {
-        return Err(anyhow!(
-            "this machine already has space \"{name}\" - if it is a stale copy, run rsrs space remove {name} --yes then join again"
-        ));
-    }
     let addr = v["addr"]
         .as_str()
         .unwrap_or("")
@@ -298,10 +306,10 @@ pub fn space_use(name: &str) -> Result<serde_json::Value> {
     validate_space_name(name)?;
     let n = name.trim();
     if n != "main" && !account_dir(n)?.exists() {
-        return Err(anyhow!(
+        return Err(respire_app::input_error::InputError(format!(
             "space \"{n}\" does not exist - rsrs space list to see current spaces; \
              to create one, run rsrs space create {n}"
-        ));
+        )).into());
     }
     account_use(n)
 }
@@ -559,8 +567,8 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir()?;
-        let saved = std::env::var("ONEMEMORY_DATA_DIR").ok();
-        std::env::set_var("ONEMEMORY_DATA_DIR", dir.path());
+        let saved = std::env::var("RSRS_DATA_DIR").ok();
+        std::env::set_var("RSRS_DATA_DIR", dir.path());
         assert!(space_create("main").is_err());
         let created = space_create("team_a")?;
         assert_eq!(created["name"], "team_a");
@@ -578,8 +586,8 @@ mod tests {
         space_use("main")?;
         space_remove("team_a")?;
         match saved {
-            Some(v) => std::env::set_var("ONEMEMORY_DATA_DIR", v),
-            None => std::env::remove_var("ONEMEMORY_DATA_DIR"),
+            Some(v) => std::env::set_var("RSRS_DATA_DIR", v),
+            None => std::env::remove_var("RSRS_DATA_DIR"),
         }
         Ok(())
     }

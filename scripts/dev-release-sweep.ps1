@@ -10,7 +10,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Server = $env:RESPIRE_DEV_SERVER_ADDR,
+    [string]$Server = $env:RSRS_DEV_SERVER_ADDR,
     [string]$Package = '@rsrsai/cli@dev',
     [string]$Root = '',
     [string]$Exe = '',
@@ -20,13 +20,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 if ($env:GITHUB_ACTIONS -ne 'true') { throw 'Release smoke may run only in GitHub Actions.' }
-if ($Server -cne 'https://dev.rsrs.rs') { throw 'Release smoke requires exactly https://dev.rsrs.rs.' }
+if ($Server -cne 'https://api.dev.rsrs.rs') { throw 'Release smoke requires exactly https://api.dev.rsrs.rs.' }
 if (-not $Exe -or $ExpectVersion -notmatch '^\d+\.\d+\.\d+(-dev\.\d+)?$') {
     throw 'Release smoke requires an exact CI artifact via -Exe and its -ExpectVersion.'
 }
 if ($env:CLI_SHA -notmatch '^[0-9a-fA-F]{40}$') { throw 'CLI_SHA must identify the verified artifact source commit.' }
-if ([string]::IsNullOrWhiteSpace($env:RESPIRE_DEV_SERVER_ADDR) -or $Server -ne $env:RESPIRE_DEV_SERVER_ADDR) {
-    throw 'Configure RESPIRE_DEV_SERVER_ADDR with the approved development server before running this sweep.'
+if ([string]::IsNullOrWhiteSpace($env:RSRS_DEV_SERVER_ADDR) -or $Server -ne $env:RSRS_DEV_SERVER_ADDR) {
+    throw 'Configure RSRS_DEV_SERVER_ADDR with the approved development server before running this sweep.'
 }
 $pkgMatch = [regex]::Match($Package, '^@rsrsai/cli@(dev|\d+\.\d+\.\d+(-dev\.\d+)?)$')
 if (-not $pkgMatch.Success) {
@@ -120,6 +120,7 @@ $script:CloudCleanup = @{ passed = $false; events = @(); remaining_users = @() }
 $script:CloudCleanupCompleted = $false
 $script:CloudCleanupRunning = $false
 $script:ModelProgressEvidence = $null
+$script:IndexPendingEvents = New-Object System.Collections.Generic.List[object]
 trap { $failure = $_; Invoke-CloudCleanup; Write-SweepReport; Stop-OurRuntimes; throw $failure }
 $Rows = New-Object System.Collections.Generic.List[object]
 $script:Step = 0
@@ -142,6 +143,7 @@ function Write-SweepReport {
         observed_version_display = $script:ObservedVersionDisplay
         cloud_cleanup = $script:CloudCleanup
         model_progress = $script:ModelProgressEvidence
+        index_pending_events = @($script:IndexPendingEvents.ToArray())
         binary_sha256 = $script:BinarySha256; catalog = $script:Catalog
         cases = $observed; passed = @($Rows | Where-Object { $_.Ok -and $_.Status -notin @('skip', 'fail') }).Count
         expected_errors = @($Rows | Where-Object { $_.Ok -and $_.Status -eq 'fail' }).Count
@@ -272,23 +274,22 @@ function Get-Leak([string]$Text, [bool]$Secret) {
 }
 
 # Only the endpoint and token beneath the current disposable device are used.
-function Invoke-OwnedRuntimeRpc([string]$DataDir, [string]$Method, [string[]]$Arguments = @()) {
+function Invoke-OwnedRuntimeRpc([string]$DataDir, [string]$Method, [string[]]$Arguments = @(), [int]$TimeoutSec = 5) {
     $endpoint = Get-Content -LiteralPath (Join-Path $DataDir 'runtime/endpoint.json') -Raw | ConvertFrom-Json
     $uri = [Uri][string]$endpoint.url
     if ($uri.Scheme -ne 'http' -or $uri.Host -notin @('127.0.0.1', 'localhost', '::1')) {
         throw 'Owned runtime endpoint is not loopback HTTP.'
     }
-    $token = (Get-Content -LiteralPath (Join-Path $DataDir 'runtime/token') -Raw).Trim()
-    if (-not $token) { throw 'Owned runtime token is missing.' }
+    if (Test-Path -LiteralPath (Join-Path $DataDir 'runtime/token')) { throw 'Owned loopback runtime created a token.' }
     $origin = $uri.GetLeftPart([UriPartial]::Authority)
     try {
         if ($Method -eq 'health') {
-            return Invoke-RestMethod -Uri "$origin/api/health" -Headers @{ Authorization = "Bearer $token" } -TimeoutSec 5
+            return Invoke-RestMethod -Uri "$origin/api/health" -TimeoutSec $TimeoutSec
         }
         $requestId = [Guid]::NewGuid().ToString('N')
         $body = @{ v = 1; id = $requestId; method = $Method; args = $Arguments } | ConvertTo-Json -Compress
         $response = Invoke-RestMethod -Uri "$origin/api/rpc" -Method Post -ContentType 'application/json' `
-            -Headers @{ Authorization = "Bearer $token" } -Body $body -TimeoutSec 5
+            -Body $body -TimeoutSec 5
         if ($response.ok -ne $true -or [string]$response.id -cne $requestId -or [string]$response.bin -cne $ExpectVersion) {
             throw 'Owned runtime RPC response identity failed.'
         }
@@ -296,8 +297,8 @@ function Invoke-OwnedRuntimeRpc([string]$DataDir, [string]$Method, [string[]]$Ar
     } catch { throw 'Owned runtime request failed.' }
 }
 
-function Get-OwnedRuntimeHealth([string]$DataDir) {
-    $health = Invoke-OwnedRuntimeRpc $DataDir 'health'
+function Get-OwnedRuntimeHealth([string]$DataDir, [int]$TimeoutSec = 5) {
+    $health = Invoke-OwnedRuntimeRpc $DataDir 'health' -TimeoutSec $TimeoutSec
     $profile = [IO.Path]::GetFullPath([string]$health.data_dir)
     $device = [IO.Path]::GetFullPath($DataDir).TrimEnd([IO.Path]::DirectorySeparatorChar)
     $nativeName = if ($IsWindows) { 'rsrs.exe' } else { 'rsrs' }
@@ -331,6 +332,7 @@ function Invoke-Om {
         [switch]$Secret,
         [switch]$Raw,
         [switch]$HostProfile,
+        [switch]$AllowIndexWait,
         [string]$ModelTaskId = '',
         [int]$TimeoutSec = 180,
         [string]$StdinText = '',
@@ -354,6 +356,12 @@ function Invoke-Om {
         if ($ArgList -notcontains '--direct') { $ArgList = @('--direct') + $ArgList }
     }
     if ($ModelTaskId) { $ArgList = @('--model-task-id', $ModelTaskId) + $ArgList }
+    if ($AllowIndexWait) {
+        $readCommand = @($ArgList | Where-Object { $_ -notin @('--direct', '--client-only', '--json') })[0]
+        if ($readCommand -notin @('recall', 'candidates') -or $Raw -or $Secret -or $ModelTaskId) {
+            throw 'Index readiness waiting is restricted to explicit JSON retrieval reads.'
+        }
+    }
     New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
     $script:Step++
     $safe = ($Name -replace '[^\w\-]+', '_')
@@ -377,21 +385,28 @@ function Invoke-Om {
     $psi.StandardErrorEncoding = $utf8
     $psi.StandardInputEncoding = $utf8
     foreach ($a in $ArgList) { $psi.ArgumentList.Add([string]$a) }
-    $psi.Environment['ONEMEMORY_DATA_DIR'] = $DataDir
-    $psi.Environment['ONEMEMORY_LANG'] = 'en'
+    $psi.Environment['RSRS_DATA_DIR'] = $DataDir
+    $psi.Environment['RSRS_LANG'] = 'en'
     $psi.Environment['HOME'] = $SmokeHome
     $psi.Environment['USERPROFILE'] = $SmokeHome
     $psi.Environment['XDG_CONFIG_HOME'] = Join-Path $SmokeHome '.config'
     $psi.Environment['XDG_DATA_HOME'] = Join-Path $SmokeHome '.local/share'
-    $psi.Environment['ONEMEMORY_MODEL_DIR'] = Join-Path $Root 'models/bge-base-zh-v1.5'
-    $psi.Environment['ONEMEMORY_M3_DIR'] = Join-Path $Root 'models/bge-m3'
-    $psi.Environment['ONEMEMORY_RERANKER_DIR'] = Join-Path $Root 'models/bge-reranker-base'
-    [void]$psi.Environment.Remove('ONEMEMORY_SERVER')
+    $psi.Environment['RSRS_M3_DIR'] = Join-Path $Root 'models/bge-m3'
+    $psi.Environment['RSRS_M3_DIR'] = Join-Path $Root 'models/bge-m3'
+    [void]$psi.Environment.Remove('RSRS_SERVER')
     Write-Host "STEP $script:Step $Name"
     $readyTries = 0
+    $indexRetried = $false
+    $indexEvent = $null
+    $indexCommandBudget = [Diagnostics.Stopwatch]::StartNew()
     do {
         $readyTries++
         if ($readyTries -gt 1) { Write-Host "RETRY $Name" }
+    $attemptTimeout = $TimeoutSec
+    if ($AllowIndexWait) {
+        $attemptTimeout = [int][Math]::Floor($TimeoutSec - $indexCommandBudget.Elapsed.TotalSeconds)
+        if ($attemptTimeout -le 0) { throw 'Index readiness retry exceeded the original command deadline.' }
+    }
     $proc = [System.Diagnostics.Process]::Start($psi)
     if ($StdinText) { $proc.StandardInput.Write($StdinText) }
     $proc.StandardInput.Close()
@@ -408,7 +423,7 @@ function Invoke-Om {
                 $progressSamples.Add($progress) | Out-Null
             } elseif ($progress.active -ne $false) { throw 'Model progress active flag is missing.' }
         }
-    } else { $finished = $proc.WaitForExit($TimeoutSec * 1000) }
+    } else { $finished = $proc.WaitForExit($attemptTimeout * 1000) }
     if (-not $finished) {
         $timedOut = $true
         try { $proc.Kill($true) } catch { try { $proc.Kill() } catch { } }
@@ -452,7 +467,9 @@ function Invoke-Om {
         $exitOk = $ExpectExit -contains [int]$exit
         $statusOk = $true
     } else {
-        $want = switch ($status) { 'ok' { 0 } 'skip' { 0 } 'warn' { 2 } 'pending' { 2 } 'fail' { 1 } default { -1 } }
+        $want = switch ($status) { 'ok' { 0 } 'skip' { 0 } 'warn' { 2 } 'pending' { 2 } 'fail' {
+            if ([string]$envlp.summary.reason -eq 'invalid_input' -and [string]$envlp.details.error_type -eq 'user') { 2 } else { 1 }
+        } default { -1 } }
         $exitOk = ($exit -eq $want)
         $statusOk = $AllowStatus -contains $status
     }
@@ -468,7 +485,44 @@ function Invoke-Om {
     }
     $readyFail = ($stdout + $stderr) -match 'did not become ready'
         if ($readyFail -and $readyTries -lt 2) { Stop-OurRuntimes; Start-Sleep -Seconds 1 }
-    } while ($readyFail -and $readyTries -lt 2)
+    $retryIndexPending = $AllowIndexWait -and -not $indexRetried -and -not $timedOut `
+        -and $exit -eq 2 -and $status -ceq 'pending' -and [string]$envlp.summary.state -ceq 'index_pending' `
+        -and @($envlp.errors).Count -eq 0 -and $leaks.Count -eq 0
+    if ($retryIndexPending) {
+        $indexRetried = $true
+        # Preserve the first response separately. It is an observed Pending,
+        # not a passing command or a replacement for the final data assertions.
+        [IO.File]::WriteAllText($outFile + '.index-pending', $stdout, [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($errFile + '.index-pending', $stderr, [Text.UTF8Encoding]::new($false))
+        $indexEvent = [ordered]@{ case = $Name; exit = 2; state = 'index_pending'; readiness = 'waiting'; polls = 0; wait_ms = 0; retried = $false }
+        $script:IndexPendingEvents.Add($indexEvent) | Out-Null
+        Write-SweepReport
+        $indexWait = [Diagnostics.Stopwatch]::StartNew()
+        $indexWaitBudget = [Math]::Min(120, $TimeoutSec - $indexCommandBudget.Elapsed.TotalSeconds)
+        while ($true) {
+            $remaining = [Math]::Min($indexWaitBudget - $indexWait.Elapsed.TotalSeconds, $TimeoutSec - $indexCommandBudget.Elapsed.TotalSeconds)
+            if ($remaining -lt 1) {
+                $indexEvent.readiness = 'timeout'
+                throw 'Owned retrieval index did not become ready within the bounded command deadline.'
+            }
+            $health = Get-OwnedRuntimeHealth $DataDir -TimeoutSec ([int][Math]::Min(5, [Math]::Floor($remaining)))
+            $indexEvent.polls++
+            $indexEvent.wait_ms = [int]$indexWait.Elapsed.TotalMilliseconds
+            $indexState = [string]$health.retrieval_index.state
+            if ($indexState -ceq 'failed') {
+                $indexEvent.readiness = 'failed'
+                throw 'Owned retrieval index reported failed; the command was not retried.'
+            }
+            if ($indexState -ceq 'ready') {
+                $indexEvent.readiness = 'ready'
+                $indexEvent.retried = $true
+                break
+            }
+            if ($indexState -cnotin @('idle', 'scheduled', 'running')) { throw 'Owned retrieval index readiness state is invalid.' }
+            Start-Sleep -Milliseconds 100
+        }
+    }
+    } while (($readyFail -and $readyTries -lt 2) -or $retryIndexPending)
     if ($readyTries -gt 1) { $Note = ("runtime 重试 $readyTries 次 " + $Note).Trim() }
     $ok = $exitOk -and $statusOk -and ($leaks.Count -eq 0) -and (-not $timedOut)
     $commandTokens = @($ArgList | Where-Object { $_ -notin @('--direct', '--client-only', '--json') })
@@ -554,7 +608,7 @@ function Invoke-CloudCleanup {
             if (-not $account.Confirmed) { throw 'registration_outcome_unconfirmed' }
             if ($account.User -notmatch "^(sweep|oth|sps)$stamp$") { throw 'cleanup_scope_mismatch' }
             $dataDir = Join-Path $Root "cleanup/$($account.User)"
-            $login = Invoke-Om -Name 'cleanup-owned-account-login' -ArgList @('--json', 'login', '--addr', $Server, '--user', $account.User, '--pass', $account.Password, '--super', $account.Super) -DataDir $dataDir -Secret -HostProfile -TimeoutSec 120
+            $login = Invoke-Om -Name 'cleanup-owned-account-login' -ArgList @('--json', 'login', '--interactive', '--addr', $Server, '--user', $account.User, '--pass', $account.Password, '--super', $account.Super) -DataDir $dataDir -Secret -HostProfile -TimeoutSec 120
             if (-not $login.Ok -or [string]$login.Envelope.summary.user -cne $account.User) { throw 'cleanup_login_failed' }
             $session = Get-SmokeSession $dataDir $account.User
             if ([string]$session.Value.addr -cne $Server) { throw 'cleanup_session_server_mismatch' }
@@ -678,8 +732,8 @@ if ($cfgAddr -ne $Server) { throw "config 地址不是测试服：$cfgAddr" }
 $configWrite = Invoke-Om -Name 'config-isolated-settings' -ArgList @('--json', 'config', '--autosync', 'false', '--cure-auto', 'false', '--rpc-parallelism', '1') -DataDir $DirA
 $configRead = Invoke-Om -Name 'config-settings-readback' -ArgList @('--json', 'config') -DataDir $DirA
 Assert-Smoke 'config-settings-persisted' ($configWrite.Ok -and $configRead.Ok -and $configRead.Envelope.summary.autosync -eq $false -and $configRead.Envelope.summary.cure_auto -eq $false -and [int]$configRead.Envelope.summary.rpc_parallelism -eq 1)
-$bgeInstall = Invoke-Om -Name 'model-install-bge' -ArgList @('--json', 'model', 'install-bge') -DataDir $DirA -TimeoutSec 900
-Assert-Smoke 'model-bge-installed' ($bgeInstall.Ok -and (Test-Path -LiteralPath (Join-Path $Root 'models/bge-base-zh-v1.5/onnx/model.onnx')))
+$bgeInstall = Invoke-Om -Name 'model-install' -ArgList @('--json', 'model', 'install') -DataDir $DirA -TimeoutSec 900
+Assert-Smoke 'model-bge-installed' ($bgeInstall.Ok -and [string]$bgeInstall.Envelope.summary.model -eq 'm3' -and (Test-Path -LiteralPath (Join-Path $Root 'models/bge-m3/onnx/model_quantized.onnx')))
 $engine = Invoke-Om -Name 'model-engine-cpu' -ArgList @('--json', 'model', 'engine', 'cpu') -DataDir $DirA
 Assert-Smoke 'model-engine-cpu-selected' ($engine.Ok -and [string]$engine.Envelope.summary.engine -eq 'cpu')
 foreach ($configuredEngine in @('gpu', 'npu')) {
@@ -689,8 +743,8 @@ foreach ($configuredEngine in @('gpu', 'npu')) {
     Assert-Smoke "model-engine-$configuredEngine-selection-persisted" ($savedEngine.Ok -and [string]$engineSettings.engine -eq $configuredEngine -and $engineSettings.force_cpu -eq $false)
 }
 Invoke-Om -Name 'model-engine-restore-cpu' -ArgList @('--json', 'model', 'engine', 'cpu') -DataDir $DirA -HostProfile | Out-Null
-$probe = Invoke-Om -Name 'model-probe-legacy' -ArgList @('--json', 'model', 'probe', '--model', 'legacy', '--text', 'isolated release smoke') -DataDir $DirA -TimeoutSec 300
-Assert-Smoke 'model-legacy-probe-success' ($probe.Ok -and [string]$probe.Envelope.status -eq 'ok')
+$probe = Invoke-Om -Name 'model-probe-m3' -ArgList @('--json', 'model', 'probe', '--text', 'isolated release smoke') -DataDir $DirA -TimeoutSec 300
+Assert-Smoke 'model-m3-default-probe-success' ($probe.Ok -and [string]$probe.Envelope.status -eq 'ok' -and [string]$probe.Envelope.summary.model -eq 'm3' -and [int]$probe.Envelope.summary.dimensions -eq 1024)
 
 $offlineDir = Join-Path $Root 'offline'
 Invoke-Om -Name 'offline-config' -ArgList @('--json', 'config', '--addr', $Server, '--autosync', 'false') -DataDir $offlineDir | Out-Null
@@ -957,11 +1011,11 @@ $script:ModelProgressEvidence.contract = @{
     invalid_total_count = @($reembed.Progress | Where-Object { $null -ne $_.total -and (($_.total -isnot [long] -and $_.total -isnot [int]) -or $_.total -lt $_.done) }).Count
 }
 Assert-Smoke 'reembed-progress-contract' (@($reembed).Count -eq 1 -and $reembed.Ok -and $invalidProgress.Count -eq 0 -and $script:ModelProgressEvidence.completed_inactive)
-Assert-Smoke 'reembed-count-dimensions' (($reembed.Envelope.summary.reembedded -is [long] -or $reembed.Envelope.summary.reembedded -is [int]) -and [long]$reembed.Envelope.summary.reembedded -ge 0 -and [int]$reembed.Envelope.summary.dims -eq 768)
+Assert-Smoke 'reembed-count-dimensions' (($reembed.Envelope.summary.reembedded -is [long] -or $reembed.Envelope.summary.reembedded -is [int]) -and [long]$reembed.Envelope.summary.reembedded -ge 0 -and [int]$reembed.Envelope.summary.dims -eq 1024)
 $afterReembed = Invoke-Om -Name 'reembed-after-readback' -ArgList @('--json', 'show', $id) -DataDir $DirA
 Assert-Smoke 'reembed-entry-preserved' ($beforeReembed.Ok -and $afterReembed.Ok -and [string]$afterReembed.Envelope.details.entry.id -ceq $id -and ($afterReembed.Envelope.details.entry | ConvertTo-Json -Depth 20 -Compress) -ceq $entryBeforeReembed)
 $cachedReembed = Invoke-Om -Name 'reembed-cached' -ArgList @('--json', 'reembed') -DataDir $DirA -TimeoutSec 300
-Assert-Smoke 'reembed-cached-zero' ($cachedReembed.Ok -and ($cachedReembed.Envelope.summary.reembedded -is [long] -or $cachedReembed.Envelope.summary.reembedded -is [int]) -and [long]$cachedReembed.Envelope.summary.reembedded -eq 0 -and [int]$cachedReembed.Envelope.summary.dims -eq 768)
+Assert-Smoke 'reembed-cached-zero' ($cachedReembed.Ok -and ($cachedReembed.Envelope.summary.reembedded -is [long] -or $cachedReembed.Envelope.summary.reembedded -is [int]) -and [long]$cachedReembed.Envelope.summary.reembedded -eq 0 -and [int]$cachedReembed.Envelope.summary.dims -eq 1024)
 Invoke-Om -Name 'book-material' -ArgList @('--json', 'book-material', $short) -DataDir $DirA | Out-Null
 Invoke-Om -Name 'portrait-material' -ArgList @('--json', 'portrait-material', '--limit', '10') -DataDir $DirA | Out-Null
 Invoke-Om -Name 'passport' -ArgList @('--json', 'passport') -DataDir $DirA | Out-Null
@@ -973,6 +1027,18 @@ if (Test-Path $shareFile) {
 }
 $exportFile = Join-Path $Work 'export.json'
 $backupFile = Join-Path $Work 'backup.sqlite'
+$missingOutput = Join-Path $Work 'missing-output/unused.json'
+$modeConfigBefore = [IO.File]::ReadAllBytes((Join-Path $DirA 'client.json'))
+foreach ($invalidOutput in @(
+    @{ Name = 'export-missing-output'; Args = @('--json', 'export', $missingOutput) },
+    @{ Name = 'backup-missing-output'; Args = @('--json', 'backup', $missingOutput) },
+    @{ Name = 'agent-config-invalid-mode'; Args = @('--json', 'agent-config', '--set', 'workspace_mode=bogus') }
+)) {
+    $rejectedOutput = Invoke-Om -Name $invalidOutput.Name -ArgList $invalidOutput.Args -DataDir $DirA -AllowStatus @('fail')
+    Assert-Smoke "$($invalidOutput.Name)-input-contract" ($rejectedOutput.Ok -and $rejectedOutput.Exit -eq 2 -and [string]$rejectedOutput.Envelope.summary.reason -eq 'invalid_input' -and [string]$rejectedOutput.Envelope.details.error_type -eq 'user')
+}
+Assert-Smoke 'invalid-output-does-not-create-directory' (-not (Test-Path -LiteralPath (Split-Path -Parent $missingOutput)))
+Assert-Smoke 'invalid-mode-preserves-config' ([Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $DirA 'client.json'))) -ceq [Convert]::ToBase64String($modeConfigBefore))
 Invoke-Om -Name 'export' -ArgList @('--json', 'export', $exportFile) -DataDir $DirA | Out-Null
 if (-not (Test-Path $exportFile) -or (Get-Item $exportFile).Length -lt 10) { throw 'export 没有写出非空文件' }
 Invoke-Om -Name 'backup' -ArgList @('--json', 'backup', $backupFile) -DataDir $DirA | Out-Null
@@ -1057,7 +1123,7 @@ $spaceProfileConfig = [IO.File]::ReadAllBytes((Join-Path $DirA 'client.json'))
 $missingSpace = "missing$stamp"
 $spaceRejected = Invoke-Om -Name 'space-live-missing-rejected' -ArgList @('--json', 'space', 'use', $missingSpace) -DataDir $DirA -AllowStatus @('fail')
 $spaceRejectedHealth = Get-OwnedRuntimeHealth $DirA
-Assert-Smoke 'space-live-rejected-restores-service' ($spaceRejected.Ok -and $spaceRejected.Exit -eq 1 -and ($spaceRejected.Envelope.errors -join ' ') -match ('space "' + [regex]::Escape($missingSpace) + '" does not exist') -and -not (Test-Path -LiteralPath (Join-Path $DirA "accounts/$missingSpace")) -and (Test-RuntimeChanged $spaceReturnHealth $spaceRejectedHealth (Join-Path $DirA 'accounts/sweepspace')) -and [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $DirA 'client.json'))) -ceq [Convert]::ToBase64String($spaceProfileConfig))
+Assert-Smoke 'space-live-rejected-restores-service' ($spaceRejected.Ok -and $spaceRejected.Exit -eq 2 -and [string]$spaceRejected.Envelope.summary.reason -eq 'invalid_input' -and [string]$spaceRejected.Envelope.details.error_type -eq 'user' -and ($spaceRejected.Envelope.errors -join ' ') -match ('space "' + [regex]::Escape($missingSpace) + '" does not exist') -and -not (Test-Path -LiteralPath (Join-Path $DirA "accounts/$missingSpace")) -and (Test-RuntimeChanged $spaceReturnHealth $spaceRejectedHealth (Join-Path $DirA 'accounts/sweepspace')) -and [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $DirA 'client.json'))) -ceq [Convert]::ToBase64String($spaceProfileConfig))
 $inv = Invoke-Om -Name 'space-invite' -ArgList @('--json', 'space', 'invite', '--note', 'sweep') -DataDir $DirA -Secret
 Invoke-Om -Name 'space-members' -ArgList @('--json', 'space', 'members') -DataDir $DirA | Out-Null
 $inviteCode = ''
@@ -1078,6 +1144,11 @@ if ($inviteCode) {
     $spaceRead = Invoke-Om -Name 'space-member-readback' -ArgList @('--json', 'show', $spaceEntryId) -DataDir $DirC
     Assert-Smoke 'space-member-can-read-owner-entry' ($spacePull.Ok -and $spaceRead.Ok -and [string]$spaceRead.Envelope.details.entry.content -eq $spaceMarker)
 }
+$readonlyTombstone = Invoke-Om -Name 'space-readonly-tombstone-create' -ArgList @('--json', 'remember', "readonly-tombstone-$stamp", '--title', 'readonly-tombstone', '--importance', 'important', '--force') -DataDir $DirA
+$readonlyTombstoneId = [string]$readonlyTombstone.Envelope.summary.id
+$readonlyDeleted = Invoke-Om -Name 'space-readonly-tombstone-delete' -ArgList @('--json', 'forget', $readonlyTombstoneId) -DataDir $DirA
+$readonlySeedSync = Invoke-Om -Name 'space-readonly-tombstone-sync' -ArgList @('--json', 'sync') -DataDir $DirA
+Assert-Smoke 'space-readonly-tombstone-ready' ($readonlyTombstone.Ok -and [bool]$readonlyTombstoneId -and $readonlyDeleted.Ok -and $readonlySeedSync.Ok)
 $readonlyInvite = Invoke-Om -Name 'space-invite-readonly' -ArgList @('--json', 'space', 'invite', '--readonly', '--note', 'readonly-smoke') -DataDir $DirA -Secret -AllowStatus @('warn')
 $readonlyCode = [string]$readonlyInvite.Envelope.details.code
 Assert-Smoke 'space-readonly-invite-present' ($readonlyInvite.Ok -and $readonlyInvite.Envelope.details.readonly -eq $true -and [bool]$readonlyCode)
@@ -1085,7 +1156,9 @@ $readonlyDir = Join-Path $Root 'readonly-member'
 Invoke-Om -Name 'space-readonly-config' -ArgList @('--json', 'config', '--addr', $Server, '--autosync', 'false') -DataDir $readonlyDir | Out-Null
 $readonlyJoin = Invoke-Om -Name 'space-readonly-join' -ArgList @('--json', 'space', 'join', $readonlyCode) -DataDir $readonlyDir -Secret -HostProfile -AllowStatus @('warn')
 Invoke-Om -Name 'space-readonly-use' -ArgList @('--json', 'space', 'use', 'sweepspace') -DataDir $readonlyDir -HostProfile | Out-Null
+Invoke-Om -Name 'space-readonly-immediate-purge-config' -ArgList @('--json', 'agent-config', '--set', 'purge_days=0') -DataDir $readonlyDir | Out-Null
 $readonlyPull = Invoke-Om -Name 'space-readonly-sync' -ArgList @('--json', 'sync') -DataDir $readonlyDir
+Assert-Smoke 'space-readonly-no-auto-purge' ($readonlyPull.Ok -and [int]$readonlyPull.Envelope.summary.purged -eq 0 -and [int]$readonlyPull.Envelope.summary.pushed -eq 0 -and [int]$readonlyPull.Envelope.summary.pending -eq 0)
 $readonlyRead = Invoke-Om -Name 'space-readonly-show' -ArgList @('--json', 'show', $spaceEntryId) -DataDir $readonlyDir
 Assert-Smoke 'space-readonly-can-read' ($readonlyJoin.Ok -and $readonlyPull.Ok -and $readonlyRead.Ok -and [string]$readonlyRead.Envelope.details.entry.content -eq $spaceMarker)
 $readonlyWrite = Invoke-Om -Name 'space-readonly-write-refused' -ArgList @('--json', 'remember', "forbidden-$stamp", '--title', 'must-not-write', '--force') -DataDir $readonlyDir -AllowStatus @('fail')
@@ -1130,7 +1203,7 @@ $autoRevoked = Invoke-Om -Name 'grant-delete-root-readback' -ArgList @('--json',
 Assert-Smoke 'grant-delete-root-auto-revoked' ($deleteGrant.Ok -and [bool]$deleteGrantId -and @($autoRevoked.Envelope.details.grants | Where-Object { $_.id -eq $deleteGrantId -and $_.revoked -eq $true }).Count -eq 1)
 Invoke-Om -Name 'session-list' -ArgList @('--json', 'session', 'list') -DataDir $DirA -TimeoutSec 120 | Out-Null
 Invoke-Om -Name 'session-revoke-bogus' -ArgList @('--json', 'session', 'revoke', '00000000-0000-0000-0000-000000000000') -DataDir $DirA -ExpectExit @(0, 1) -Note '不撤销当前会话' | Out-Null
-Invoke-Om -Name 'model-install-rerank' -ArgList @('--json', 'model', 'install-rerank') -DataDir $DirA -TimeoutSec 180 -Note '已存在则跳过，不重下' | Out-Null
+$retiredInstall = Invoke-Om -Name 'model-install-rerank' -ArgList @('--json', 'model', 'install-rerank') -DataDir $DirA -ExpectExit @(2) -Raw
 
 $syncA = Invoke-Om -Name 'sync-a' -ArgList @('--json', 'sync') -DataDir $DirA -TimeoutSec 180
 if (-not $syncA.Ok) { throw 'A 同步失败' }
@@ -1163,7 +1236,7 @@ Invoke-Om -Name 'sync-resolve-bogus' -ArgList @(
 ) -DataDir $DirA -AllowStatus @('fail') -Note '无冲突时必须失败' | Out-Null
 
 Invoke-Om -Name 'config-addr-b' -ArgList @('--json', 'config', '--addr', $Server) -DataDir $DirB | Out-Null
-$loginB = Invoke-Om -Name 'login-b' -ArgList @('--json', 'login', '--addr', $Server, '--user', $user, '--pass', $pass, '--super', $super) -DataDir $DirB -Secret -HostProfile -TimeoutSec 180
+$loginB = Invoke-Om -Name 'login-b' -ArgList @('--json', 'login', '--interactive', '--addr', $Server, '--user', $user, '--pass', $pass, '--super', $super) -DataDir $DirB -Secret -HostProfile -TimeoutSec 180
 if (-not $loginB.Ok) { throw 'B 登录失败。super 必须用 register 响应里的 summary.super。已中止，避免后续命令走默认正式服。' }
 $stB = Invoke-Om -Name 'status-b' -ArgList @('--json', 'status') -DataDir $DirB
 $addrB = ''
@@ -1171,13 +1244,13 @@ if ($stB.Envelope.summary.server_addr) { $addrB = [string]$stB.Envelope.summary.
 if ($addrB -ne $Server) { throw "B server_addr=$addrB" }
 $syncB = Invoke-Om -Name 'sync-b' -ArgList @('--json', 'sync') -DataDir $DirB -TimeoutSec 180
 if (-not $syncB.Ok) { throw 'B 下载同步失败' }
-Assert-Count 'B sync' $syncB.Envelope 'pulled' 1
-$recB = Invoke-Om -Name 'recall-b' -ArgList @('--json', 'recall', $marker, '--limit', '3') -DataDir $DirB -TimeoutSec 180
+Assert-Smoke 'device-b-sync-converged' ($syncB.Envelope.summary.converged -eq $true -and [int]$syncB.Envelope.summary.pending -eq 0)
+$recB = Invoke-Om -Name 'recall-b' -ArgList @('--json', 'recall', $marker, '--limit', '3') -DataDir $DirB -TimeoutSec 180 -AllowIndexWait
 if ($recB.Stdout -notlike "*$marker*") { throw "B recall 没有召回 A 写入的标记 $marker" }
 Invoke-Om -Name 'show-b' -ArgList @('--json', 'show', $short) -DataDir $DirB | Out-Null
 $bad = Join-Path $Root 'bad'
 Invoke-Om -Name 'config-addr-bad' -ArgList @('--json', 'config', '--addr', $Server) -DataDir $bad | Out-Null
-Invoke-Om -Name 'login-wrong-pass' -ArgList @('--json', 'login', '--addr', $Server, '--user', $user, '--pass', 'wrong-pass-000') -DataDir $bad -AllowStatus @('fail') -Secret -HostProfile -Note '错误口令应失败' | Out-Null
+Invoke-Om -Name 'login-wrong-pass' -ArgList @('--json', 'login', '--interactive', '--addr', $Server, '--user', $user, '--pass', 'wrong-pass-000') -DataDir $bad -AllowStatus @('fail') -Secret -HostProfile -Note '错误口令应失败' | Out-Null
 
 # The second device uses fivekeys. Read material from device A without printing it.
 $sessionPath = Join-Path $DirA 'session.json'
@@ -1290,14 +1363,19 @@ Assert-Smoke 'session-revocation-preserves-local-decryption' ($revokedLocal.Ok -
 # Recover through the existing CLI setting, while team members remain unable to self-unlock.
 $revokedConfig = Invoke-Om -Name 'session-revoked-agent-config' -ArgList @('--json', 'agent-config') -DataDir $DirB
 Assert-Smoke 'session-revoked-personal-readonly-marked' ($revokedConfig.Ok -and $revokedConfig.Envelope.summary.readonly -eq $true -and $revokedConfig.Envelope.summary.readonly_team -ne $true)
+$revokedStatus = Invoke-Om -Name 'session-revoked-device-status' -ArgList @('--json', 'status') -DataDir $DirB
+$revokedWrite = Invoke-Om -Name 'session-revoked-local-write-refused' -ArgList @('--json', 'remember', "must-not-write-$marker", '--title', 'must-not-write', '--force') -DataDir $DirB -AllowStatus @('fail')
+Assert-Smoke 'session-revoked-device-readonly-enforced' ($revokedStatus.Ok -and [string]$revokedStatus.Envelope.summary.workspace -eq 'readonly' -and $revokedWrite.Ok -and $revokedWrite.Exit -eq 1 -and ($revokedWrite.Envelope.errors -join ' ') -match 'read.only')
 $ownerClear = Invoke-Om -Name 'session-owner-clear-personal-readonly' -ArgList @('--json', 'agent-config', '--set', 'readonly=false') -DataDir $DirB
 Assert-Smoke 'session-owner-personal-readonly-cleared' ($ownerClear.Ok -and [string]$ownerClear.Envelope.summary.key -eq 'readonly' -and $ownerClear.Envelope.summary.value -eq $false)
 $ownerConfig = Invoke-Om -Name 'session-owner-agent-config-readback' -ArgList @('--json', 'agent-config') -DataDir $DirB
 Assert-Smoke 'session-owner-personal-readonly-readback' ($ownerConfig.Ok -and $ownerConfig.Envelope.summary.readonly -eq $false -and $ownerConfig.Envelope.summary.readonly_team -ne $true)
+$ownerStatus = Invoke-Om -Name 'session-owner-device-mode-readback' -ArgList @('--json', 'status') -DataDir $DirB
+Assert-Smoke 'session-owner-device-normal-restored' ($ownerStatus.Ok -and [string]$ownerStatus.Envelope.summary.workspace -eq 'normal')
 Invoke-Om -Name 'logout' -ArgList @('--json', 'logout') -DataDir $DirB | Out-Null
-$loginAgain = Invoke-Om -Name 'login-b-again' -ArgList @('--json', 'login', '--addr', $Server, '--user', $user, '--pass', $pass, '--super', $super) -DataDir $DirB -Secret -TimeoutSec 180
+$loginAgain = Invoke-Om -Name 'login-b-again' -ArgList @('--json', 'login', '--interactive', '--addr', $Server, '--user', $user, '--pass', $pass, '--super', $super) -DataDir $DirB -Secret -TimeoutSec 180
 if (-not $loginAgain.Ok) { throw '重新登录失败' }
-$recallAgain = Invoke-Om -Name 'recall-after-relogin' -ArgList @('--json', 'recall', $marker, '--limit', '3') -DataDir $DirB -TimeoutSec 180
+$recallAgain = Invoke-Om -Name 'recall-after-relogin' -ArgList @('--json', 'recall', $marker, '--limit', '3') -DataDir $DirB -TimeoutSec 180 -AllowIndexWait
 if ($recallAgain.Stdout -notlike "*$marker*") { throw '重新登录后没有检索到标记' }
 $syncAgain = Invoke-Om -Name 'sync-after-relogin' -ArgList @('--json', 'sync') -DataDir $DirB -TimeoutSec 180
 if (-not $syncAgain.Ok) { throw '重新登录后同步失败' }
@@ -1308,18 +1386,18 @@ $afterReset = Invoke-Om -Name 'super-reset-memory-readback' -ArgList @('--json',
 Assert-Smoke 'super-reset-preserves-memory' ($superReset.Ok -and [bool]$newSuper -and $newSuper -ne $super -and $afterReset.Ok -and [string]$afterReset.Envelope.details.entry.content -eq "merged $marker")
 $oldRecoveryDir = Join-Path $Root 'old-recovery'
 Invoke-Om -Name 'old-recovery-config' -ArgList @('--json', 'config', '--addr', $Server, '--autosync', 'false') -DataDir $oldRecoveryDir | Out-Null
-$oldRecovery = Invoke-Om -Name 'super-reset-old-code-refused' -ArgList @('--json', 'login', '--addr', $Server, '--user', $user, '--pass', $pass, '--super', $super) -DataDir $oldRecoveryDir -Secret -HostProfile -AllowStatus @('fail')
+$oldRecovery = Invoke-Om -Name 'super-reset-old-code-refused' -ArgList @('--json', 'login', '--interactive', '--addr', $Server, '--user', $user, '--pass', $pass, '--super', $super) -DataDir $oldRecoveryDir -Secret -HostProfile -AllowStatus @('fail')
 Assert-Smoke 'super-reset-old-code-rejected' ($oldRecovery.Ok -and $oldRecovery.Exit -eq 1 -and ($oldRecovery.Envelope.errors -join ' ') -match 'unwrap|decrypt')
 $recoveryDir = Join-Path $Root 'new-recovery'
 Invoke-Om -Name 'new-recovery-config' -ArgList @('--json', 'config', '--addr', $Server, '--autosync', 'false') -DataDir $recoveryDir | Out-Null
-$newRecovery = Invoke-Om -Name 'super-reset-new-code-login' -ArgList @('--json', 'login', '--addr', $Server, '--user', $user, '--pass', $pass, '--super', $newSuper, '--secret-key', $newSuper) -DataDir $recoveryDir -Secret -HostProfile
+$newRecovery = Invoke-Om -Name 'super-reset-new-code-login' -ArgList @('--json', 'login', '--interactive', '--addr', $Server, '--user', $user, '--pass', $pass, '--super', $newSuper) -DataDir $recoveryDir -Secret -HostProfile
 $newRecoverySync = Invoke-Om -Name 'super-reset-new-code-sync' -ArgList @('--json', 'sync') -DataDir $recoveryDir
 $newRecoveryRead = Invoke-Om -Name 'super-reset-new-code-readback' -ArgList @('--json', 'show', $id) -DataDir $recoveryDir
 Assert-Smoke 'super-reset-new-code-recovers-cloud-content' ($newRecovery.Ok -and $newRecoverySync.Ok -and $newRecoveryRead.Ok -and [string]$newRecoveryRead.Envelope.details.entry.content -eq "merged $marker")
 $recoverySession = Get-SmokeSession $recoveryDir $user
 $fullLogout = Invoke-Om -Name 'cloud-full-logout' -ArgList @('--json', 'logout', '--full') -DataDir $recoveryDir -HostProfile
 Assert-Smoke 'cloud-full-logout-removes-session' ($fullLogout.Ok -and [string]$fullLogout.Envelope.summary.mode -eq 'full' -and -not (Test-Path -LiteralPath $recoverySession.Path))
-$recoveredAfterFull = Invoke-Om -Name 'cloud-login-after-full-logout' -ArgList @('--json', 'login', '--addr', $Server, '--user', $user, '--pass', $pass, '--super', $newSuper) -DataDir $recoveryDir -Secret -HostProfile
+$recoveredAfterFull = Invoke-Om -Name 'cloud-login-after-full-logout' -ArgList @('--json', 'login', '--interactive', '--addr', $Server, '--user', $user, '--pass', $pass, '--super', $newSuper) -DataDir $recoveryDir -Secret -HostProfile
 $fullRead = Invoke-Om -Name 'cloud-full-logout-login-readback' -ArgList @('--json', 'show', $id) -DataDir $recoveryDir
 Assert-Smoke 'cloud-full-logout-recovery-preserves-library' ($recoveredAfterFull.Ok -and $fullRead.Ok -and [string]$fullRead.Envelope.details.entry.content -eq "merged $marker")
 
@@ -1327,20 +1405,19 @@ Assert-Smoke 'cloud-full-logout-recovery-preserves-library' ($recoveredAfterFull
 # risking the main sweep account's local library or exporting old ciphertext.
 $resetDir = Join-Path $Root 'reset-vault'
 Invoke-Om -Name 'reset-vault-config' -ArgList @('--json', 'config', '--addr', $Server, '--autosync', 'false') -DataDir $resetDir | Out-Null
-Invoke-Om -Name 'reset-vault-baseline-login' -ArgList @('--json', 'login', '--addr', $Server, '--user', $user, '--pass', $pass, '--super', $newSuper) -DataDir $resetDir -Secret -HostProfile | Out-Null
+Invoke-Om -Name 'reset-vault-baseline-login' -ArgList @('--json', 'login', '--interactive', '--addr', $Server, '--user', $user, '--pass', $pass, '--super', $newSuper) -DataDir $resetDir -Secret -HostProfile | Out-Null
 Invoke-Om -Name 'reset-vault-local-keygen' -ArgList @('--json', 'keygen', '--force') -DataDir $resetDir -Secret -HostProfile | Out-Null
 $mismatched = Invoke-Om -Name 'reset-vault-old-local-write' -ArgList @('--json', 'remember', "reset-local-old-key-$stamp", '--title', "reset-local-$stamp", '--importance', 'important', '--force') -DataDir $resetDir
 $mismatchedId = [string]$mismatched.Envelope.summary.id
 Assert-Smoke 'reset-vault-mismatched-fixture-written' ($mismatched.Ok -and [bool]$mismatchedId)
-$resetGuard = Invoke-Om -Name 'reset-vault-mismatch-refused' -ArgList @('--json', 'login', '--addr', $Server, '--user', $user, '--pass', $pass, '--super', $newSuper) -DataDir $resetDir -Secret -HostProfile -AllowStatus @('fail')
-Assert-Smoke 'reset-vault-mismatch-guard' ($resetGuard.Ok -and $resetGuard.Exit -eq 1 -and ($resetGuard.Envelope.errors -join ' ') -match 'reset-vault|undecryptable')
-$resetAdopt = Invoke-Om -Name 'reset-vault-explicit-adopt-cloud' -ArgList @('--json', 'login', '--addr', $Server, '--user', $user, '--pass', $pass, '--super', $newSuper, '--reset-vault') -DataDir $resetDir -Secret -HostProfile
-Assert-Smoke 'reset-vault-explicit-cloud-key-adopted' ($resetAdopt.Ok)
-$resetSync = Invoke-Om -Name 'reset-vault-sync-after-adoption' -ArgList @('--json', 'sync') -DataDir $resetDir
-$resetCloudRead = Invoke-Om -Name 'reset-vault-cloud-content-readback' -ArgList @('--json', 'show', $id) -DataDir $resetDir
-$resetList = Invoke-Om -Name 'reset-vault-library-readable' -ArgList @('--json', 'list', '--limit', '100') -DataDir $resetDir
-$resetRecall = Invoke-Om -Name 'reset-vault-recall-readable' -ArgList @('--json', 'recall', $marker, '--limit', '5') -DataDir $resetDir
-Assert-Smoke 'reset-vault-no-undecryptable-old-library' ($resetSync.Ok -and $resetCloudRead.Ok -and $resetList.Ok -and $resetRecall.Ok -and [string]$resetCloudRead.Envelope.details.entry.content -eq "merged $marker" -and ($resetList.Envelope.errors -join ' ') -notmatch 'decrypt|decode' -and ($resetRecall.Envelope.errors -join ' ') -notmatch 'decrypt|decode')
+$resetProfile = [string](Invoke-Om -Name 'reset-vault-selected-profile' -ArgList @('--json', 'config') -DataDir $resetDir).Envelope.summary.data_dir
+$resetSession = Join-Path $resetProfile 'session.json'
+$beforeResetSession = (Get-FileHash -LiteralPath $resetSession -Algorithm SHA256).Hash
+$resetGuard = Invoke-Om -Name 'reset-vault-mismatch-refused' -ArgList @('--json', 'login', '--interactive', '--addr', $Server, '--user', $user, '--pass', $pass, '--super', $newSuper) -DataDir $resetDir -Secret -HostProfile -AllowStatus @('fail')
+Assert-Smoke 'reset-vault-mismatch-guard' ($resetGuard.Ok -and $resetGuard.Exit -eq 1 -and ($resetGuard.Envelope.errors -join ' ') -match 'different key material|destination belongs to another account')
+Assert-Smoke 'login-key-mismatch-original-session-preserved' ((Get-FileHash -LiteralPath $resetSession -Algorithm SHA256).Hash -ceq $beforeResetSession)
+$resetRead = Invoke-Om -Name 'login-key-mismatch-original-readback' -ArgList @('--json', 'show', $mismatchedId) -DataDir $resetDir
+Assert-Smoke 'login-key-mismatch-original-data-readable' ($resetRead.Ok -and [string]$resetRead.Envelope.details.entry.content -ceq "reset-local-old-key-$stamp")
 Invoke-Om -Name 'sync-reset' -ArgList @('--json', 'sync-reset') -DataDir $DirA -TimeoutSec 180 -Note '一次性账号上的快照重建' | Out-Null
 
 # Web opens the hosted dashboard; runtime lifecycle is a separate hidden command.
@@ -1365,11 +1442,7 @@ if (Test-Path $endpointFile) {
     $runtimeUri = [Uri]$url
     if ($runtimeUri.Host -notin @('127.0.0.1', 'localhost', '::1')) { throw "Runtime endpoint is not loopback: $url" }
 }
-$rpcToken = ''
 $tokenFile = Join-Path $DirA 'runtime\token'
-if (Test-Path -LiteralPath $tokenFile) {
-    $rpcToken = (Get-Content -LiteralPath $tokenFile -Raw).Trim()
-}
 $origin = $url
 if ($origin -match '^(https?://[^/?]+)') { $origin = $Matches[1] }
 $mcpUrl = ''
@@ -1377,8 +1450,7 @@ if ($origin) { $mcpUrl = ($origin.TrimEnd('/') + '/mcp') }
 $mcpSse = ''
 if ($origin) { $mcpSse = ($origin.TrimEnd('/') + '/sse') }
 $mcpHeaders = @{}
-if ($rpcToken) { $mcpHeaders['Authorization'] = "Bearer $rpcToken" }
-Assert-Smoke 'runtime-endpoint-and-token-present' ([bool]$origin -and [bool]$rpcToken)
+Assert-Smoke 'runtime-endpoint-without-token' ([bool]$origin -and -not (Test-Path -LiteralPath $tokenFile))
 function Invoke-LocalSmoke {
     param([string]$Name, [string]$Path, $Payload, [int]$ExpectedStatus = 200, [hashtable]$Headers = $mcpHeaders, [string]$Method = 'POST', [switch]$RawBody)
     $body = if ($RawBody) { [string]$Payload } else { $Payload | ConvertTo-Json -Compress -Depth 12 }
@@ -1390,8 +1462,9 @@ function Invoke-LocalSmoke {
 }
 $health = Invoke-LocalSmoke -Name 'runtime-http-health' -Path '/api/health' -Method GET
 Assert-Smoke 'runtime-health-protocol-version' ([int]$health.v -eq 1 -and [string]$health.bin -eq $ExpectVersion)
-Invoke-LocalSmoke -Name 'runtime-http-wrong-token' -Path '/api/rpc' -Payload @{ v = 1; id = 'wrong-token'; method = 'runtime.status' } -Headers @{ Authorization = 'Bearer invalid-smoke-token' } -ExpectedStatus 401 | Out-Null
-Invoke-LocalSmoke -Name 'runtime-http-foreign-origin' -Path '/api/rpc' -Payload @{ v = 1; id = 'foreign-origin'; method = 'runtime.status' } -Headers @{ Authorization = "Bearer $rpcToken"; Origin = 'https://example.invalid' } -ExpectedStatus 403 | Out-Null
+$wrongToken = Invoke-LocalSmoke -Name 'runtime-http-loopback-ignores-token' -Path '/api/rpc' -Payload @{ v = 1; id = 'wrong-token'; method = 'runtime.status' } -Headers @{ Authorization = 'Bearer invalid-smoke-token' }
+if ($wrongToken.ok -ne $true -or [string]$wrongToken.id -cne 'wrong-token' -or [string]$wrongToken.bin -cne $ExpectVersion) { throw 'Loopback RPC response identity failed.' }
+Invoke-LocalSmoke -Name 'runtime-http-foreign-origin' -Path '/api/rpc' -Payload @{ v = 1; id = 'foreign-origin'; method = 'runtime.status' } -Headers @{ Origin = 'https://example.invalid' } -ExpectedStatus 403 | Out-Null
 Invoke-LocalSmoke -Name 'runtime-http-malformed-json' -Path '/api/rpc' -Payload '{' -RawBody -ExpectedStatus 400 | Out-Null
 Invoke-LocalSmoke -Name 'runtime-http-missing-command' -Path '/api/rpc' -Payload @{} -ExpectedStatus 400 | Out-Null
 foreach ($removed in @(@('/', 'GET'), @('/index.html', 'GET'), @('/favicon.ico', 'GET'), @('/api/invoke', 'POST'), @('/api/task/start', 'POST'))) {
@@ -1412,7 +1485,7 @@ Assert-Smoke 'runtime-cli-diary-mode-contract' ([string]$runtimeAgent.summary.di
 Invoke-RuntimeCli 'runtime-cli-list' @('list', '--limit', '5') | Out-Null
 Invoke-RuntimeCli 'runtime-cli-tree' @('tree', '--depth', '3') | Out-Null
 Invoke-RuntimeCli 'runtime-cli-inject-targets' @('inject', '--targets') | Out-Null
-Assert-Smoke 'runtime-cli-rerank-installed' (Test-Path -LiteralPath (Join-Path $Root 'models/bge-reranker-base/onnx/model_quantized.onnx'))
+Assert-Smoke 'runtime-cli-retired-rerank-rejected' ($retiredInstall.Ok -and -not (Test-Path -LiteralPath (Join-Path $Root 'models/bge-reranker-base')))
 $runtimeCreated = Invoke-RuntimeCli 'runtime-cli-create' @('remember', "runtime-rpc-$stamp", '--title', "runtime-$stamp", '--importance', 'important', '--force', '--parent', $id)
 $runtimeId = [string]$runtimeCreated.summary.id
 Assert-Smoke 'runtime-cli-created-id' ([bool]$runtimeId)
@@ -1593,26 +1666,20 @@ Assert-Smoke 'mcp-http-restore-content-persisted' ([string]$httpRestored.details
 $unknownHttp = Invoke-McpHttpRpc 'mcp-http-unknown-tool' @{ jsonrpc = '2.0'; id = 90; method = 'tools/call'; params = @{ name = 'memory_nope'; arguments = @{} } }
 Assert-Smoke 'mcp-http-unknown-tool-is-error' ($unknownHttp.result.isError -eq $true)
 Invoke-LocalSmoke -Name 'mcp-http-malformed-json' -Path '/mcp' -Payload '{' -RawBody -ExpectedStatus 400 | Out-Null
-Invoke-LocalSmoke -Name 'mcp-http-foreign-origin' -Path '/mcp' -Payload @{} -Headers @{ Authorization = "Bearer $rpcToken"; Origin = 'https://example.invalid' } -ExpectedStatus 403 | Out-Null
+Invoke-LocalSmoke -Name 'mcp-http-foreign-origin' -Path '/mcp' -Payload @{} -Headers @{ Origin = 'https://example.invalid' } -ExpectedStatus 403 | Out-Null
 
 $m3Install = Invoke-Om -Name 'model-install-m3' -ArgList @('--json', 'model', 'install-m3') -DataDir $DirA -TimeoutSec 1200
-Assert-Smoke 'model-m3-installed-without-activation' ($m3Install.Ok -and $m3Install.Envelope.summary.activated -eq $false -and (Test-Path -LiteralPath (Join-Path $Root 'models/bge-m3/onnx/model_fp16.onnx')))
+Assert-Smoke 'model-m3-installed-without-activation' ($m3Install.Ok -and $m3Install.Envelope.summary.activated -eq $false -and (Test-Path -LiteralPath (Join-Path $Root 'models/bge-m3/onnx/model_quantized.onnx')))
 $m3Probe = Invoke-Om -Name 'model-probe-m3' -ArgList @('--json', 'model', 'probe', '--model', 'm3', '--text', $marker) -DataDir $DirA -TimeoutSec 600
 Assert-Smoke 'model-m3-probe-success' ($m3Probe.Ok -and [string]$m3Probe.Envelope.status -eq 'ok')
 $activateM3 = Invoke-Om -Name 'model-activate-m3' -ArgList @('--json', 'model', 'activate', 'm3') -DataDir $DirA -TimeoutSec 900
 $m3Recall = Invoke-Om -Name 'model-m3-recall-existing-content' -ArgList @('--json', 'recall', $marker, '--limit', '5') -DataDir $DirA -TimeoutSec 300
 $m3MarkerHits = @($m3Recall.Envelope.details | Where-Object { [string]$_.entry.content -like "*$marker*" })
-Assert-Smoke 'model-m3-index-and-recall' ($activateM3.Ok -and [string]$activateM3.Envelope.summary.model -eq 'm3' -and [int]$activateM3.Envelope.summary.indexed -gt 0 -and $m3Recall.Ok -and [string]$m3Recall.Envelope.summary.embedding_model -eq 'm3' -and $m3MarkerHits.Count -gt 0)
-$activateLegacy = Invoke-Om -Name 'model-activate-legacy' -ArgList @('--json', 'model', 'activate', 'legacy') -DataDir $DirA -TimeoutSec 600
-$legacyRecall = Invoke-Om -Name 'model-legacy-recall-after-switch' -ArgList @('--json', 'recall', $marker, '--limit', '5') -DataDir $DirA -TimeoutSec 300
-# Existing source-checked generation artifacts are reused; indexed counts only
-# newly prepared rows, so a successful switch can legitimately report zero.
-$legacyIndexed = $activateLegacy.Envelope.summary.indexed
-$legacyIndexedNumber = $legacyIndexed -is [int] -or $legacyIndexed -is [long]
-$legacyMarkerHits = @($legacyRecall.Envelope.details | Where-Object { [string]$_.entry.content -like "*$marker*" })
-# Recall reports the persisted active model; lightweight JSON status does not.
-$legacyContent = Invoke-Om -Name 'model-legacy-show-preserved-content' -ArgList @('--json', 'show', $httpId) -DataDir $DirA
-Assert-Smoke 'model-legacy-switch-back-preserves-content' ($activateLegacy.Ok -and [string]$activateLegacy.Envelope.summary.model -eq 'legacy' -and $legacyIndexedNumber -and $legacyIndexed -ge 0 -and $legacyRecall.Ok -and [string]$legacyRecall.Envelope.summary.embedding_model -eq 'legacy' -and $legacyMarkerHits.Count -gt 0 -and $legacyContent.Ok -and [string]$legacyContent.Envelope.details.entry.id -eq $httpId -and [string]$legacyContent.Envelope.details.entry.content -ceq $httpMarker)
+Assert-Smoke 'model-m3-index-and-recall' ($activateM3.Ok -and [string]$activateM3.Envelope.summary.model -eq 'm3' -and [int]$activateM3.Envelope.summary.indexed -ge 0 -and $m3Recall.Ok -and [string]$m3Recall.Envelope.summary.embedding_model -eq 'm3' -and $m3MarkerHits.Count -gt 0)
+$activateLegacy = Invoke-Om -Name 'model-activate-legacy-rejected' -ArgList @('--json', 'model', 'activate', 'legacy') -DataDir $DirA -ExpectExit @(2) -Raw
+$m3AfterReject = Invoke-Om -Name 'model-m3-recall-after-retired-request' -ArgList @('--json', 'recall', $marker, '--limit', '5') -DataDir $DirA -TimeoutSec 300
+$preservedContent = Invoke-Om -Name 'model-show-preserved-content' -ArgList @('--json', 'show', $httpId) -DataDir $DirA
+Assert-Smoke 'model-retired-request-preserves-content' ($activateLegacy.Ok -and $m3AfterReject.Ok -and [string]$m3AfterReject.Envelope.summary.embedding_model -eq 'm3' -and $preservedContent.Ok -and [string]$preservedContent.Envelope.details.entry.content -ceq $httpMarker)
 $revealed = Invoke-Om -Name 'secret-reveal-isolated' -ArgList @('--json', 'secret', '--reveal') -DataDir $DirA -Secret -AllowStatus @('warn')
 Assert-Smoke 'secret-reveal-current-recovery-code' ($revealed.Ok -and [string]$revealed.Envelope.details.secret -eq $newSuper)
 Invoke-Om -Name 'model-reset-cpu' -ArgList @('--json', 'model', 'reset-cpu') -DataDir $DirA -HostProfile | Out-Null
@@ -1620,10 +1687,10 @@ $resetEngine = Invoke-Om -Name 'model-reset-cpu-readback' -ArgList @('--json', '
 Assert-Smoke 'model-reset-cpu-engine' ($resetEngine.Ok -and [string]$resetEngine.Envelope.summary.engine -eq 'cpu')
 Invoke-Om -Name 'runtime-stop' -ArgList @('--json', '--runtime-internal', '--stop') -DataDir $DirA -ExpectExit @(0, 2) -Raw | Out-Null
 Stop-OurRuntimes
-$uninstallRerank = Invoke-Om -Name 'model-uninstall-rerank' -ArgList @('--direct', '--json', 'model', 'uninstall-rerank') -DataDir $DirA
-Assert-Smoke 'model-rerank-removed' ($uninstallRerank.Ok -and $uninstallRerank.Envelope.summary.removed -eq $true -and -not (Test-Path -LiteralPath (Join-Path $Root 'models/bge-reranker-base')))
-$uninstallBge = Invoke-Om -Name 'model-uninstall-bge' -ArgList @('--direct', '--json', 'model', 'uninstall-bge') -DataDir $DirA
-Assert-Smoke 'model-bge-removed' ($uninstallBge.Ok -and $uninstallBge.Envelope.summary.removed -eq $true -and -not (Test-Path -LiteralPath (Join-Path $Root 'models/bge-base-zh-v1.5')))
+$uninstallRerank = Invoke-Om -Name 'model-uninstall-rerank-rejected' -ArgList @('--direct', '--json', 'model', 'uninstall-rerank') -DataDir $DirA -ExpectExit @(2) -Raw
+Assert-Smoke 'model-rerank-command-rejected' ($uninstallRerank.Ok)
+$uninstallBge = Invoke-Om -Name 'model-uninstall' -ArgList @('--direct', '--json', 'model', 'uninstall') -DataDir $DirA
+Assert-Smoke 'model-bge-removed' ($uninstallBge.Ok -and $uninstallBge.Envelope.summary.removed -eq $true -and -not (Test-Path -LiteralPath (Join-Path $Root 'models/bge-m3')))
 foreach ($required in $script:Catalog.required_assertions) {
     if (-not @($Rows | Where-Object { $_.Name -ceq $required -and $_.Ok -and $_.Status -ceq 'ok' }).Count) {
         Add-SweepRow "missing-required-$required" $false 'required positive assertion was not observed'

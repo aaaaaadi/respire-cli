@@ -13,6 +13,7 @@ import platform
 import re
 import secrets
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -23,7 +24,7 @@ import threading
 
 
 REQUIRED = json.loads(Path(__file__).with_name('dev-runtime-required.json').read_text(encoding='utf-8'))['required_cases']
-DEV = 'https://dev.rsrs.rs'
+DEV = 'https://api.dev.rsrs.rs'
 DASH = 'https://dash.rsrs.rs'
 
 
@@ -139,10 +140,10 @@ class Smoke:
         while time.monotonic() < deadline:
             require(self.child.poll() is None, 'owned_runtime_exited_before_ready')
             token_path = self.root / 'runtime' / 'token'
-            if token_path.is_file():
-                self.token = token_path.read_text(encoding='utf-8').strip()
+            require(not token_path.exists(), 'loopback_runtime_created_token')
+            if (self.root / 'runtime' / 'endpoint.json').is_file():
                 try:
-                    code, health, _ = self.http(self.url, 'GET', '/api/health', token=self.token)
+                    code, health, _ = self.http(self.url, 'GET', '/api/health')
                 except Failure:
                     time.sleep(0.1)
                     continue
@@ -179,18 +180,18 @@ class Smoke:
         self.env.update(HOME=str(self.root / 'home'), USERPROFILE=str(self.root / 'home'),
                         XDG_CONFIG_HOME=str(self.root / 'config'), XDG_DATA_HOME=str(self.root / 'data'),
                         XDG_CACHE_HOME=str(self.root / 'cache'), XDG_RUNTIME_DIR=str(self.root / 'runtime'),
-                        TMPDIR=str(self.root / 'tmp'), ONEMEMORY_DATA_DIR=str(self.root),
-                        ONEMEMORY_BIN_DIR=str(self.root / 'bin'), ONEMEMORY_ENGINE='cpu',
-                        ONEMEMORY_LANG='en', ONEMEMORY_NO_AUTOSYNC='1', ONEMEMORY_UPDATE_CHECK='0',
-                        ONEMEMORY_MODEL_DIR=str(self.root / 'models/bge-base-zh-v1.5'),
-                        ONEMEMORY_RERANKER_DIR=str(self.root / 'models/bge-reranker-base'))
+                        TMPDIR=str(self.root / 'tmp'), RSRS_DATA_DIR=str(self.root),
+                        RSRS_BIN_DIR=str(self.root / 'bin'), RSRS_ENGINE='cpu',
+                        RSRS_LANG='en', RSRS_NO_AUTOSYNC='1', RSRS_UPDATE_CHECK='0',
+                        RSRS_M3_DIR=str(self.root / 'models/bge-m3'),
+                        )
         for key in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'):
             self.env.pop(key, None)
         with socket.socket() as port:
             port.bind(('127.0.0.1', 0))
             self.port = port.getsockname()[1]
         self.url = 'http://127.0.0.1:' + str(self.port)
-        self.env['ONEMEMORY_RPC_PORT'] = str(self.port)
+        self.env['RSRS_RPC_PORT'] = str(self.port)
         value = self.direct(['-v'])
         require(value.get('summary', {}).get('version') == self.args.version, 'exact_version_mismatch')
         self.passed('artifact_identity_verified')
@@ -234,13 +235,13 @@ class Smoke:
         old = client_home / '.onememory'
         old.mkdir(parents=True, mode=0o700)
         marker = old / 'client.json'
-        marker.write_text('{"addr":"https://dev.rsrs.rs"}\n', encoding='utf-8')
+        marker.write_text('{"addr":"https://api.dev.rsrs.rs"}\n', encoding='utf-8')
         before = {str(path.relative_to(client_home)): hashlib.sha256(path.read_bytes()).hexdigest()
                   for path in client_home.rglob('*') if path.is_file()}
         client_env = dict(self.env, HOME=str(client_home), USERPROFILE=str(client_home),
-                          ONEMEMORY_CLIENT_ONLY='1')
-        client_env.pop('ONEMEMORY_DATA_DIR', None)
-        client_env.pop('RESPIRE_DEFAULT_DATA_DIR', None)
+                          RSRS_CLIENT_ONLY='1')
+        client_env.pop('RSRS_DATA_DIR', None)
+        client_env.pop('RSRS_DEFAULT_DATA_DIR', None)
         result = subprocess.run([str(self.args.binary), '--client-only', '--json', 'status'],
                                 env=client_env, cwd=self.root, capture_output=True, timeout=25)
         after = {str(path.relative_to(client_home)): hashlib.sha256(path.read_bytes()).hexdigest()
@@ -250,11 +251,11 @@ class Smoke:
         self.passed('client_only_no_profile_writes')
 
     def account(self):
-        expected = os.environ.get('RESPIRE_DEV_SERVER_SHA', '')
-        require(os.environ.get('RESPIRE_DEV_SERVER_ADDR') == DEV and re.fullmatch('[0-9a-f]{40}', expected),
+        expected = os.environ.get('RSRS_DEV_SERVER_SHA', '')
+        require(os.environ.get('RSRS_DEV_SERVER_ADDR') == DEV and re.fullmatch('[0-9a-f]{40}', expected),
                 'exact_development_server_required')
-        code, ready, headers = self.http(DEV, 'GET', '/ready')
-        require(code == 200 and headers.get('X-Respire-Server-SHA', '') == expected,
+        code, health, _ = self.http(DEV, 'GET', '/health')
+        require(code == 200 and isinstance(health, dict) and health.get('source_revision') == expected,
                 'development_server_revision_mismatch')
         self.report['server_sha'] = expected
         self.direct(['config', '--data-dir', str(self.library), '--addr', DEV, '--autosync', 'false', '--cure-auto', 'false'])
@@ -262,9 +263,9 @@ class Smoke:
         require(Path(config.get('data_dir', '')).resolve() == self.library and config.get('addr') == DEV,
                 'data_dir_configuration_failed')
         self.passed('data_dir_persisted')
-        self.direct(['model', 'install-bge'], timeout=1200)
-        probe = self.direct(['model', 'probe', '--model', 'legacy'], timeout=180)['summary']
-        require(probe.get('ready') is True and probe.get('dimensions') == 768
+        self.direct(['model', 'install-m3'], timeout=1200)
+        probe = self.direct(['model', 'probe', '--model', 'm3'], timeout=180)['summary']
+        require(probe.get('ready') is True and probe.get('dimensions') == 1024
                 and str(probe.get('selected', '')).lower() == 'cpu', 'real_bge_cpu_probe_failed')
         self.attempted = True
         registered = self.direct(['register', '--user', self.user, '--pass=' + self.password, '--addr', DEV])
@@ -276,9 +277,13 @@ class Smoke:
         status = self.direct(['--runtime-internal', '--status'])['summary']
         require(status.get('state') == 'up' and status.get('pid') == self.child.pid, 'hidden_status_identity_failed')
         self.passed('hidden_runtime_status_up')
-        for token, name in ((None, 'runtime_token_required'), ('ci-invalid-token', 'runtime_wrong_token_rejected')):
+        for token, name in ((None, 'runtime_loopback_without_token'), ('ci-invalid-token', 'runtime_loopback_ignores_token')):
             code, value, _ = self.http(self.url, 'GET', '/api/health', token=token)
-            require(code == 401 and isinstance(value.get('error'), str), 'runtime_auth_not_rejected')
+            require(code == 200 and value.get('v') == 1 and value.get('bin') == self.args.version
+                    and value.get('pid') == self.child.pid
+                    and Path(value.get('exe', '')).resolve() == self.args.binary
+                    and Path(value.get('data_dir', '')).resolve() == self.library
+                    and not (self.root / 'runtime' / 'token').exists(), 'runtime_loopback_health_identity_failed')
             self.passed(name)
         code, value, _ = self.http(self.url, 'POST', '/api/rpc', {}, self.token, {'Origin': 'https://example.invalid'})
         require(code == 403 and value.get('error') == 'forbidden origin', 'runtime_foreign_origin_not_rejected')
@@ -323,8 +328,10 @@ class Smoke:
         require(self.rpc(['show', memory_id])['details'].get('entry', {}).get('id') == memory_id, 'readonly_read_failed')
         self.rpc(['agent-config', '--set', 'readonly=false'])
         self.rpc(['agent-config', '--set', 'memory_off=true'])
-        rejected = self.rpc(['show', memory_id], expected=1)
-        require('temporarily off' in ' '.join(rejected.get('errors', [])), 'off_read_guard_missing')
+        skipped = self.rpc(['show', memory_id])
+        require(skipped.get('summary') == {'mode': 'off', 'skipped': True, 'count': 0}
+                and skipped.get('items') == [] and skipped.get('details') == []
+                and skipped.get('errors') == [], 'off_read_empty_response_missing')
         self.rpc(['agent-config', '--set', 'memory_off=false'])
         normal = self.rpc(['agent-config'])['summary']
         require(normal.get('readonly') is False and normal.get('memory_off') is False, 'normal_mode_not_restored')
@@ -336,12 +343,25 @@ class Smoke:
                 and self.rpc(['show', memory_id])['details']['entry']['content'] == 'Runtime fixture persisted memory.',
                 'stored_session_not_resumed')
         self.passed('resume_session_real', method='fresh_runtime_reuses_owned_session_and_keyring_no_password_input')
+        # Remember persists before deriving its index. Exercise recall and wait
+        # for the owned worker before stopping it for strict offline diagnosis.
+        require(self.rpc(['recall', 'Runtime fixture persisted memory.', '--titles']).get('items'),
+                'resumed_pending_source_not_recalled')
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            code, health, _ = self.http(self.url, 'GET', '/api/health', token=self.token)
+            require(code == 200, 'owned_index_health_unavailable')
+            index = health.get('retrieval_index', {})
+            require(index.get('state') != 'failed', 'owned_index_preparation_failed')
+            if index.get('state') == 'ready' and not index.get('running') and not index.get('scheduled'):
+                break
+            time.sleep(.1)
+        else:
+            raise Failure('owned_index_not_ready_before_offline_doctor')
         self.stop()
-        install = self.direct(['model', 'install-rerank'], timeout=1200)['summary']
-        folder = Path(install.get('dir', '')).resolve()
-        require(folder == self.root / 'models/bge-reranker-base'
-                and (folder / 'onnx/model_quantized.onnx').stat().st_size > 1024 * 1024
-                and (folder / 'tokenizer.json').is_file(), 'owned_rerank_model_not_real')
+        retired = subprocess.run([str(self.args.binary), '--direct', '--json', 'model', 'install-rerank'], env=self.env,
+                                 cwd=self.root, capture_output=True, text=True, timeout=30)
+        require(retired.returncode == 2, 'retired_reranker_command_was_accepted')
         agent_file = self.root / 'home/.codex/AGENTS.md'
         agent_file.parent.mkdir()
         original = '# Disposable runtime fixture\nKeep this text.\n'
@@ -360,8 +380,8 @@ class Smoke:
             diagnostic = None
         if isinstance(diagnostic, dict) and isinstance(diagnostic.get('items'), list):
             names = {'store', 'data dir', 'mcp bin', 'mcp http', 'session', 'embedder',
-                     'reranker', 'lock', 'remote', 'inject', 'memory status',
-                     'tidy counter', 'CLI version'}
+                     'lock', 'remote', 'inject', 'memory status',
+                     'tidy counter', 'CLI version', 'Runtime version', 'model index'}
             statuses = {'ok', 'warn', 'fail', 'skip', 'pending'}
             self.report['doctor']['items'] = [
                 {'name': item['name'], 'status': item['status']}
@@ -370,14 +390,14 @@ class Smoke:
                 and item['name'] in names and isinstance(item.get('status'), str)
                 and item['status'] in statuses
             ]
-        require(result.returncode in (0, 2), 'rerank_doctor_execution_failed')
+        require(result.returncode in (0, 2), 'm3_doctor_execution_failed')
         require(isinstance(diagnostic, dict) and isinstance(diagnostic.get('items'), list),
                 'doctor_envelope_invalid')
         require(any(item.get('name') == 'inject' and item.get('status') == 'ok'
                     for item in diagnostic.get('items', [])), 'owned_agent_doctor_not_fresh')
-        require(any(item.get('name') == 'reranker' and item.get('status') == 'ok'
-                    for item in diagnostic.get('items', [])), 'rerank_doctor_status_not_ready')
-        self.passed('rerank_status_real', model_sha256=hashlib.sha256((folder / 'onnx/model_quantized.onnx').read_bytes()).hexdigest())
+        require(not any(item.get('name') == 'reranker' for item in diagnostic.get('items', [])), 'retired_reranker_doctor_entry_present')
+        require(any(item.get('name') == 'embedder' and item.get('status') == 'ok' for item in diagnostic.get('items', [])), 'm3_doctor_not_ready')
+        self.passed('m3_status_real', retired_command_exit=retired.returncode)
         self.direct(['classify-config', '--set', '--backend', 'jev'])
         require(self.direct(['classify-config'])['summary'].get('backend') == 'jev', 'backend_not_persisted')
         self.passed('classify_config_persisted')
@@ -436,6 +456,248 @@ class Smoke:
         self.report['cloud_cleanup'] = {'passed': self.cloud_clean,
                                         'remaining_users': [] if self.cloud_clean else [self.user] if self.attempted else []}
 
+    def doctor_model_recovery(self):
+        """Exercise a real failed download and retry against the exact artifact."""
+        require(self.child is None, 'doctor_fixture_requires_stopped_runtime')
+        model = Path(self.env['RSRS_M3_DIR'])
+        cache = self.root / 'doctor-model-cache'
+        model.rename(cache)
+        database = self.library / 'rsrs.db'
+
+        def snapshot():
+            with sqlite3.connect(database) as db:
+                return (db.execute('SELECT id,user,ciphertext,nonce,dirty,deleted,created_at,updated_at FROM memories ORDER BY id').fetchall(),
+                        db.execute('SELECT * FROM sync_outbox ORDER BY seq').fetchall())
+
+        before = snapshot()
+        session = (self.library / 'session.json').read_bytes()
+        with sqlite3.connect(database) as db:
+            db.execute('DELETE FROM core_artifacts')
+            db.commit()
+        allowed, started, release = threading.Event(), threading.Event(), threading.Event()
+        requests = []
+        prefix = '/Xenova/bge-m3/resolve/4de13258303883538bd53b696b452bf8099f0858/'
+
+        class ModelSource(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                if not allowed.is_set():
+                    self.send_response(503)
+                    self.end_headers()
+                    return
+                name = self.path.removeprefix(prefix)
+                if not self.path.startswith(prefix) or name not in ('tokenizer.json', 'onnx/model_quantized.onnx'):
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                requests.append((name, self.headers.get('Range')))
+                path = cache / name
+                self.send_response(200)
+                self.send_header('Content-Length', str(path.stat().st_size))
+                self.end_headers()
+                try:
+                    with path.open('rb') as stream:
+                        first = True
+                        while chunk := stream.read(256 * 1024):
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                            if first and name.startswith('onnx/') and self.headers.get('Range') is None:
+                                started.set()
+                                if not release.wait(45):
+                                    return
+                            first = False
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), ModelSource)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        previous_mirror = self.env.get('RSRS_MIRROR')
+        self.env['RSRS_MIRROR'] = 'http://127.0.0.1:' + str(server.server_port)
+
+        def doctor(fix=False):
+            code, reply, _ = self.http(self.url, 'POST', '/api/rpc',
+                {'v': 1, 'id': secrets.token_hex(8), 'method': 'cli.exec',
+                 'args': ['--json', 'doctor', *(['--fix'] if fix else [])]}, self.token)
+            envelope = reply.get('envelope', {})
+            require(code == 200 and envelope.get('command') == 'doctor'
+                    and reply.get('exit') in (0, 1, 2), 'doctor_repair_envelope_invalid')
+            rows = {row['name']: row for row in envelope.get('items', [])
+                    if row.get('name') in ('embedder', 'model index')}
+            require(len(rows) == 2, 'doctor_model_rows_missing')
+            return rows
+
+        def wait_index(want, seconds=90):
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                if want == 'ready':
+                    # Exercise the existing repair while TUI-style reads continue.
+                    # These reads must not restart model verification or indexing.
+                    for command in (['account', 'list'], ['config'], ['agent-config']):
+                        self.rpc(command)
+                index = self.rpc(['status'])['summary']['retrieval_index']
+                if index.get('state') == want:
+                    return index
+                time.sleep(.2)
+            raise Failure('doctor_index_' + want + '_timeout')
+
+        try:
+            self.start()
+            wait_index('failed')
+            failed = doctor()
+            require(all(row['status'] == 'fail' for row in failed.values())
+                    and '503' in str(failed['model index'].get('value')), 'doctor_download_error_hidden')
+            self.passed('doctor_model_failed_download_visible', http_status=503)
+            allowed.set()
+            scheduled = doctor(True)
+            require(all(row['status'] == 'warn' for row in scheduled.values()), 'doctor_retry_not_scheduled')
+            require(started.wait(45), 'doctor_retry_did_not_download')
+            self.passed('doctor_model_failed_download_retry')
+            busy = doctor(True)
+            # This source ignores Range: one support probe precedes one full
+            # transfer. Block only the transfer, and reject additional requests.
+            model_requests = [range_header for name, range_header in requests
+                              if name == 'onnx/model_quantized.onnx']
+            require(all(row['status'] == 'warn' for row in busy.values())
+                    and model_requests == ['bytes=0-0', None], 'doctor_competing_installer_started')
+            self.passed('doctor_model_active_download_no_duplicate', model_downloads=1, range_probes=1)
+            release.set()
+            wait_index('ready', 240)
+            ready = doctor()
+            require(all(row['status'] == 'ok' for row in ready.values()), 'doctor_ready_model_not_pass')
+            self.passed('doctor_model_repair_ready')
+            require(snapshot() == before and (self.library / 'session.json').read_bytes() == session,
+                    'doctor_repair_changed_source_or_session')
+            self.passed('doctor_model_repair_preserves_source')
+        finally:
+            release.set()
+            try:
+                self.stop()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+                if previous_mirror is None:
+                    self.env.pop('RSRS_MIRROR', None)
+                else:
+                    self.env['RSRS_MIRROR'] = previous_mirror
+
+
+    def validation_errors(self):
+        entry = self.direct(['remember', 'Owned validation fixture.', '--title', 'Validation leaf',
+                             '--force', '--importance', 'important'])['summary']['id']
+        commands = [
+            ['resort', '--spec', '{"ops":[{"id":"aaaaaaaa","parent":"aaaaaaaa"}]}'],
+            ['resort', '--spec', '{'], ['resort', '--spec', '{"ops":[]}'],
+            ['split', entry, '--go', '--spec', '{"items":[]}'],
+            ['split', entry, '--go', '--spec', '{'], ['tree-deepen', '--root', entry],
+        ]
+        for command in commands:
+            result = subprocess.run([str(self.args.binary), '--direct', *command, '--json'],
+                                    env=self.env, cwd=self.root, capture_output=True, text=True, timeout=90)
+            require(result.returncode == 2, 'direct_validation_exit_not_user_error')
+            value = json.loads(result.stdout.strip())
+            require(value.get('status') == 'fail', 'direct_validation_status_not_fail')
+            require(value['summary'].get('reason') == 'invalid_input'
+                    and value['details'].get('error_type') == 'user', 'direct_validation_error_not_typed')
+        self.start()
+        try:
+            for command in commands:
+                value = self.rpc(command, expected=2)
+                require(value['summary'].get('reason') == 'invalid_input'
+                        and value['details'].get('error_type') == 'user', 'rpc_validation_error_not_typed')
+        finally:
+            self.stop()
+        self.passed('runtime_validation_errors_typed', direct_cases=len(commands), rpc_cases=len(commands))
+
+    def host_space_commands(self):
+        home = self.root / 'space-command-home'
+        library = home / '.rsrs'
+        library.mkdir(parents=True)
+        config = library / 'client.json'
+        config.write_text(json.dumps({'data_dir': str(library), 'api_base': 'https://fixture.invalid',
+                                      'custom': 'preserve'}), encoding='utf-8')
+        env = self.env.copy()
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            port = listener.getsockname()[1]
+        url = 'http://127.0.0.1:' + str(port)
+        env.update(HOME=str(home), USERPROFILE=str(home), RSRS_DATA_DIR=str(library),
+                   RSRS_RPC_PORT=str(port), XDG_RUNTIME_DIR=str(home / 'runtime'))
+        def cli(args, expected=0):
+            result = subprocess.run([str(self.args.binary), '--json', *args], env=env, cwd=home,
+                                    capture_output=True, text=True, timeout=90)
+            require(result.returncode == expected, 'space_host_cli_exit_mismatch')
+            value = json.loads(result.stdout.strip())
+            require(value['status'] == ('ok' if expected == 0 else 'fail'), 'space_host_cli_status_mismatch')
+            return value
+        def health(profile):
+            code, actual, _ = self.http(url, 'GET', '/api/health')
+            require(code == 200 and actual['bin'] == self.args.version
+                    and hashlib.sha256(Path(actual['exe']).read_bytes()).hexdigest() == self.args.binary_sha256
+                    and Path(actual['data_dir']).resolve() == profile.resolve(), 'space_host_runtime_readback_failed')
+            return actual['pid']
+        try:
+            cli(['space', 'list'])
+            old_pid = health(library)
+            cli(['space', 'create', 'probe'])
+            probe = library / 'accounts/probe'
+            require(probe.joinpath('space_owner.json').is_file() and health(probe) != old_pid,
+                    'space_create_did_not_take_over_runtime')
+            before = config.read_bytes()
+            denied = cli(['space', 'remove', 'probe'], 2)
+            require(denied['summary']['reason'] == 'invalid_input' and config.read_bytes() == before,
+                    'space_remove_without_confirmation_changed_profile')
+            cli(['space', 'remove', 'probe', '--yes'], 2)
+            require(probe.is_dir(), 'space_removed_active_profile')
+            health(probe)
+            cli(['space', 'use', 'main'])
+            health(library)
+            before = config.read_bytes()
+            cli(['space', 'use', 'missing'], 2)
+            require(config.read_bytes() == before, 'space_failed_switch_changed_configuration')
+            health(library)
+            cli(['space', 'remove', 'probe', '--yes'])
+            require(not probe.exists(), 'space_remove_did_not_remove_profile')
+            health(library)
+            preserved = json.loads(config.read_text(encoding='utf-8'))
+            require(preserved['api_base'] == 'https://fixture.invalid' and preserved['custom'] == 'preserve',
+                    'space_host_command_lost_configuration')
+        finally:
+            cli(['--runtime-internal', '--stop'])
+        with socket.socket() as listener:
+            listener.settimeout(2)
+            require(listener.connect_ex(('127.0.0.1', port)) != 0, 'space_fixture_runtime_not_closed')
+        self.passed('host_space_lifecycle', runtime_cleanup=True, configuration_preserved=True)
+
+    def update_check_comparisons(self):
+        previous = self.env.get('RSRS_UPDATE_CHECK')
+        self.env['RSRS_UPDATE_CHECK'] = '1'
+        cache = self.library / 'update_check.json'
+        try:
+            for latest, ahead, outdated in [('0.0.1', True, False), (self.args.version, False, False),
+                                             ('99.0.0', False, True)]:
+                cache.write_text(json.dumps({'checked_at': int(time.time()), 'latest': latest, 'ok': True}),
+                                 encoding='utf-8')
+                result = subprocess.run([str(self.args.binary), '--direct', '--json', 'update-check'],
+                                        env=self.env, cwd=self.root, capture_output=True, text=True, timeout=30)
+                require(result.returncode == (2 if outdated else 0), 'update_check_exit_mismatch')
+                value = json.loads(result.stdout.strip())
+                require(value['summary'].get('ahead') is ahead and value['summary'].get('outdated') is outdated
+                        and value['summary'].get('cached') is True, 'update_comparison_state_wrong')
+                display = value['items'][0]['value']
+                require((' -> ' in display) is outdated and ('ahead of published latest' in display) is ahead
+                        and bool(value['actions']) is outdated, 'update_comparison_offers_downgrade')
+        finally:
+            cache.unlink(missing_ok=True)
+            if previous is None:
+                self.env.pop('RSRS_UPDATE_CHECK', None)
+            else:
+                self.env['RSRS_UPDATE_CHECK'] = previous
+        self.passed('update_check_comparison', states=3)
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -458,6 +720,10 @@ def main():
         smoke.account()
         smoke.transport()
         smoke.settings()
+        smoke.doctor_model_recovery()
+        smoke.validation_errors()
+        smoke.host_space_commands()
+        smoke.update_check_comparisons()
     except Exception as error:
         smoke.report['failure_code'] = str(error) if isinstance(error, Failure) else type(error).__name__
     finally:

@@ -1,0 +1,163 @@
+name: Native release regression
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native (${{ matrix.target }})
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            rustflags: -C target-feature=-crt-static
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare ephemeral build version
+        run: node npm/scripts/set-build-version.mjs ${{ inputs.version }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: cli-release-${{ matrix.target }}
+          path: validated-cli
+      - name: Verify and extract the release binary
+        env:
+          CLI_TARGET: ${{ matrix.target }}
+          CLI_SHA: ${{ inputs.ref }}
+          CLI_VERSION: ${{ inputs.version }}
+        run: node npm/scripts/extract-artifact.mjs validated-cli target/ci/${{ matrix.target }}/release
+      - uses: actions/cache@v4
+        if: runner.os == 'macOS'
+        with:
+          path: ${{ runner.temp }}/release-probe/models/bge-m3
+          key: release-m3-quantized-0826f8c1-macos
+      - name: Install and probe BGE CPU inference
+        shell: bash
+        env:
+          RSRS_ENGINE: cpu
+          RSRS_DATA_DIR: ${{ runner.temp }}/release-probe
+          RSRS_M3_DIR: ${{ runner.temp }}/release-probe/models/bge-m3
+          RSRS_NO_AUTOSYNC: '1'
+          RSRS_UPDATE_CHECK: '0'
+        run: |
+          set -euo pipefail
+          exe=target/ci/${{ matrix.target }}/release/rsrs
+          if [ "$RUNNER_OS" = Windows ]; then exe="$exe.exe"; fi
+          "$exe" --version
+          "$exe" --direct model install-m3 --json
+          "$exe" --direct model probe --json
+      - name: Require every published stable upgrade and the 1.0.6 baseline
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/upgrade-python"
+          py="$RUNNER_TEMP/upgrade-python/bin/python"
+          exe="target/ci/${{ matrix.target }}/release/rsrs"
+          if [ "$RUNNER_OS" = Windows ]; then
+            py="$RUNNER_TEMP/upgrade-python/Scripts/python.exe"
+            exe="$exe.exe"
+          fi
+          "$py" -m pip install --only-binary=:all: cryptography==46.0.3
+          if [ "$RUNNER_OS" = Windows ]; then
+            # PyPI 7.2.2 predates the fixed Windows handle-query implementation.
+            # Build the exact upstream fix, not a moving branch or local patch.
+            "$py" -m pip install --no-deps 'psutil @ https://github.com/giampaolo/psutil/archive/078f2f08d2ccea916a42f9571ab8bd40d958e7a1.tar.gz#sha256=8073a6389894b1ea3edc4f0feb47dba742b5552eab93f28ba6f45d2b19f11e4b'
+          else
+            "$py" -m pip install --only-binary=:all: psutil==7.1.0
+          fi
+          # Only the real historical baseline uses FP16; the candidate uses quantized.
+          mkdir -p native-legacy-model/onnx
+          cp "$RUNNER_TEMP/release-probe/models/bge-m3/tokenizer.json" native-legacy-model/tokenizer.json
+          cp "$RUNNER_TEMP/release-probe/models/bge-m3/onnx/model_quantized.onnx" native-legacy-model/onnx/model_quantized.onnx
+          curl --fail --location --retry 1 --connect-timeout 20 --max-time 1200 \
+            'https://huggingface.co/Xenova/bge-m3/resolve/4de13258303883538bd53b696b452bf8099f0858/onnx/model_fp16.onnx' \
+            --output native-legacy-model/onnx/model_fp16.onnx
+          "$py" scripts/test-published-upgrades.py --binary "$exe" --target '${{ matrix.target }}' \
+            --model-dir "$RUNNER_TEMP/release-probe/models/bge-m3" \
+            --legacy-model-dir native-legacy-model \
+            --output-dir "$RUNNER_TEMP/published-upgrades"
+      - name: Verify resident foreground and background inference under concurrent CLI load
+        shell: bash
+        run: |
+          set -euo pipefail
+          py="$RUNNER_TEMP/upgrade-python/bin/python"
+          exe="target/ci/${{ matrix.target }}/release/rsrs"
+          if [ "$RUNNER_OS" = Windows ]; then
+            py="$RUNNER_TEMP/upgrade-python/Scripts/python.exe"
+            exe="$exe.exe"
+          fi
+          "$py" scripts/test-native-fixture-process.py --output-dir "$RUNNER_TEMP/native-fixture-bounds"
+          "$py" scripts/test-real-m3-account-switch.py --binary "$exe" \
+            --model-dir "$RUNNER_TEMP/release-probe/models/bge-m3" \
+            --output-dir "$RUNNER_TEMP/resident-concurrency" --expect-supervised-worker --resident-stress
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          retention-days: 1
+          name: resident-concurrency-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/resident-concurrency/real-account-return-verification.json
+            ${{ runner.temp }}/resident-concurrency/resident-stress-metrics.json
+            ${{ runner.temp }}/resident-concurrency/fixture-dependencies.json
+            ${{ runner.temp }}/resident-concurrency/**/boundary-inspector/inspector.log
+            ${{ runner.temp }}/resident-concurrency/**/boundary-inspector/inspection-failure.json
+            ${{ runner.temp }}/native-fixture-bounds/fixture-process-verification.json
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          retention-days: 1
+          name: published-upgrades-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/published-upgrades/published-upgrades.json
+            ${{ runner.temp }}/published-upgrades/**/results/real-account-return-verification.json
+          if-no-files-found: error
+      - name: Verify GNU login interruption recovery with this release binary
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/login-regression-python"
+          "$RUNNER_TEMP/login-regression-python/bin/pip" install --only-binary=:all: cryptography==46.0.3
+          binary="$(realpath target/ci/${{ matrix.target }}/release/rsrs)"
+          checksum="$(sha256sum "$binary" | cut -d ' ' -f 1)"
+          "$RUNNER_TEMP/login-regression-python/bin/python" scripts/dev-login-interruption-smoke.py --binary "$binary" --binary-sha256 "$checksum" --version '${{ inputs.version }}' --source-sha '${{ inputs.ref }}' --root "$RUNNER_TEMP/gnu-login-interruption" --model-dir "$RUNNER_TEMP/release-probe/models/bge-m3"
+      - uses: actions/upload-artifact@v4
+        if: always() && matrix.target == 'x86_64-unknown-linux-gnu'
+        with:
+          retention-days: 1
+          name: gnu-login-interruption
+          path: ${{ runner.temp }}/gnu-login-interruption/interruption-coverage.json
+          if-no-files-found: error

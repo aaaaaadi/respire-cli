@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -24,8 +25,8 @@ REQUIRED = (
     "tree_deepen_auto_applied", "tree_cure_auto_applied",
 )
 MODEL_HASHES = {
-    "onnx/model.onnx": "5e5619f7cca7380b824d329c157dba10bee7cc00d0c139e82fdb7906051b8e4f",
-    "tokenizer.json": "7dfbf1966ebf99d471c3796e9b457329d2b2182b817e144f1e904b957745c839",
+    "onnx/model_quantized.onnx": "0826f8c1ab9edf1801db86c61919d4d108e8bfc0b809ec823ad366882ff0b77d",
+    "tokenizer.json": "6710678b12670bc442b99edc952c4d996ae309a7020c1fa0096dd245c2faf790",
 }
 
 
@@ -120,10 +121,10 @@ class Smoke:
     def __init__(self, args):
         self.args = args
         self.root = args.root
-        self.model = args.model_dir or self.root / "data/models/bge-base-zh-v1.5"
+        self.model = args.model_dir or self.root / "data/models/bge-m3"
         require(self.model.is_relative_to(self.root) and not self.model.exists(), "model_directory_not_fresh")
         self.env = {k: v for k, v in os.environ.items()
-            if not k.startswith(("ONEMEMORY_", "RESPIRE_", "XDG_", "DS_", "JEV_"))
+            if not k.startswith(("RSRS_", "ONEMEMORY_", "RESPIRE_", "XDG_", "DS_", "JEV_"))
             and not k.endswith(("_TOKEN", "_API_KEY"))
             and "TEST_MODE" not in k
             and k not in ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "DBUS_SESSION_BUS_ADDRESS")}
@@ -133,15 +134,18 @@ class Smoke:
             APPDATA=str(self.root / "config"), LOCALAPPDATA=str(self.root / "data"),
             XDG_CONFIG_HOME=str(self.root / "config"), XDG_DATA_HOME=str(self.root / "data"),
             XDG_CACHE_HOME=str(self.root / "cache"), TMPDIR=str(self.root / "tmp"),
-            ONEMEMORY_DATA_DIR=str(self.root / "library"), ONEMEMORY_BIN_DIR=str(self.root / "bin"),
-            ONEMEMORY_MODEL_DIR=str(self.model), ONEMEMORY_ENGINE="cpu", ONEMEMORY_NO_AUTOSYNC="1",
+            RSRS_DATA_DIR=str(self.root / "library"), RSRS_BIN_DIR=str(self.root / "bin"),
+            RSRS_M3_DIR=str(self.model), RSRS_ENGINE="cpu", RSRS_NO_AUTOSYNC="1",
             DBUS_SESSION_BUS_ADDRESS="unix:path=" + str(self.root / "tmp/missing-keyring.sock"),
             DS_API_KEY="ci-local-fixture", NO_PROXY="127.0.0.1,localhost")
         for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
             self.env.pop(name, None)
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            self.env['RSRS_RPC_PORT'] = str(listener.getsockname()[1])
         self.report = {"binary_sha256": args.binary_sha256, "source_sha": args.source_sha,
             "workflow_sha": os.environ.get("GITHUB_SHA"),
-            "version": args.version, "target": "https://dev.rsrs.rs", "cases": {},
+            "version": args.version, "target": "https://api.dev.rsrs.rs", "cases": {},
             "provider_scope": "Deterministic local CLI/provider protocol only; no external LLM quality claim.",
             "cloud_cleanup": {"passed": False, "remaining_users": []}}
         self.provider = None
@@ -182,7 +186,7 @@ class Smoke:
 
         def request(method, path, payload=None):
             body = json.dumps(payload).encode() if payload is not None else None
-            req = urllib.request.Request("https://dev.rsrs.rs" + path, body,
+            req = urllib.request.Request("https://api.dev.rsrs.rs" + path, body,
                 {"Authorization": "Bearer " + self.account_token, "Content-Type": "application/json"},
                 method=method)
             try:
@@ -208,7 +212,7 @@ class Smoke:
                 code=str(error) if isinstance(error, RuntimeError) else type(error).__name__)
 
     def rows(self):
-        path = self.root / "library/onememory.db"
+        path = self.root / "library/rsrs.db"
         with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as db:
             return {row[0]: {"title": row[1], "parent": row[2]} for row in db.execute(
                 "SELECT id,title,parent_id FROM memories WHERE deleted=0")}
@@ -354,12 +358,12 @@ class Smoke:
         raw = subprocess.run([str(self.args.binary), "--version"], env=self.env,
             capture_output=True, timeout=20)
         require(raw.returncode == 0 and re.search(r"(?<!\S)" + re.escape(self.args.version) + r"(?!\S)", raw.stdout.decode()), "binary_version_mismatch")
-        self.cli("model", "install-bge", timeout=900)
+        self.cli("model", "install-m3", timeout=900)
         for relative, expected in MODEL_HASHES.items():
             require(digest(self.model / relative) == expected, "model_hash_mismatch")
         self.cli("model", "engine", "cpu")
-        probe = self.cli("model", "probe", "--model", "legacy", "--text", "CPU inference contract fixture")["summary"]
-        require(probe["ready"] and probe["dimensions"] == 768 and str(probe["selected"]).lower() == "cpu", "real_cpu_probe_failed")
+        probe = self.cli("model", "probe", "--model", "m3", "--text", "CPU inference contract fixture")["summary"]
+        require(probe["ready"] and probe["dimensions"] == 1024 and str(probe["selected"]).lower() == "cpu", "real_cpu_probe_failed")
         self.passed("model_cpu_real", dimensions=probe["dimensions"], model_hashes=MODEL_HASHES)
         self.inject()
         username = "ci-ai-" + secrets.token_hex(8)
@@ -367,19 +371,19 @@ class Smoke:
         self.report["cloud_cleanup"]["remaining_users"] = [username]
         self.registration_attempted = True
         self.save()
-        registered = self.cli("register", "--addr", "https://dev.rsrs.rs", "--user", username,
+        registered = self.cli("register", "--addr", "https://api.dev.rsrs.rs", "--user", username,
             "--pass=-" + secrets.token_urlsafe(32), timeout=120)
         require(registered["summary"].get("user") == username and registered["summary"].get("ok") is True,
             "registered_user_identity_mismatch")
         session = json.loads((self.root / "library/session.json").read_text())
-        require(session["addr"].rstrip("/") == "https://dev.rsrs.rs" and session["user"] == username
+        require(session["addr"].rstrip("/") == "https://api.dev.rsrs.rs" and session["user"] == username
             and isinstance(session.get("token"), str) and bool(session["token"]),
             "session_not_dev")
         self.created_user = username
         self.account_token = session["token"]
         super_key = registered["summary"].get("super")
         require(isinstance(super_key, str) and bool(super_key), "registered_super_missing")
-        self.env["ONEMEMORY_SUPER"] = super_key
+        self.env["RSRS_SUPER"] = super_key
         roots = {}
         for name in ("CI causal root", "CI deepen explicit", "CI deepen automatic"):
             self.cli("root-create", name, "--content", "Disposable independent topic collection", "--yes")

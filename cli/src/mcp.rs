@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::rpc;
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
-const TOOL_COUNT: usize = 15;
+const TOOL_COUNT: usize = 16;
 
 /// Incoming HTTP fields for `/mcp` and `/sse`.
 pub struct HttpIn {
@@ -23,10 +23,10 @@ pub struct HttpIn {
     pub body: String,
 }
 
-/// Native daemon directory. Default: `~/.respire/bin` (profile root, not the
-/// current account `data_dir()`). Isolation: `ONEMEMORY_DATA_DIR` / `ONEMEMORY_BIN_DIR`.
+/// Native daemon directory. Default: `~/.rsrs/bin` (profile root, not the
+/// current account `data_dir()`). Isolation: `RSRS_DATA_DIR` / `RSRS_BIN_DIR`.
 pub fn bin_dir() -> PathBuf {
-    if let Ok(raw) = std::env::var("ONEMEMORY_BIN_DIR") {
+    if let Ok(raw) = respire::env::var("RSRS_BIN_DIR") {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
             return PathBuf::from(trimmed);
@@ -54,8 +54,8 @@ pub fn materialize_bin() -> Result<PathBuf, String> {
         return Ok(dest);
     }
     // cargo test binaries live under target/*/deps. Never overwrite the user
-    // ~/.respire/bin with a test harness. Sweep and unit tests isolate data_dir.
-    if std::env::var("ONEMEMORY_BIN_DIR")
+    // ~/.rsrs/bin with a test harness. Sweep and unit tests isolate data_dir.
+    if respire::env::var("RSRS_BIN_DIR")
         .ok()
         .filter(|v| !v.trim().is_empty())
         .is_none()
@@ -122,6 +122,22 @@ fn tools() -> Vec<(&'static str, &'static str, serde_json::Value)> {
             serde_json::json!({"type":"object","properties":{}}),
         ),
         (
+            "memory_extract",
+            "Import local coding-agent sessions (Codex, OpenCode, Claude Code, …) into rsrs memories. Batch write: imports up to `limit` newest sessions per source, seals each, then auto-syncs; pass confirm=true to write, or dry_run=true to preview",
+            serde_json::json!({
+                "type":"object",
+                "properties":{
+                    "id":{"type":"string","description":"One platform (codex/opencode/claude/…); omit for all detected"},
+                    "dry_run":{"type":"boolean","description":"Scan and summarize without writing"},
+                    "limit":{"type":"integer","minimum":0,"description":"Maximum sessions to import per source (newest first)"},
+                    "since":{"type":"string","description":"today|yesterday|7d|YYYY-MM-DD"},
+                    "importance":{"type":"string","enum":["important","trivial"]},
+                    "parent":{"type":"string","description":"Attach imported memories under this parent (id / tree / anchor title)"},
+                    "confirm":{"type":"boolean","description":"Required to write (omit only with dry_run=true)"}
+                }
+            }),
+        ),
+        (
             "memory_remember",
             "Store a memory (judge-then-store; --force writes immediately; merge_ids deletes the listed ids)",
             serde_json::json!({
@@ -133,6 +149,8 @@ fn tools() -> Vec<(&'static str, &'static str, serde_json::Value)> {
                     "parent":{"type":"string","description":"Parent id or catalog title"},
                     "force":{"type":"boolean"},
                     "merge_ids":{"type":"string","description":"Comma-separated ids to merge into this content"},
+                    "supersedes":{"type":"string","description":"Live important memory replaced by this conclusion"},
+                    "see_also":{"type":"array","items":{"type":"string"},"description":"Live important memories to link bidirectionally"},
                     "type":{"type":"string","description":"Memory kind; default context"}
                 },
                 "required":["content"]
@@ -145,7 +163,8 @@ fn tools() -> Vec<(&'static str, &'static str, serde_json::Value)> {
                 "type":"object",
                 "properties":{
                     "query":{"type":"string"},
-                    "limit":{"type":"integer","description":"Default 3"}
+                    "limit":{"type":"integer","description":"Default 20"},
+                    "related":{"type":"boolean","default":true}
                 },
                 "required":["query"]
             }),
@@ -293,6 +312,36 @@ fn tool_argv(name: &str, args: &serde_json::Value) -> Result<Vec<String>, String
     let opt_bool = |key: &str| args.get(key).and_then(|v| v.as_bool());
     match name {
         "memory_status" => Ok(vec!["status".to_owned()]),
+        "memory_extract" => {
+            let dry_run = opt_bool("dry_run") == Some(true);
+            if !dry_run && opt_bool("confirm") != Some(true) {
+                return Err(
+                    "memory_extract writes memories: pass dry_run=true to preview or confirm=true to import"
+                        .to_owned(),
+                );
+            }
+            let mut cmd = vec!["extract".to_owned()];
+            if let Some(id) = opt_str("id") {
+                cmd.extend(["--id".to_owned(), id.to_owned()]);
+            }
+            if opt_bool("dry_run") == Some(true) {
+                cmd.push("--dry-run".to_owned());
+            }
+            if args.get("limit").is_some() {
+                let limit = opt_u64("limit").ok_or("limit must be a non-negative integer")?;
+                cmd.extend(["--limit".to_owned(), limit.to_string()]);
+            }
+            if let Some(since) = opt_str("since") {
+                cmd.extend(["--since".to_owned(), since.to_owned()]);
+            }
+            if let Some(importance) = opt_str("importance") {
+                cmd.extend(["--importance".to_owned(), importance.to_owned()]);
+            }
+            if let Some(parent) = opt_str("parent") {
+                cmd.extend(["--parent".to_owned(), parent.to_owned()]);
+            }
+            Ok(cmd)
+        }
         "memory_remember" => {
             let content = opt_str("content").ok_or("missing content")?;
             let mut cmd = vec!["remember".to_owned(), content.to_owned()];
@@ -311,6 +360,12 @@ fn tool_argv(name: &str, args: &serde_json::Value) -> Result<Vec<String>, String
             if let Some(merge_ids) = opt_str("merge_ids") {
                 cmd.extend(["--merge-ids".to_owned(), merge_ids.to_owned()]);
             }
+            if let Some(id) = opt_str("supersedes") { cmd.extend(["--supersedes".to_owned(),id.to_owned()]); }
+            if let Some(value) = args.get("see_also") {
+                let ids = value.as_array().ok_or("see_also must be an array")?.iter()
+                    .map(|v| v.as_str().ok_or("see_also IDs must be strings")).collect::<Result<Vec<_>,_>>()?;
+                if !ids.is_empty() { cmd.extend(["--see-also".to_owned(),ids.join(",")]); }
+            }
             if opt_bool("force") == Some(true) {
                 cmd.push("--force".to_owned());
             }
@@ -319,6 +374,7 @@ fn tool_argv(name: &str, args: &serde_json::Value) -> Result<Vec<String>, String
         "memory_recall" => {
             let query = opt_str("query").ok_or("missing query")?;
             let mut cmd = vec!["recall".to_owned(), query.to_owned()];
+            if opt_bool("related") == Some(false) { cmd.push("--no-related".to_owned()); }
             if let Some(limit) = opt_u64("limit") {
                 cmd.extend(["--limit".to_owned(), limit.to_string()]);
             }
@@ -714,6 +770,11 @@ mod tests {
         let cases: Vec<(&str, serde_json::Value, &str)> = vec![
             ("memory_status", serde_json::json!({}), "status"),
             (
+                "memory_extract",
+                serde_json::json!({"id":"codex","dry_run":true,"limit":5}),
+                "extract",
+            ),
+            (
                 "memory_remember",
                 serde_json::json!({"content":"c","importance":"important","type":"decision","merge_ids":"a,b"}),
                 "remember",
@@ -783,6 +844,25 @@ mod tests {
         }
         if tool_argv("memory_attach", &serde_json::json!({"id":"c"})).is_ok() {
             return Err("attach without parent should fail".to_owned());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn memory_extract_requires_confirm_and_valid_limit() -> Result<(), String> {
+        if tool_argv("memory_extract", &serde_json::json!({})).is_ok() {
+            return Err("extract without confirm or dry_run should fail".to_owned());
+        }
+        if tool_argv("memory_extract", &serde_json::json!({"confirm":true,"limit":-1})).is_ok() {
+            return Err("a negative extract limit should fail".to_owned());
+        }
+        let write = tool_argv("memory_extract", &serde_json::json!({"confirm":true,"limit":5}))?;
+        if !write.contains(&"--limit".to_owned()) || write.contains(&"--dry-run".to_owned()) {
+            return Err(format!("extract write argv {write:?}"));
+        }
+        let preview = tool_argv("memory_extract", &serde_json::json!({"dry_run":true}))?;
+        if !preview.contains(&"--dry-run".to_owned()) {
+            return Err(format!("extract preview argv {preview:?}"));
         }
         Ok(())
     }
@@ -967,23 +1047,22 @@ mod tests {
 
     #[test]
     fn default_bin_dir_is_under_data_dir() -> Result<(), String> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _lock = LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
-        let prev_data = std::env::var("ONEMEMORY_DATA_DIR").ok();
-        let prev_bin = std::env::var("ONEMEMORY_BIN_DIR").ok();
-        std::env::remove_var("ONEMEMORY_BIN_DIR");
-        std::env::set_var("ONEMEMORY_DATA_DIR", dir.path());
+        let prev_data = respire::env::var("RSRS_DATA_DIR").ok();
+        let prev_bin = respire::env::var("RSRS_BIN_DIR").ok();
+        std::env::remove_var("RSRS_BIN_DIR");
+        std::env::set_var("RSRS_DATA_DIR", dir.path());
         let got = bin_dir();
         let want = dir.path().join("bin");
         let restore = || {
             match prev_data {
-                Some(value) => std::env::set_var("ONEMEMORY_DATA_DIR", value),
-                None => std::env::remove_var("ONEMEMORY_DATA_DIR"),
+                Some(value) => std::env::set_var("RSRS_DATA_DIR", value),
+                None => std::env::remove_var("RSRS_DATA_DIR"),
             }
             match prev_bin {
-                Some(value) => std::env::set_var("ONEMEMORY_BIN_DIR", value),
-                None => std::env::remove_var("ONEMEMORY_BIN_DIR"),
+                Some(value) => std::env::set_var("RSRS_BIN_DIR", value),
+                None => std::env::remove_var("RSRS_BIN_DIR"),
             }
         };
         if got != want {
@@ -996,41 +1075,40 @@ mod tests {
 
     #[test]
     fn materialize_bin_honors_override_dir() -> Result<(), String> {
-        static BIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _lock = BIN_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
-        let prev = std::env::var("ONEMEMORY_BIN_DIR").ok();
-        std::env::set_var("ONEMEMORY_BIN_DIR", dir.path());
+        let prev = respire::env::var("RSRS_BIN_DIR").ok();
+        std::env::set_var("RSRS_BIN_DIR", dir.path());
         let path = materialize_bin()?;
         if !path.starts_with(dir.path()) {
             if let Some(value) = prev {
-                std::env::set_var("ONEMEMORY_BIN_DIR", value);
+                std::env::set_var("RSRS_BIN_DIR", value);
             } else {
-                std::env::remove_var("ONEMEMORY_BIN_DIR");
+                std::env::remove_var("RSRS_BIN_DIR");
             }
             return Err(format!("bin path {} not under override", path.display()));
         }
         if !path.exists() {
             if let Some(value) = prev {
-                std::env::set_var("ONEMEMORY_BIN_DIR", value);
+                std::env::set_var("RSRS_BIN_DIR", value);
             } else {
-                std::env::remove_var("ONEMEMORY_BIN_DIR");
+                std::env::remove_var("RSRS_BIN_DIR");
             }
             return Err("materialized bin missing".to_owned());
         }
         let again = materialize_bin()?;
         if again != path {
             if let Some(value) = prev {
-                std::env::set_var("ONEMEMORY_BIN_DIR", value);
+                std::env::set_var("RSRS_BIN_DIR", value);
             } else {
-                std::env::remove_var("ONEMEMORY_BIN_DIR");
+                std::env::remove_var("RSRS_BIN_DIR");
             }
             return Err("second materialize changed path".to_owned());
         }
         if let Some(value) = prev {
-            std::env::set_var("ONEMEMORY_BIN_DIR", value);
+            std::env::set_var("RSRS_BIN_DIR", value);
         } else {
-            std::env::remove_var("ONEMEMORY_BIN_DIR");
+            std::env::remove_var("RSRS_BIN_DIR");
         }
         Ok(())
     }

@@ -9,6 +9,9 @@ on:
       version:
         default: ''
         type: string
+      full_validation:
+        default: true
+        type: boolean
     outputs:
       sha:
         value: ${{ jobs.resolve.outputs.sha }}
@@ -21,6 +24,10 @@ on:
         required: true
         default: main
         type: string
+      full_validation:
+        description: Run historical native upgrades as well as build/package checks
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -61,19 +68,12 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
           - os: macos-latest
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            rustflags: -C target-feature=-crt-static
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
             rustflags: -C target-feature=-crt-static
     runs-on: ${{ matrix.os }}
     steps:
@@ -101,50 +101,61 @@ jobs:
         run: cargo build --release --locked -p respire --bin rsrs --target ${{ matrix.target }} --target-dir target/ci
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
+      - uses: actions/cache@v4
+        if: contains(matrix.target, '-musl')
+        with:
+          path: target/musl-cache
+          key: musl-${{ matrix.target }}-ort-da9b5e3-rust-1.95-v1
       - name: Build and verify static musl binary
         if: contains(matrix.target, '-musl')
         run: bash scripts/build-linux-musl.sh ${{ matrix.target }}
       - name: Stage Core runtime and notices
         if: ${{ !contains(matrix.target, '-musl') }}
         run: node scripts/stage-core-runtime.mjs target/ci/${{ matrix.target }}/release
-      - name: Install and probe BGE CPU inference
+      - name: Verify the native executable
         shell: bash
-        env:
-          ONEMEMORY_ENGINE: cpu
-          ONEMEMORY_DATA_DIR: ${{ runner.temp }}/release-probe
-          ONEMEMORY_MODEL_DIR: ${{ runner.temp }}/release-probe/models/bge-base-zh-v1.5
-          ONEMEMORY_NO_AUTOSYNC: '1'
-          ONEMEMORY_UPDATE_CHECK: '0'
         run: |
           set -euo pipefail
           exe=target/ci/${{ matrix.target }}/release/rsrs
           if [ "$RUNNER_OS" = Windows ]; then exe="$exe.exe"; fi
           "$exe" --version
-          "$exe" --direct model install-bge --json
-          "$exe" --direct model probe --json
-      - name: Install and probe BGE-M3 CPU inference
-        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-pc-windows-msvc'
+      - uses: actions/cache@v4
+        if: runner.os == 'macOS'
+        with:
+          path: ${{ runner.temp }}/release-probe/models/bge-m3
+          key: release-m3-quantized-0826f8c1-macos
+      - name: Verify real macOS CPU inference before DEV publication
+        if: runner.os == 'macOS'
         shell: bash
-        timeout-minutes: 15
         env:
-          ONEMEMORY_ENGINE: cpu
-          ONEMEMORY_DATA_DIR: ${{ runner.temp }}/release-m3-probe
-          ONEMEMORY_M3_DIR: ${{ runner.temp }}/release-m3-probe/models/bge-m3
-          ONEMEMORY_NO_AUTOSYNC: '1'
-          ONEMEMORY_UPDATE_CHECK: '0'
+          RSRS_ENGINE: cpu
+          RSRS_DATA_DIR: ${{ runner.temp }}/release-probe
+          RSRS_M3_DIR: ${{ runner.temp }}/release-probe/models/bge-m3
+          RSRS_NO_AUTOSYNC: '1'
+          RSRS_UPDATE_CHECK: '0'
         run: |
           set -euo pipefail
           exe=target/ci/${{ matrix.target }}/release/rsrs
-          if [ "$RUNNER_OS" = Windows ]; then exe="$exe.exe"; fi
           "$exe" --direct model install-m3 --json
-          "$exe" --direct model probe --model m3 --json
+          "$exe" --direct model probe --json
       - name: Prepare versioned binary and runtime artifacts
         run: node npm/scripts/stage-artifacts.mjs ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
+          retention-days: 1
           name: cli-release-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
+
+  native-regression:
+    if: inputs.full_validation
+    needs: [resolve, binaries]
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-native-validation.yml
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
+      version: ${{ needs.resolve.outputs.version }}
 
   npm-dry-run:
     needs: [resolve, binaries]
@@ -164,21 +175,25 @@ jobs:
           pattern: cli-release-*
           path: release-assets
           merge-multiple: true
-      - name: Assemble all seven native packages
+      - name: Assemble all four native packages
         shell: bash
         run: |
           set -euo pipefail
+          node npm/scripts/test-wrapper.mjs
+          python3 scripts/test-dev-smoke-gate.py
           node npm/scripts/verify-packages.mjs release-assets --assets-only
           node npm/scripts/assemble-artifacts.mjs release-assets target/ci
           node npm/scripts/pack.mjs --root target/ci
           node npm/scripts/verify-packages.mjs release-assets --pack npm/release-packages
       - uses: actions/upload-artifact@v4
         with:
+          retention-days: 1
           name: npm-release-validation
           path: npm/dist/**/*.pack.json
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
+          retention-days: 1
           name: npm-release-packages
           path: npm/release-packages/*
           if-no-files-found: error

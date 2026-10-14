@@ -10,9 +10,12 @@
 
 pub use respire_app::auth;
 pub use respire_app::core_sdk;
+pub use respire_app::env;
+pub mod extract_tui;
 pub mod hooks;
 pub use respire_app::inject;
 pub mod inject_tui;
+pub use respire_app::session_import;
 pub use respire_app::keystore;
 pub use respire_app::lock;
 pub use respire_app::migration;
@@ -21,6 +24,7 @@ pub mod model_install;
 pub mod model_progress;
 pub use respire_app::prompt;
 pub use respire_app::service;
+pub use respire_app::resident;
 pub use respire_app::share;
 pub mod space;
 pub use respire_app::sync;

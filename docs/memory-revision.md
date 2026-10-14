@@ -1,14 +1,16 @@
 # Client memory refresh contract
 
-`rsrs memory-revision --json` probes an **already running authenticated runtime**.
+`rsrs memory-revision --json` probes an **already running local loopback runtime**.
 It never starts/restarts a runtime, initializes a profile, unlocks a session, loads
-an inference model, or scans memory rows. `ONEMEMORY_JSON=1` produces the same JSON.
+an inference model, schedules background indexing, or scans memory rows. `RSRS_JSON=1` produces the same JSON.
 
 ```json
 {"command":"memory-revision","status":"ok","summary":{"profile":"/resolved/profile","revision":"0123456789abcdef0123456789abcdef"},"items":[],"actions":[],"errors":[],"details":null}
 ```
 
 - `summary.profile` is the CLI-resolved `data_dir` used for this exact database.
+  Existing `rsrs.db` and legacy `onememory.db` follow the normal database resolver;
+  ambiguous directories containing both are rejected, never migrated by the probe.
   Clients must not guess `~/.rsrs`, cache a profile path, or derive it from the
   active account name. Runtime profile ownership checks still apply.
 - `summary.revision` is an opaque 128-bit random token, encoded as 32 lowercase
@@ -20,7 +22,7 @@ an inference model, or scans memory rows. `ONEMEMORY_JSON=1` produces the same J
 - `--direct memory-revision` is a host-only, SQLite READ_ONLY probe of an initialized
   local database. It works without a runtime and does not acquire its writer lock.
   It does not initialize a missing/legacy schema. Client-only/sandbox mode refuses
-  `--direct`; use the authenticated runtime instead. GUI snapshots using RPC
+  `--direct`; use the existing loopback runtime instead. GUI snapshots using RPC
   status/list should use ordinary `memory-revision` to keep all reads on one path.
 
 ## Refresh sequence
@@ -65,9 +67,9 @@ will detect it.
 With the pinned Rust/Core SDK prepared as in CI:
 
 ```sh
-RESPIRE_CORE_TEST_MODE=1 RUST_TEST_THREADS=1 cargo test --locked -p respire_storage revision
-RESPIRE_CORE_TEST_MODE=1 RUST_TEST_THREADS=1 cargo test --locked -p respire --test memory_revision
-RESPIRE_CORE_TEST_MODE=1 RUST_TEST_THREADS=1 cargo test --locked -p respire --test net_rpc_http rpc_memory_revision
+RSRS_CORE_TEST_MODE=1 RUST_TEST_THREADS=1 cargo test --locked -p respire_storage revision
+RSRS_CORE_TEST_MODE=1 RUST_TEST_THREADS=1 cargo test --locked -p respire --test memory_revision
+RSRS_CORE_TEST_MODE=1 RUST_TEST_THREADS=1 cargo test --locked -p respire --test net_rpc_http rpc_memory_revision
 ```
 
 Fixtures use only temporary synthetic databases/profiles. The workspace's normal

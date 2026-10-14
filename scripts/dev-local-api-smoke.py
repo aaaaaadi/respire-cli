@@ -83,7 +83,7 @@ class Suite:
         require(os.environ.get('GITHUB_ACTIONS') == 'true', 'github-actions-required')
         require(os.environ.get('RUNNER_OS') == 'Linux', 'isolated-linux-keyring-required')
         require(os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted', 'ephemeral-github-hosted-runner-required')
-        require(os.environ.get('RESPIRE_DEV_SERVER_ADDR') == 'https://dev.rsrs.rs', 'exact-development-server-required')
+        require(os.environ.get('RSRS_DEV_SERVER_ADDR') == 'https://api.dev.rsrs.rs', 'exact-development-server-required')
         require(re.fullmatch('[0-9a-f]{40}', self.args.cli_source_sha) is not None, 'exact-cli-source-sha-required')
         require(os.environ.get('CLI_SHA', os.environ.get('GITHUB_SHA')) == self.args.cli_source_sha, 'cli-build-source-sha-mismatch')
         require(hashlib.sha256(self.args.binary.read_bytes()).hexdigest() == self.args.binary_sha256.lower(), 'exact-cli-binary-sha-mismatch')
@@ -103,18 +103,17 @@ class Suite:
         self.env.update(HOME=str(self.home), USERPROFILE=str(self.home),
                         XDG_CONFIG_HOME=str(self.root / 'config'), XDG_DATA_HOME=str(self.root / 'data'),
                         XDG_CACHE_HOME=str(self.root / 'cache'), XDG_RUNTIME_DIR=str(self.root / 'runtime'),
-                        TMPDIR=str(self.root / 'tmp'), ONEMEMORY_BIN_DIR=str(self.root / 'bin'),
-                        ONEMEMORY_DATA_DIR=str(self.root),
-                        ONEMEMORY_MODEL_DIR=str(self.root / 'models' / 'bge-base-zh-v1.5'),
-                        ONEMEMORY_RERANKER_DIR=str(self.root / 'models' / 'bge-reranker-base'),
-                        ONEMEMORY_ENGINE='cpu', ONEMEMORY_NO_AUTOSYNC='1')
-        require('RESPIRE_CORE_TEST_MODE' not in self.env
-                and Path(self.env['ONEMEMORY_DATA_DIR']).resolve() == self.root, 'fixture-environment-not-isolated')
+                        TMPDIR=str(self.root / 'tmp'), RSRS_BIN_DIR=str(self.root / 'bin'),
+                        RSRS_DATA_DIR=str(self.root),
+                        RSRS_M3_DIR=str(self.root / 'models' / 'bge-m3'),
+                        RSRS_ENGINE='cpu', RSRS_NO_AUTOSYNC='1')
+        require('RSRS_CORE_TEST_MODE' not in self.env
+                and Path(self.env['RSRS_DATA_DIR']).resolve() == self.root, 'fixture-environment-not-isolated')
         version = subprocess.run([str(self.args.binary), '--version'], env=self.env, capture_output=True, text=True, timeout=20)
         require(version.returncode == 0 and version.stdout.strip().split()[-1] == self.args.version, 'exact-cli-version-mismatch')
-        self.direct(['config', '--data-dir', str(self.library), '--addr', 'https://dev.rsrs.rs', '--autosync', 'false'])
-        self.direct(['model', 'install-bge'], timeout=1200)
-        probe = self.direct(['model', 'probe', '--model', 'legacy'], timeout=180)
+        self.direct(['config', '--data-dir', str(self.library), '--addr', 'https://api.dev.rsrs.rs', '--autosync', 'false'])
+        self.direct(['model', 'install-m3'], timeout=1200)
+        probe = self.direct(['model', 'probe', '--model', 'm3'], timeout=180)
         require(probe.get('status') == 'ok' and probe.get('summary', {}).get('ready') is True
                 and probe['summary'].get('dimensions', 0) > 0, 'real-cpu-model-probe-failed')
         self.model_dimensions = probe['summary']['dimensions']
@@ -143,7 +142,7 @@ class Suite:
             port.bind(('127.0.0.1', 0))
             self.port = port.getsockname()[1]
         self.url = 'http://127.0.0.1:' + str(self.port)
-        env = dict(self.env, ONEMEMORY_RPC_PORT=str(self.port))
+        env = dict(self.env, RSRS_RPC_PORT=str(self.port))
         self.runtime = subprocess.Popen([str(self.args.binary), 'web', '--internal', '--no-open', '--port', str(self.port)],
                                         env=env, cwd=self.root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         deadline = time.monotonic() + 40
@@ -228,7 +227,7 @@ class Suite:
         # Raw RPC preserves a failed diagnostic envelope. Only allowlisted
         # names/statuses and numeric counts leave memory; never item values.
         names = {'store', 'data dir', 'mcp bin', 'mcp http', 'session', 'embedder',
-                 'reranker', 'lock', 'remote', 'inject', 'memory status', 'tidy counter', 'CLI version'}
+                 'lock', 'remote', 'inject', 'memory status', 'tidy counter', 'CLI version'}
         statuses = {'ok', 'warn', 'fail', 'skip', 'pending'}
         try:
             status, response = self.request('POST', '/api/rpc',
@@ -290,18 +289,18 @@ class Suite:
         key = self.invoke('keygen', {}, lambda v: bool(v.get('super')) and bool(v.get('path')))
         self.super = key['super']
         self.register_attempted = True
-        registered = self.invoke('register', {'user': self.user, 'pass': self.password, 'addr': 'https://dev.rsrs.rs'},
+        registered = self.invoke('register', {'user': self.user, 'pass': self.password, 'addr': 'https://api.dev.rsrs.rs'},
                                  lambda v: v.get('ok') is True and v.get('user') == self.user and bool(v.get('super')))
         self.created_user = self.user
         self.super = registered['super']
-        self.invoke('login', {'user': self.user, 'pass': self.password, 'addr': 'https://dev.rsrs.rs', 'super_pass': self.super},
+        self.invoke('login', {'user': self.user, 'pass': self.password, 'addr': 'https://api.dev.rsrs.rs', 'super_pass': self.super},
                     lambda v: v.get('ok') is True and v.get('user') == self.user)
         self.invoke('resume_session', {}, lambda v: v.get('resumed') is True and v.get('user') == self.user)
-        self.invoke('server_addr_set', {'addr': 'https://dev.rsrs.rs'}, lambda v: v.get('addr') == 'https://dev.rsrs.rs')
-        self.invoke('server_addr_get', {}, lambda v: v.get('addr') == 'https://dev.rsrs.rs')
+        self.invoke('server_addr_set', {'addr': 'https://api.dev.rsrs.rs'}, lambda v: v.get('addr') == 'https://api.dev.rsrs.rs')
+        self.invoke('server_addr_get', {}, lambda v: v.get('addr') == 'https://api.dev.rsrs.rs')
         self.invoke('sync_config_set', {'autosync': False}, lambda v: v.get('autosync') is False)
         self.invoke('cure_config_set', {'on': False}, lambda v: v.get('cure_auto') is False)
-        self.invoke('config_get', {}, lambda v: Path(v['data_dir']).resolve() == self.library and v['addr'] == 'https://dev.rsrs.rs')
+        self.invoke('config_get', {}, lambda v: Path(v['data_dir']).resolve() == self.library and v['addr'] == 'https://api.dev.rsrs.rs')
         self.invoke('data_dir_set', {'dir': str(self.library)}, lambda v: Path(v['data_dir']).resolve() == self.library)
         self.invoke('diary_mode_set', {'mode': 'verbose'}, lambda v: v.get('action') == 'updated'
                     and v.get('key') == 'diary_mode' and v.get('value') == 'verbose')
@@ -371,11 +370,6 @@ class Suite:
         self.invoke('inject_remove', {'id': 'codex'}, lambda v: v.get('id') == 'codex' and v.get('changed') is True)
         require('<!-- respire:begin -->' not in (self.home / '.codex' / 'AGENTS.md').read_text(encoding='utf-8'),
                 'injection-removal-readback-failed')
-        reranker = self.root / 'models' / 'bge-reranker-base'
-        self.invoke('rerank_model_install', {}, lambda v: v.get('model') == 'bge-reranker-base'
-                    and Path(v.get('dir', '')).resolve() == reranker and (reranker / 'onnx' / 'model_quantized.onnx').is_file(), timeout=1200)
-        self.invoke('rerank_model_status', {}, lambda v: v.get('installed') is True and v.get('size_mb', 0) > 0
-                    and Path(v.get('dir', '')).resolve() == reranker)
         self.invoke('classify_backend_set', {'backend': 'ds'}, lambda v: v.get('backend') == 'ds')
         self.invoke('classify_backend_get', {}, lambda v: v.get('backend') == 'ds')
         self.invoke('ds_key_save', {'key': 'ci-disposable-unused-key', 'base': 'http://127.0.0.1:9/v1', 'model': 'ci-no-provider'},
@@ -405,7 +399,7 @@ class Suite:
         reset = self.invoke('super_reset', {'super_pass': self.super}, lambda v: v.get('ok') is True and bool(v.get('super')))
         self.super = reset['super']
         self.invoke('logout', {}, lambda v: v.get('credentials_cleared') is True)
-        self.invoke('login', {'user': self.user, 'pass': self.password, 'addr': 'https://dev.rsrs.rs', 'super_pass': self.super}, lambda v: v.get('ok') is True and v.get('user') == self.user, label='post-logout-relogin')
+        self.invoke('login', {'user': self.user, 'pass': self.password, 'addr': 'https://api.dev.rsrs.rs', 'super_pass': self.super}, lambda v: v.get('ok') is True and v.get('user') == self.user, label='post-logout-relogin')
         actual, version = self.request('POST', '/api/invoke', {'cmd': 'update_check', 'args': {}})
         require(actual == 200 and isinstance(version, dict) and version.get('current') == self.args.version, 'update-check-adapter-contract-failed')
         if isinstance(version.get('latest'), str):
@@ -455,8 +449,8 @@ class Suite:
         if self.root_created and self.register_attempted:
             try:
                 session = json.loads((self.library / 'session.json').read_text(encoding='utf-8'))
-                require(session.get('user') == self.user and session.get('addr') == 'https://dev.rsrs.rs', 'cleanup-account-identity-mismatch')
-                request = urllib.request.Request('https://dev.rsrs.rs/api/self/purge',
+                require(session.get('user') == self.user and session.get('addr') == 'https://api.dev.rsrs.rs', 'cleanup-account-identity-mismatch')
+                request = urllib.request.Request('https://api.dev.rsrs.rs/api/self/purge',
                     json.dumps({'confirm': self.user}).encode(),
                     {'Authorization': 'Bearer ' + session['token'], 'Content-Type': 'application/json'}, method='POST')
                 with self.opener.open(request, timeout=30) as response:

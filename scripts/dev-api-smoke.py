@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Opt-in cloud API smoke for Actions and dev.rsrs.rs; never prints credentials.
+"""Opt-in cloud API smoke for Actions and api.dev.rsrs.rs; never prints credentials.
 
 Run: python3 scripts/dev-api-smoke.py --scope all --report <coverage.json>
-Requires GITHUB_ACTIONS=true, RESPIRE_DEV_SERVER_ADDR=https://dev.rsrs.rs,
-RESPIRE_DEV_API_ADMIN_APPROVED=true and secret RESPIRE_DEV_ADMIN_TOKEN.
-This supplements CLI smoke. Synthetic opaque ciphertext checks the server
+Requires GITHUB_ACTIONS=true, RSRS_DEV_SERVER_ADDR=https://api.dev.rsrs.rs,
+RSRS_DEV_API_ADMIN_APPROVED=true and secret RSRS_DEV_ADMIN_TOKEN.
+This checks the reviewed 66-operation CLI baseline, not all browser/Passkey APIs.
+Synthetic opaque ciphertext checks the server
 contract; actual client encryption/decryption belongs to the separate CLI run.
 """
 
@@ -27,6 +28,19 @@ import urllib.parse
 import urllib.request
 
 
+BASELINE_ROUTE_SHA256 = 'd9ae8f93cfb979ba626c90da3494e4d747e2b5a25548d99caa29c8cf97622864'
+REQUIRED_VAULT_ASSERTIONS = {
+    'wrapped-vault-save', 'wrapped-vault-roundtrip', 'identical-legacy-vault-write',
+    'identical-write-preserves-vault-and-generation', 'changed-legacy-vault-write',
+    'legacy-write-advances-generation', 'rewrap-missing-generation',
+    'rewrap-missing-generation-preserves-vault', 'rewrap-stale-generation',
+    'rewrap-stale-generation-preserves-vault', 'unsupported-vault-operation',
+    'unsupported-vault-operation-preserves-vault', 'same-urk-rewrap-current-generation',
+    'same-urk-rewrap-preserves-generation', 'readonly-vault-write-rejected',
+    'readonly-vault-write-preserves-state',
+}
+
+
 class SmokeFailure(Exception):
     """Only constant, non-sensitive reason codes may escape the request layer."""
 
@@ -44,6 +58,18 @@ def totp(secret):
     return f'{value % 1000000:06d}'
 
 
+def valid_vault_reply(reply, vault, account_id=None, key_generation=None):
+    """Require preserved recovery fields and the reviewed stable identity/generation schema."""
+    identity = reply.get('account_id')
+    generation = reply.get('key_generation')
+    return (all(reply.get(key) == value for key, value in vault.items())
+            and isinstance(identity, str)
+            and re.fullmatch('[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', identity) is not None
+            and type(generation) is int and 1 <= generation <= 9007199254740991
+            and (account_id is None or identity == account_id)
+            and (key_generation is None or generation == key_generation))
+
+
 class Smoke:
     def __init__(self, args):
         self.args = args
@@ -57,9 +83,9 @@ class Smoke:
         self.cleanup_events = []
         self.users = {}
         self.admins = set()
-        self.seed = os.environ.get('RESPIRE_DEV_ADMIN_TOKEN', '')
-        self.base = os.environ.get('RESPIRE_DEV_SERVER_ADDR', '').rstrip('/')
-        self.expected_server_sha = os.environ.get('RESPIRE_DEV_SERVER_SHA', '').lower()
+        self.seed = os.environ.get('RSRS_DEV_ADMIN_TOKEN', '')
+        self.base = os.environ.get('RSRS_DEV_SERVER_ADDR', '').rstrip('/')
+        self.expected_server_sha = os.environ.get('RSRS_DEV_SERVER_SHA', '').lower()
         self.actual_server_sha = None
         self.unconfirmed_creations = set()
         run = os.environ.get('GITHUB_RUN_ID', '')
@@ -70,15 +96,16 @@ class Smoke:
         self.start = datetime.datetime.now(datetime.timezone.utc)
 
     def preflight(self):
+        """Reject unapproved environments or any drift from the reviewed route inventory."""
         if os.environ.get('GITHUB_ACTIONS') != 'true':
             raise SmokeFailure('github-actions-required')
-        if self.base != 'https://dev.rsrs.rs':
+        if self.base != 'https://api.dev.rsrs.rs':
             raise SmokeFailure('exact-development-address-required')
         if not re.fullmatch(r'ci-api-\d+-\d+-[0-9a-f]{8}', self.namespace):
             raise SmokeFailure('github-run-identity-required')
         if self.args.scope != 'all':
             raise SmokeFailure('full-scope-required-no-partial-success')
-        if os.environ.get('RESPIRE_DEV_API_ADMIN_APPROVED') != 'true':
+        if os.environ.get('RSRS_DEV_API_ADMIN_APPROVED') != 'true':
             raise SmokeFailure('development-admin-scope-not-approved')
         if not self.seed.strip():
             raise SmokeFailure('development-admin-secret-missing')
@@ -86,8 +113,12 @@ class Smoke:
             raise SmokeFailure('exact-server-sha-required')
         if self.contract.get('server_source_sha') != self.expected_server_sha:
             raise SmokeFailure('route-contract-server-revision-mismatch')
-        if self.contract.get('expected_route_count') != 61 or len(self.routes) != 61:
+        if (self.contract.get('expected_route_count') != 66 or len(self.routes) != 66
+                or len(self.contract.get('routes', [])) != 66):
             raise SmokeFailure('route-contract-count-mismatch')
+        inventory = '\n'.join(sorted(f"{r['method']} {r['path']} {r['group']}" for r in self.routes.values()))
+        if hashlib.sha256(inventory.encode()).hexdigest() != BASELINE_ROUTE_SHA256:
+            raise SmokeFailure('route-contract-inventory-mismatch')
 
     def key(self, method, path):
         clean = urllib.parse.urlsplit(path).path
@@ -103,9 +134,9 @@ class Smoke:
         headers = {'Accept': 'application/json'}
         if token:
             headers['Authorization'] = 'Bearer ' + token
-        data = None if body is None else json.dumps(body).encode('utf-8')
+        data = None if body is None else (body if isinstance(body, str) else json.dumps(body)).encode('utf-8')
         if data is not None:
-            headers['Content-Type'] = 'application/json'
+            headers['Content-Type'] = 'application/x-www-form-urlencoded' if isinstance(body, str) else 'application/json'
         req = urllib.request.Request(self.base + path, data=data, headers=headers, method=method)
         try:
             response = self.http.open(req, timeout=30)
@@ -115,11 +146,6 @@ class Smoke:
             raise SmokeFailure('network-request-failed') from None
         with response:
             status = response.code
-            if path == '/ready':
-                advertised = response.headers.get('X-Respire-Server-SHA', '').lower()
-                self.actual_server_sha = advertised if re.fullmatch('[0-9a-f]{40}', advertised) else None
-                if self.actual_server_sha != self.expected_server_sha:
-                    raise SmokeFailure('development-server-sha-mismatch')
             raw = response.read(8 * 1024 * 1024 + 1)
         if len(raw) > 8 * 1024 * 1024:
             raise SmokeFailure('response-size-limit-exceeded')
@@ -129,6 +155,11 @@ class Smoke:
             raise SmokeFailure('response-not-json') from None
         if not isinstance(value, dict):
             raise SmokeFailure('response-not-object')
+        if method == 'GET' and path == '/health':
+            advertised = value.get('source_revision')
+            self.actual_server_sha = advertised if isinstance(advertised, str) and re.fullmatch('[0-9a-f]{40}', advertised) else None
+            if self.actual_server_sha != self.expected_server_sha:
+                raise SmokeFailure('development-server-sha-mismatch')
         return status, value
 
     def check(self, method, path, body=None, token=None, status=200,
@@ -200,7 +231,7 @@ class Smoke:
         for key, route in self.routes.items():
             if route['group'] == 'public':
                 continue
-            path = route['path'].replace('{user}', self.namespace + '-missing').replace('{id}', 'missing')
+            path = route['path'].replace('{user}', self.namespace + '-missing').replace('{id}', 'missing').replace('{code}', '000000000000')
             unauth = route['group'] == 'auth'
             # Serde accepts [] for TotpIn: all three fields have defaults.
             # That is an empty ticket/code authentication attempt, not bad JSON.
@@ -209,9 +240,43 @@ class Smoke:
                        status=401 if empty_totp or not unauth else 400, predicate=lambda r: 'error' in r,
                        kind='negative', label='empty-default-totp-ticket' if empty_totp else 'bad-json' if unauth else 'missing-authorization')
 
+    def vault_contract(self, token):
+        """Exercise changed baseline vault semantics using only this run's synthetic account."""
+        vault = {'kdf_salt': secrets.token_hex(16), 'wrapped_urk': secrets.token_hex(32),
+                 'urk_nonce': secrets.token_hex(12), 'version': 4}
+        self.check('POST', '/api/self/vault', vault, token,
+                   predicate=lambda r: r.get('ok') is True, label='wrapped-vault-save')
+        original = self.check('GET', '/api/self/vault', token=token,
+                   predicate=lambda r: valid_vault_reply(r, vault, key_generation=1), label='wrapped-vault-roundtrip')
+        account_id = original['account_id']
+        self.check('POST', '/api/self/vault', vault, token,
+                   predicate=lambda r: r.get('ok') is True, label='identical-legacy-vault-write')
+        self.check('GET', '/api/self/vault', token=token,
+                   predicate=lambda r: r == original, label='identical-write-preserves-vault-and-generation')
+        changed = dict(vault, wrapped_urk=secrets.token_hex(32))
+        self.check('POST', '/api/self/vault', changed, token,
+                   predicate=lambda r: r.get('ok') is True, label='changed-legacy-vault-write')
+        current = self.check('GET', '/api/self/vault', token=token,
+                   predicate=lambda r: valid_vault_reply(r, changed, account_id, 2), label='legacy-write-advances-generation')
+        rewrapped = dict(changed, wrapped_urk=secrets.token_hex(32))
+        rejected = [
+            (dict(rewrapped, operation='rewrap_same_urk'), 'rewrap-missing-generation'),
+            (dict(rewrapped, operation='rewrap_same_urk', expected_key_generation=1), 'rewrap-stale-generation'),
+            (dict(rewrapped, operation='unsupported', expected_key_generation=2), 'unsupported-vault-operation'),
+        ]
+        for body, label in rejected:
+            self.check('POST', '/api/self/vault', body, token, status=400,
+                       predicate=lambda r: 'error' in r, kind='negative', label=label)
+            self.check('GET', '/api/self/vault', token=token,
+                       predicate=lambda r: r == current, label=label + '-preserves-vault')
+        self.check('POST', '/api/self/vault', dict(rewrapped, operation='rewrap_same_urk', expected_key_generation=2), token,
+                   predicate=lambda r: r.get('ok') is True, label='same-urk-rewrap-current-generation')
+        return self.check('GET', '/api/self/vault', token=token,
+                   predicate=lambda r: valid_vault_reply(r, rewrapped, account_id, 2), label='same-urk-rewrap-preserves-generation')
+
     def user_and_sync(self, a, b):
+        """Exercise isolated account, vault, session and encrypted sync operations."""
         token = a['token']
-        self.check('GET', '/health', predicate=lambda r: r.get('ok') is True and r.get('service') == 'respire', label='service-liveness')
         self.check('GET', '/ready', predicate=lambda r: r.get('database') == 'ready' and r.get('ok') is True, label='database-readiness')
         for path in ('/health', '/ready'):
             self.check('DELETE', path, token=token, status=404, predicate=lambda r: 'error' in r,
@@ -223,16 +288,17 @@ class Smoke:
                    predicate=lambda r: 'error' in r, kind='negative', label='wrong-password')
         token = a['token']
         self.check('GET', '/api/self', token=token, predicate=lambda r: r.get('user') == a['user'], label='own-identity')
-        vault = {'kdf_salt': secrets.token_hex(16), 'wrapped_urk': 'aa', 'urk_nonce': 'bb', 'version': 4}
-        self.check('POST', '/api/self/vault', vault, token, predicate=lambda r: r.get('ok') is True, label='wrapped-vault-save')
-        self.check('GET', '/api/self/vault', token=token,
-                   predicate=lambda r: all(r.get(k) == v for k, v in vault.items()), label='wrapped-vault-roundtrip')
+        vault_snapshot = self.vault_contract(token)
         self.check('GET', '/api/self/keys', token=token,
                    predicate=lambda r: r.get('user') == a['user'] and r.get('auth_salt') == a['salt'] and 'token_masked' in r,
                    label='own-key-summary')
         reader = self.check('POST', '/api/self/sessions', {'device_name': 'api-reader', 'readonly': True}, token,
                             predicate=lambda r: bool(r.get('token')) and bool(r.get('session_id')) and r.get('readonly') is True,
                             label='readonly-session-create')
+        self.check('POST', '/api/self/vault', vault_snapshot, reader['token'], status=403,
+                   predicate=lambda r: 'error' in r, kind='negative', label='readonly-vault-write-rejected')
+        self.check('GET', '/api/self/vault', token=token,
+                   predicate=lambda r: r == vault_snapshot, label='readonly-vault-write-preserves-state')
         other = self.check('POST', '/api/self/sessions', {'device_name': 'api-other'}, b['token'],
                            predicate=lambda r: bool(r.get('token')) and bool(r.get('session_id')), label='second-account-session')
         self.check('GET', '/api/self/sessions', token=token,
@@ -335,7 +401,7 @@ class Smoke:
 
     def email_and_totp(self, a, owner):
         self.owned(a['user'])
-        email = os.environ.get('RESPIRE_DEV_MAIL_ADDRESS', '')
+        email = os.environ.get('RSRS_DEV_MAIL_ADDRESS', '')
         if not email:
             raise SmokeFailure('development-test-mailbox-not-configured')
         requested_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -361,12 +427,58 @@ class Smoke:
         a['token'] = authenticated['token']
         self.check('POST', '/api/self/totp/disable', {'code': totp(setup['secret'])}, a['token'], predicate=lambda r: r.get('totp') is False, label='fixture-totp-disabled')
 
+    def oauth_flow(self, a, b):
+        form = urllib.parse.urlencode({'client_id': 'respire-cli', 'device_name': 'API acceptance', 'expected_user': a['user']})
+        grant = self.check('POST', '/oauth/device/code', form,
+                           predicate=lambda r: bool(re.fullmatch('[0-9a-fA-F]{12}', r.get('user_code', ''))) and
+                           urllib.parse.urlsplit(r.get('verification_uri_complete', '')).netloc == 'dash.dev.rsrs.rs',
+                           label='device-grant-development-dashboard')
+        path = '/api/self/cli-authorization/' + grant['user_code']
+        self.check('GET', path, token=a['token'], predicate=lambda r: r.get('device_name') == 'API acceptance',
+                   label='device-grant-details')
+        self.check('POST', path, {'approve': True}, b['token'], status=409,
+                   predicate=lambda r: 'error' in r, kind='negative', label='wrong-account-approval-rejected')
+        self.check('POST', path, {'approve': True}, a['token'], predicate=lambda r: r.get('ok') is True,
+                   label='device-grant-approved')
+        poll = urllib.parse.urlencode({'client_id': 'respire-cli', 'grant_type': 'urn:ietf:params:oauth:grant-type:device_code',
+                                      'device_code': grant['device_code']})
+        access = self.check('POST', '/oauth/token', poll,
+                            predicate=lambda r: r.get('token_type') == 'Bearer' and r.get('user') == a['user'] and bool(r.get('access_token')),
+                            label='approved-grant-exchanged')
+        self.check('GET', '/api/self', token=access['access_token'], predicate=lambda r: r.get('user') == a['user'],
+                   label='oauth-session-account-readback')
+        self.check('POST', '/oauth/token', poll, status=400, predicate=lambda r: r.get('error') == 'invalid_grant',
+                   kind='negative', label='device-grant-replay-rejected')
+        self.check('GET', '/api/self/cli-authorization/000000000000', token=a['token'], status=404,
+                   predicate=lambda r: 'error' in r, kind='negative', label='unknown-authorization-code')
+
     def admin_flow(self, owner, a):
         self.owned(owner['user'], admin=True)
         token = owner['token']
         self.check('GET', '/admin/me', token=token, predicate=lambda r: r.get('user') == owner['user'] and r.get('role') == 'owner', label='fixture-owner-identity')
         viewer = self.create_admin('viewer', 'viewer', token)
         admin = self.create_admin('operator', 'admin', token)
+        def valid_stats(reply, days):
+            since = reply.get('memory_tracking_since', '')
+            points = reply.get('series', [])
+            return (reply.get('days') == days and reply.get('timezone') == 'Asia/Shanghai'
+                    and reply.get('historical_baseline') == 'retained_registrations_and_sessions'
+                    and bool(re.fullmatch(r'\d{4}-\d{2}-\d{2}', since)) and len(points) == days
+                    and all((i == 0 or points[i - 1]['date'] < point['date'])
+                            and type(point.get('registrations')) is int and point['registrations'] >= 0
+                            and type(point.get('sessions')) is int and point['sessions'] >= 0
+                            and (point.get('memories') is None if point['date'] < since else
+                                 type(point.get('memories')) is int and point['memories'] >= 0)
+                            for i, point in enumerate(points)))
+        self.check('GET', '/admin/stats', token=token, predicate=lambda r: valid_stats(r, 30), label='owner-daily-stats-default')
+        for days in [7, 90]:
+            self.check('GET', f'/admin/stats?days={days}', token=admin['token'],
+                       predicate=lambda r, days=days: valid_stats(r, days), label=f'admin-daily-stats-{days}-days')
+        for days in ['6', '91', 'abc', '7.5']:
+            self.check('GET', '/admin/stats?days=' + days, token=token, status=400,
+                       predicate=lambda r: 'error' in r, kind='negative', label='stats-invalid-days-rejected')
+        self.check('GET', '/admin/stats', token=viewer['token'], status=403,
+                   predicate=lambda r: r.get('error') == 'forbidden', kind='negative', label='viewer-daily-stats-blocked')
         self.check('GET', '/admin/admins', token=token,
                    predicate=lambda r: any(x.get('user') == viewer['user'] for x in r.get('admins', [])), label='fixture-admin-visible')
         forbidden = self.namespace + '-forbidden'
@@ -497,6 +609,7 @@ class Smoke:
     def run(self):
         self.preflight()
         # Check deployment identity before any fixture creation or privileged write.
+        self.check('GET', '/health', predicate=lambda r: r.get('ok') is True and r.get('service') == 'respire', label='service-liveness')
         self.check('GET', '/ready', predicate=lambda r: r.get('database') == 'ready' and r.get('ok') is True,
                    label='exact-server-deployment-ready')
         self.check('GET', '/admin/me', token=self.seed, predicate=lambda r: r.get('role') == 'owner', label='development-seed-owner-check')
@@ -505,6 +618,7 @@ class Smoke:
         a, b = self.register('a'), self.register('b')
         self.user_and_sync(a, b)
         self.email_and_totp(a, owner)
+        self.oauth_flow(a, b)
         self.admin_flow(owner, a)
         self.owned(b['user'])
         self.check('POST', '/api/self/purge', {'confirm': 'not-the-fixture'}, b['token'], status=400,
@@ -514,20 +628,26 @@ class Smoke:
         del self.users[b['user']]
 
     def report(self, error):
+        """Write a sanitized result that requires complete route, vault and cleanup coverage."""
         routes = list(self.routes.values())
         uncovered = [r['method'] + ' ' + r['path'] for r in routes if not r['positive']]
         negative_uncovered = [r['method'] + ' ' + r['path'] for r in routes if not r['negative']]
-        complete = error is None and not uncovered and not negative_uncovered and not self.users and not self.admins and not self.unconfirmed_creations and all(x['passed'] for x in self.cleanup_events)
+        observed_vault = {event['assertion'] for event in self.events if event['passed']
+                          and event['route'] in ('GET /api/self/vault', 'POST /api/self/vault')}
+        missing_vault = sorted(REQUIRED_VAULT_ASSERTIONS - observed_vault)
+        complete = error is None and not uncovered and not negative_uncovered and not missing_vault and not self.users and not self.admins and not self.unconfirmed_creations and all(x['passed'] for x in self.cleanup_events)
         workflow_sha = os.environ.get('GITHUB_SHA', '').lower()
-        result = {'schema': 1, 'scope': 'development-cloud-api', 'server': 'https://dev.rsrs.rs',
+        result = {'schema': 1, 'scope': 'development-cli-baseline-api', 'server': 'https://api.dev.rsrs.rs',
                   'namespace': self.namespace, 'complete': complete, 'error': error,
                   'server_sha_expected': self.expected_server_sha,
                   'server_sha_actual': self.actual_server_sha,
                   'contract_server_sha': self.contract.get('server_source_sha'),
+                  'separate_coverage': self.contract.get('separate_coverage', {}),
                   'cli_workflow_sha': workflow_sha if re.fullmatch('[0-9a-f]{40}', workflow_sha) else None,
                   'counts': {'routes': len(routes), 'positive_covered': len(routes) - len(uncovered),
                              'negative_covered': sum(bool(r['negative']) for r in routes), 'assertions': len(self.events)},
-                  'uncovered': uncovered, 'negative_uncovered': negative_uncovered, 'routes': routes, 'assertions': self.events,
+                  'uncovered': uncovered, 'negative_uncovered': negative_uncovered,
+                  'missing_vault_assertions': missing_vault, 'routes': routes, 'assertions': self.events,
                   'cleanup': {'events': self.cleanup_events, 'remaining_users': list(self.users), 'remaining_admins': sorted(self.admins),
                               'unconfirmed_creations': sorted(self.unconfirmed_creations)},
                   'not_run': ['shared-server-last-owner-guard', 'CLI encryption/decryption and legacy CLI fallback proxy'],

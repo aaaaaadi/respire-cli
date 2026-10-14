@@ -2,15 +2,30 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{env, error::Error, fs, path::PathBuf};
 
+#[path = "src/env.rs"]
+mod compatibility_env;
+
+#[path = "host-winml-build.rs"]
+mod host_winml_build;
+
 fn main() -> Result<(), Box<dyn Error>> {
+    host_winml_build::prepare()?;
+    println!("cargo:rerun-if-env-changed=RSRS_CORE_SDK_DIR");
+    println!("cargo:rerun-if-env-changed=ONEMEMORY_CORE_SDK_DIR");
     println!("cargo:rerun-if-env-changed=RESPIRE_CORE_SDK_DIR");
     let directory = PathBuf::from(
-        env::var_os("RESPIRE_CORE_SDK_DIR")
-            .ok_or("prepare the Core SDK with prepare-sdk.mjs and set RESPIRE_CORE_SDK_DIR")?,
+        compatibility_env::var_os("RSRS_CORE_SDK_DIR")
+            .ok_or("prepare the Core SDK with prepare-sdk.mjs and set RSRS_CORE_SDK_DIR")?,
     );
     let manifest_path = directory.join("manifest.json");
     let manifest_bytes = fs::read(&manifest_path)?;
     let manifest: Value = serde_json::from_slice(&manifest_bytes)?;
+    if manifest.get("test_only").is_some() && env::var_os("CARGO_FEATURE_NATIVE_FAULT_TESTS").is_none() {
+        return Err("Test-only SDK requires the non-default native-fault-tests feature".into());
+    }
+    if manifest["association_contract"].as_u64() != Some(1) {
+        return Err("Core SDK lacks association contract 1; rebuild and pin a matching SDK".into());
+    }
     let target = env::var("TARGET")?;
     let lock_path =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR")?).join("core-sdk.lock.json");
@@ -35,7 +50,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     if target.contains("musl") && !static_crt {
         return Err("musl Core SDK requires the static CRT (+crt-static)".into());
     }
-    if manifest["abi_version"].as_u64() != Some(0x0001_0000) {
+    if manifest["abi_version"].as_u64() != Some(0x0001_0002) {
         return Err("Core SDK ABI version mismatch".into());
     }
     let compiler = std::process::Command::new(env::var_os("RUSTC").ok_or("missing RUSTC")?)

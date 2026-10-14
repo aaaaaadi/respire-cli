@@ -15,8 +15,9 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from dev_model_fixture import share_cpu_container
 
-UPSTREAM = "https://dev.rsrs.rs"
+UPSTREAM = "https://api.dev.rsrs.rs"
 
 
 def require(condition, code):
@@ -189,17 +190,20 @@ class Fixture:
         profile = self.root / name
         (profile / "home").mkdir(parents=True, mode=0o700)
         env = {key: value for key, value in os.environ.items()
-               if not key.startswith(("ONEMEMORY_", "RESPIRE_", "XDG_"))
+               if not key.startswith(("RSRS_", "ONEMEMORY_", "RESPIRE_", "XDG_"))
                and not key.endswith(("_TOKEN", "_API_KEY"))
                and key not in ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "DBUS_SESSION_BUS_ADDRESS")}
         env.update(HOME=str(profile / "home"), USERPROFILE=str(profile / "home"),
                    XDG_CONFIG_HOME=str(profile / "config"), XDG_DATA_HOME=str(profile / "data"),
                    XDG_CACHE_HOME=str(profile / "cache"), TMPDIR=str(profile / "tmp"),
-                   ONEMEMORY_DATA_DIR=str(profile / "library"), ONEMEMORY_BIN_DIR=str(profile / "bin"),
-                   ONEMEMORY_MODEL_DIR=str(self.args.model_dir), ONEMEMORY_ENGINE="cpu",
-                   ONEMEMORY_NO_AUTOSYNC="1")
-        for key in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "TMPDIR", "ONEMEMORY_DATA_DIR", "ONEMEMORY_BIN_DIR"):
+                   RSRS_DATA_DIR=str(profile / "library"), RSRS_BIN_DIR=str(profile / "bin"),
+                   RSRS_M3_DIR=str(self.args.model_dir), RSRS_ENGINE="cpu",
+                   RSRS_NO_AUTOSYNC="1")
+        for key in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "TMPDIR", "RSRS_DATA_DIR", "RSRS_BIN_DIR"):
             Path(env[key]).mkdir(parents=True, exist_ok=True, mode=0o700)
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            env['RSRS_RPC_PORT'] = str(listener.getsockname()[1])
         return env
 
     def direct(self, env, command, allow_pending=False, timeout=150):
@@ -235,7 +239,7 @@ class Fixture:
         self.created = True
         self.cleanup_report["unconfirmed_users"].remove(self.user)
         self.cleanup_report["remaining_users"].append(self.user)
-        session_path = Path(self.a["ONEMEMORY_DATA_DIR"]) / "session.json"
+        session_path = Path(self.a["RSRS_DATA_DIR"]) / "session.json"
         session = json.loads(session_path.read_text(encoding="utf-8"))
         require(session.get("user") == self.user and session.get("addr") == UPSTREAM
                 and isinstance(session.get("token"), str) and bool(session["token"]), "created_user_session_mismatch")
@@ -243,7 +247,10 @@ class Fixture:
         super_key = registration.get("summary", {}).get("super")
         require(isinstance(super_key, str) and bool(super_key), "generated_super_missing")
         self.direct(self.a, ["sync"], allow_pending=True)
-        self.direct(self.b, ["login", "--addr", UPSTREAM, "--user", self.user, "--pass=" + self.password, "--super=" + super_key])
+        self.direct(self.b, ["login", "--interactive", "--addr", UPSTREAM, "--user", self.user, "--pass=" + self.password, "--super=" + super_key])
+        stopped = subprocess.run([str(self.args.binary), '--runtime-internal', '--stop'],
+            env=self.b, capture_output=True, timeout=60)
+        require(stopped.returncode == 0, 'independent_login_runtime_stop_failed')
         session = json.loads(session_path.read_text(encoding="utf-8"))
         require(session.get("addr") == UPSTREAM, "unexpected_registered_upstream")
         session["addr"] = self.gate.address
@@ -256,19 +263,41 @@ class Fixture:
             self.port = sock.getsockname()[1]
         env = self.a.copy()
         if automatic:
-            env.pop("ONEMEMORY_NO_AUTOSYNC", None)
-        env["ONEMEMORY_RPC_PORT"] = str(self.port)
+            env.pop("RSRS_NO_AUTOSYNC", None)
+        env["RSRS_RPC_PORT"] = str(self.port)
         self.child = subprocess.Popen([str(self.args.binary), "--runtime-internal", "--no-open", "--port", str(self.port)],
                                       env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        token_path = Path(env["ONEMEMORY_DATA_DIR"]) / "runtime" / "token"
-        wait_for(lambda: token_path.is_file() if self.child.poll() is None else False, 30, "runtime_start_timeout")
-        self.runtime_token = token_path.read_text(encoding="utf-8").strip()
+        data_dir = Path(env["RSRS_DATA_DIR"])
+        token_path = data_dir / "runtime" / "token"
+        endpoint_path = data_dir / "runtime" / "endpoint.json"
+
+        def ready():
+            require(self.child.poll() is None, "owned_runtime_exited_before_ready")
+            require(not token_path.exists(), "loopback_runtime_created_token")
+            if not endpoint_path.is_file():
+                return False
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:" + str(self.port) + "/api/health", timeout=5) as response:
+                    require(response.status == 200, "runtime_health_status_failed")
+                    health = json.load(response)
+            except urllib.error.HTTPError:
+                raise RuntimeError("runtime_health_status_failed") from None
+            except (OSError, urllib.error.URLError):
+                return False
+            require(health.get("v") == 1 and health.get("bin") == self.args.version
+                    and health.get("pid") == self.child.pid
+                    and Path(health.get("exe", "")).resolve() == self.args.binary
+                    and Path(health.get("data_dir", "")).resolve() == data_dir.resolve(),
+                    "owned_runtime_identity_mismatch")
+            return True
+
+        wait_for(ready, 30, "runtime_start_timeout")
         wait_for(lambda: self.rpc(["status"]).get("ok"), 30, "runtime_ready_timeout")
 
     def rpc(self, command):
         request = urllib.request.Request("http://127.0.0.1:" + str(self.port) + "/api/rpc",
             json.dumps({"v": 1, "id": secrets.token_hex(16), "method": "cli.exec", "args": ["--json", *command]}).encode(),
-            {"Authorization": "Bearer " + self.runtime_token, "Content-Type": "application/json"})
+            {"Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(request, timeout=45) as response:
                 return json.load(response)
@@ -282,7 +311,7 @@ class Fixture:
         else:
             result = self.rpc(command)
             require(result.get("ok") and result.get("exit") == 0, "foreground_save_failed")
-        with sqlite3.connect(Path(self.a["ONEMEMORY_DATA_DIR"]) / "onememory.db") as db:
+        with sqlite3.connect(Path(self.a["RSRS_DATA_DIR"]) / "rsrs.db") as db:
             row = db.execute("SELECT id FROM memories WHERE title=? AND deleted=0", (title,)).fetchone()
         require(row is not None, "saved_memory_missing")
         return row[0]
@@ -297,7 +326,7 @@ class Fixture:
                           proxy_response_parse_failures=self.gate.proxy_response_parse_failures)
         try:
             result["pending"] = self.pending()
-            if result["runtime_alive"] and hasattr(self, "runtime_token"):
+            if result["runtime_alive"]:
                 summary = self.rpc(["status"]).get("envelope", {}).get("summary", {})
                 scheduler = summary.get("sync_scheduler", {})
                 result["scheduler"] = {key: scheduler.get(key) for key in ("state", "next_run_ms", "manual_waiters")}
@@ -309,11 +338,11 @@ class Fixture:
         report.setdefault("diagnostics", []).append(result)
 
     def pending(self):
-        with sqlite3.connect(Path(self.a["ONEMEMORY_DATA_DIR"]) / "onememory.db") as db:
+        with sqlite3.connect(Path(self.a["RSRS_DATA_DIR"]) / "rsrs.db") as db:
             return db.execute("SELECT COUNT(*) FROM sync_outbox WHERE state='pending'").fetchone()[0]
 
     def snapshot(self):
-        with sqlite3.connect(Path(self.a["ONEMEMORY_DATA_DIR"]) / "onememory.db") as db:
+        with sqlite3.connect(Path(self.a["RSRS_DATA_DIR"]) / "rsrs.db") as db:
             return {
                 "pending": db.execute("SELECT seq,id FROM sync_outbox WHERE state='pending' ORDER BY seq").fetchall(),
                 "envelopes": db.execute("SELECT id,user,ciphertext,nonce,embedding_enc,updated_at,deleted FROM sync_outbox WHERE state='pending' ORDER BY seq").fetchall(),
@@ -402,9 +431,10 @@ def run(args, report):
         require(any(value == args.version for node in objects(version) for value in node.values() if isinstance(value, str)), "binary_version_mismatch")
         args.model_dir.mkdir(mode=0o700)
         # The CLI sweep can uninstall its models; install independently through the pinned CLI flow.
-        fixture.direct(fixture.a, ["model", "install-bge"], timeout=600)
+        fixture.direct(fixture.a, ["model", "install-m3"], timeout=600)
+        share_cpu_container(args.root, fixture.a, args.model_dir)
         require(all(path.is_file() and path.stat().st_size > 0 for path in
-                    (args.model_dir / "tokenizer.json", args.model_dir / "onnx" / "model.onnx")),
+                    (args.model_dir / "tokenizer.json", args.model_dir / "onnx" / "model_quantized.onnx")),
                 "installed_model_files_missing")
         fixture.prepare()
         seed_content = "Development queued foreground seed " + secrets.token_hex(16)

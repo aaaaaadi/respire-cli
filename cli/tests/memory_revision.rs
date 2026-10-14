@@ -9,12 +9,12 @@ fn run(root: &Path, args: &[&str]) -> std::io::Result<Output> {
     Command::new(env!("CARGO_BIN_EXE_rsrs"))
         .args(args)
         .env("HOME", root.join("unused-home"))
-        .env("ONEMEMORY_DATA_DIR", root)
-        .env("ONEMEMORY_MODEL_DIR", root.join("missing-model"))
-        .env("ONEMEMORY_JSON", "1")
-        .env_remove("ONEMEMORY_CLIENT_ONLY")
-        .env_remove("ONEMEMORY_NO_AUTOSTART")
-        .env_remove("ONEMEMORY_RPC_TOKEN")
+        .env("RSRS_DATA_DIR", root)
+        .env("RSRS_MODEL_DIR", root.join("missing-model"))
+        .env("RSRS_JSON", "1")
+        .env_remove("RSRS_CLIENT_ONLY")
+        .env_remove("RSRS_NO_AUTOSTART")
+        .env_remove("RSRS_RPC_TOKEN")
         .output()
 }
 
@@ -38,16 +38,16 @@ fn memory_revision_direct_is_model_free_and_follows_resolved_profile(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let root = dir.path();
-    drop(LocalStore::open(&root.join("onememory.db"))?);
+    drop(LocalStore::open(&root.join("rsrs.db"))?);
     let initial = summary(run(root, &["--direct", "memory-revision", "--json"])?)?;
     assert_eq!(initial["profile"], root.to_string_lossy().as_ref());
-    // ONEMEMORY_JSON=1 is exactly the same wire contract as the explicit flag.
+    // RSRS_JSON=1 is exactly the same wire contract as the explicit flag.
     assert_eq!(
         summary(run(root, &["--direct", "memory-revision"])?)?,
         initial
     );
     let profile = root.join("accounts").join("work");
-    drop(LocalStore::open(&profile.join("onememory.db"))?);
+    drop(LocalStore::open(&profile.join("rsrs.db"))?);
     std::fs::write(
         root.join("client.json"),
         serde_json::to_vec(&serde_json::json!({
@@ -88,9 +88,9 @@ fn memory_revision_does_not_initialize_or_autostart() -> Result<(), Box<dyn std:
     let ordinary = Command::new(env!("CARGO_BIN_EXE_rsrs"))
         .args(["memory-revision", "--json"])
         .env("HOME", dir.path().join("unused-home"))
-        .env("ONEMEMORY_DATA_DIR", &root)
-        .env("ONEMEMORY_RPC_PORT", port.to_string())
-        .env_remove("ONEMEMORY_RPC_TOKEN")
+        .env("RSRS_DATA_DIR", &root)
+        .env("RSRS_RPC_PORT", port.to_string())
+        .env_remove("RSRS_RPC_TOKEN")
         .output()?;
     assert!(!ordinary.status.success());
     let envelope: Value = serde_json::from_slice(&ordinary.stdout)?;
@@ -103,7 +103,7 @@ fn memory_revision_does_not_initialize_or_autostart() -> Result<(), Box<dyn std:
 #[test]
 fn memory_revision_direct_respects_client_only_policy() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
-    drop(LocalStore::open(&dir.path().join("onememory.db"))?);
+    drop(LocalStore::open(&dir.path().join("rsrs.db"))?);
     let result = run(
         dir.path(),
         &["--client-only", "--direct", "memory-revision"],
@@ -111,5 +111,53 @@ fn memory_revision_direct_respects_client_only_policy() -> Result<(), Box<dyn st
     assert!(!result.status.success());
     let envelope: Value = serde_json::from_slice(&result.stdout)?;
     assert!(envelope["errors"].to_string().contains("client_only"));
+    Ok(())
+}
+
+#[test]
+fn memory_revision_legacy_database_and_ambiguous_names() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    drop(LocalStore::open(&dir.path().join("onememory.db"))?);
+    let legacy = summary(run(dir.path(), &["--direct", "memory-revision"])?)?;
+    assert_eq!(legacy["profile"], dir.path().to_string_lossy().as_ref());
+    assert!(!dir.path().join("rsrs.db").exists());
+    drop(LocalStore::open(&dir.path().join("rsrs.db"))?);
+    let result = run(dir.path(), &["--direct", "memory-revision"])?;
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stdout).contains("both rsrs.db"));
+    Ok(())
+}
+
+#[test]
+fn memory_revision_does_not_recover_interrupted_login() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    drop(LocalStore::open(&dir.path().join("rsrs.db"))?);
+    let journal = dir.path().join(".login-recovery.json");
+    let marker = b"synthetic invalid journal must remain untouched";
+    std::fs::write(&journal, marker)?;
+    summary(run(dir.path(), &["--direct", "memory-revision"])?)?;
+    assert_eq!(std::fs::read(&journal)?, marker);
+    assert!(!dir.path().join("session.json").exists());
+    assert!(!dir.path().join("runtime").exists());
+    Ok(())
+}
+
+#[test]
+fn memory_revision_preserves_legacy_environment_alias() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    drop(LocalStore::open(&dir.path().join("onememory.db"))?);
+    let output = Command::new(env!("CARGO_BIN_EXE_rsrs"))
+        .args(["--direct", "memory-revision", "--json"])
+        .env("HOME", dir.path().join("unused-home"))
+        .env_remove("RSRS_DATA_DIR")
+        .env_remove("RESPIRE_DATA_DIR")
+        .env("ONEMEMORY_DATA_DIR", dir.path())
+        .env_remove("RSRS_CLIENT_ONLY")
+        .env_remove("ONEMEMORY_CLIENT_ONLY")
+        .env_remove("RESPIRE_CLIENT_ONLY")
+        .output()?;
+    let value = summary(output)?;
+    assert_eq!(value["profile"], dir.path().to_string_lossy().as_ref());
+    assert!(!dir.path().join("rsrs.db").exists());
     Ok(())
 }

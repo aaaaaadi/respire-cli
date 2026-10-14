@@ -5,10 +5,10 @@ use std::sync::OnceLock;
 use anyhow::{bail, Result};
 
 pub fn client_only() -> bool {
-    if ["ONEMEMORY_CLIENT_ONLY", "ONEMEMORY_NO_AUTOSTART"]
+    if ["RSRS_CLIENT_ONLY", "RSRS_NO_AUTOSTART"]
         .iter()
         .any(|name| {
-            std::env::var(name).is_ok_and(|value| {
+            respire::env::var(name).is_ok_and(|value| {
                 matches!(
                     value.trim().to_ascii_lowercase().as_str(),
                     "1" | "true" | "on" | "yes"
@@ -30,7 +30,7 @@ pub fn client_only() -> bool {
 
 pub fn require_host(action: &str) -> Result<()> {
     if client_only() {
-        bail!("client_only: {action} is host-managed; connect to the authenticated HTTP runtime. Start or update rsrs from the host terminal, outside the sandbox");
+        bail!("client_only: {action} is host-managed; connect to the host loopback HTTP runtime. Start or update rsrs from the host terminal, outside the sandbox");
     }
     Ok(())
 }
