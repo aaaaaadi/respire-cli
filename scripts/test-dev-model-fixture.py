@@ -92,6 +92,8 @@ class ModelFixtureTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "cli_failed_remember"):
                     smoke.cli({"RSRS_DATA_DIR": str(root)}, "remember", "synthetic content")
             self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_args_list[1].args[0],
+                [str(smoke.args.binary), "--runtime-internal", "--stop"])
             smoke.save.assert_called()
             diagnostic = smoke.report["cli_failure"]["error"]
             self.assertIn("os error 2", diagnostic)
