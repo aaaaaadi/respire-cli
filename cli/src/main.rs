@@ -18,6 +18,7 @@ use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use uuid::Uuid;
 
+mod admission;
 mod app_version;
 mod bench;
 mod classify;
@@ -26,6 +27,7 @@ mod i18n;
 mod login;
 mod mcp;
 mod net_rpc;
+mod network;
 mod output;
 mod progress;
 mod rpc;
@@ -317,13 +319,20 @@ fn output_emitted() -> bool {
 
 fn command_failure(error: &anyhow::Error) -> (ResultEnvelope, i32) {
     let input = error.downcast_ref::<respire_app::input_error::InputError>().is_some();
+    let unknown = match error.downcast_ref::<runtime_error::RuntimeError>() {
+        Some(runtime_error::RuntimeError::OutcomeUnknown { request_id, .. }) => Some(request_id),
+        _ => None,
+    };
     let mut envelope = ResultEnvelope::new(
         "cli", OutputStatus::Fail,
-        serde_json::json!({"reason": if input { "invalid_input" } else { "runtime_error" }}),
+        serde_json::json!({"reason": if unknown.is_some() { "request_outcome_unknown" } else if input { "invalid_input" } else { "runtime_error" }}),
         Vec::new(),
     );
     envelope.errors.push(format!("{error:#}"));
     envelope.details = serde_json::json!({"error_type": if input { "user" } else { "runtime" }});
+    if let Some(id) = unknown {
+        envelope.details = serde_json::json!({"error_type":"outcome_unknown","request_id":id,"replayed":false,"result_method":"runtime.result"});
+    }
     (envelope, if input { 2 } else { 1 })
 }
 
@@ -336,8 +345,18 @@ pub(crate) fn capture_run(args: Vec<String>) -> Captured {
         std::iter::once(std::ffi::OsString::from("rsrs"))
             .chain(args.iter().cloned().map(std::ffi::OsString::from)),
     );
+    let defer_index = parsed.as_ref().is_ok_and(|cli| matches!(cli.command.as_ref(),
+        Some(Command::Remember { .. } | Command::Update { .. } | Command::Import { .. }
+            | Command::Attach { .. } | Command::Restore { .. })));
+    let _deferred = defer_index.then(respire::core_sdk::defer_indexing);
     let ran = match parsed {
-        Ok(cli) => run(cli),
+        Ok(cli) => match run(cli) {
+            Err(error) if error.downcast_ref::<respire::transport::local::MemorySourceChanged>().is_some() => {
+                Cli::try_parse_from(std::iter::once("rsrs".to_owned()).chain(args.iter().cloned()))
+                    .map_err(anyhow::Error::from).and_then(run)
+            }
+            result => result,
+        },
         Err(error) => {
             let code = error.exit_code();
             let mut envelope = ResultEnvelope::new(
@@ -465,7 +484,7 @@ fn candidates_count_normal(all: &[respire::StoredMemory]) -> usize {
 #[derive(Parser)]
 #[command(
     name = "rsrs",
-    version,
+    version = crate::app_version::clap_version(),
     about = "跨设备跨软件统一 AI 记忆系统（local-first）",
     after_help = "Sandbox: use --client-only or RSRS_CLIENT_ONLY=1 to connect to the host HTTP runtime without managing its lifecycle."
 )]
@@ -978,7 +997,7 @@ enum Command {
         /// Set periodic auto-cure
         #[arg(long)]
         cure_auto: Option<bool>,
-        /// Max concurrent runtime read jobs. 0 follows CPU count (at most 4). Writes queue. Applies after `rsrs --runtime-internal --stop`.
+        /// Max concurrent ordinary runtime jobs. 0 follows available CPU parallelism; explicit values cannot exceed it. Applies after runtime restart.
         #[arg(long)]
         rpc_parallelism: Option<u32>,
     },
@@ -1242,6 +1261,54 @@ enum Command {
         #[arg(long)]
         title: Option<String>,
         /// Bypass Core-reported conflicts and explicitly create a sibling entry
+        #[arg(long)]
+        force: bool,
+    },
+    /// Extract local coding-agent sessions (Codex, OpenCode, Claude Code, …) into rsrs memories
+    Extract {
+        /// List agent sources and whether a local session store exists
+        #[arg(long)]
+        targets: bool,
+        /// Force the interactive TUI picker (needs a TTY)
+        #[arg(long, conflicts_with_all = ["targets", "id", "all", "dry_run"])]
+        tui: bool,
+        /// Extract from every detected source (default when --id is omitted)
+        #[arg(long, conflicts_with = "id")]
+        all: bool,
+        /// Extract from one source (codex/opencode/claude/…); see --targets
+        #[arg(long)]
+        id: Option<String>,
+        /// Scan and summarize without writing any memory
+        #[arg(long)]
+        dry_run: bool,
+        /// Only sessions updated since this bound (today|yesterday|7d|YYYY-MM-DD)
+        #[arg(long)]
+        since: Option<String>,
+        /// Maximum sessions to import per source (newest first)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Filter by working-directory substring
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Filter by model/provider substring
+        #[arg(long)]
+        model: Option<String>,
+        /// Filter by session id substring
+        #[arg(long)]
+        session: Option<String>,
+        /// Memory kind for imported sessions
+        #[arg(long, default_value = "context")]
+        kind: String,
+        /// Importance: important (default) or trivial (diary)
+        #[arg(long, default_value = "important")]
+        importance: String,
+        /// Optional pre-attach parent (id / tree / anchor title); omit to ingest as roots for a later tidy
+        #[arg(long, default_value = "")]
+        parent: String,
+        /// Include subagent/child sessions (hidden by default)
+        #[arg(long)]
+        include_subagents: bool,
+        /// Re-import sessions already recorded in the cursor
         #[arg(long)]
         force: bool,
     },
@@ -1556,6 +1623,33 @@ fn current_user() -> String {
     respire::env::var("RSRS_USER").unwrap_or_else(|_| "local".to_owned())
 }
 
+/// Daily identity is stable even when its display title or importance changes.
+/// Legacy same-user/title tracks still participate in the existing atomic merge.
+fn select_diary_tracks<'a>(
+    memories: &'a [respire::StoredMemory],
+    track_id: &str,
+    track_title: &str,
+    mut accepted_author: impl FnMut(&respire::StoredMemory) -> Result<bool>,
+) -> Result<Vec<&'a respire::StoredMemory>> {
+    let mut tracks = Vec::new();
+    for memory in memories.iter().filter(|memory| !memory.deleted) {
+        // Envelope IDs and wire owners are not authenticated payload identity.
+        // Accept authors only from the logical identity or unlocked local profile.
+        if memory.id == track_id || memory.local_title == track_title {
+            let accepted = accepted_author(memory)?;
+            anyhow::ensure!(memory.id != track_id || accepted,
+                "daily track author does not match this profile; append was not applied");
+            if accepted { tracks.push(memory); }
+        }
+    }
+    tracks.sort_by(|left, right| {
+        (left.id != track_id).cmp(&(right.id != track_id))
+            .then_with(|| left.local_created_at.cmp(&right.local_created_at))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(tracks)
+}
+
 /// Assemble transport: RSRS_ADDR (or session.json addr) -> remote backup store; else local store.
 fn build_transport() -> Result<Arc<dyn MemoryTransport>> {
     if let Some((addr, token)) = remote_config_from_session_or_env()? {
@@ -1604,8 +1698,14 @@ fn build_remote() -> Result<RemoteTransport> {
 
 /// Unlock session keys: local keyfile first (from keygen/register), else env vars.
 fn build_session() -> Result<SessionKeys> {
-    if let Ok(keys) = load_local_session() {
-        return Ok(keys);
+    build_session_with_owner().map(|(keys, _)| keys)
+}
+
+/// Preserve only the owner alias from the local snapshot that supplied these keys.
+/// Environment-key fallback must never inherit identity from an unrelated profile.
+fn build_session_with_owner() -> Result<(SessionKeys, Option<String>)> {
+    if let Ok(session) = auth::load_local_session_with_owner() {
+        return Ok(session);
     }
     if read_session_json().is_err() {
         // no local session -> first-run guide
@@ -1625,7 +1725,7 @@ fn build_session() -> Result<SessionKeys> {
         .map_err(|_| anyhow!("need RSRS_WRAPPED_URK (from keygen/login)"))?;
     let urk_nonce = respire::env::var("RSRS_URK_NONCE")
         .map_err(|_| anyhow!("need RSRS_URK_NONCE (from keygen/login)"))?;
-    SessionKeys::unlock(&password, &secret, &kdf_salt, &wrapped_urk, &urk_nonce)
+    Ok((SessionKeys::unlock(&password, &secret, &kdf_salt, &wrapped_urk, &urk_nonce)?, None))
 }
 
 fn read_session_json() -> Result<serde_json::Value> {
@@ -1819,6 +1919,292 @@ fn run_tree_deepen(
         }
     }
     Ok(())
+}
+
+/// TUI/non-TUI dispatch for `extract`, kept out of `run_local_inner` to bound its stack frame.
+fn run_extract_command(command: &Command) -> Result<()> {
+    let Command::Extract {
+        targets,
+        tui,
+        all,
+        id,
+        dry_run,
+        since,
+        limit,
+        cwd,
+        model,
+        session,
+        kind,
+        importance,
+        parent,
+        include_subagents,
+        force,
+    } = command
+    else {
+        return Ok(());
+    };
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin())
+        && std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let filters_absent = since.is_none()
+        && limit.is_none()
+        && cwd.is_none()
+        && model.is_none()
+        && session.is_none()
+        && kind.as_str() == "context"
+        && importance.as_str() == "important"
+        && parent.is_empty()
+        && !*include_subagents
+        && !*force;
+    let bare = !*targets && id.is_none() && !*all && !*dry_run && filters_absent && !json_mode();
+    if *tui {
+        if !bare {
+            anyhow::bail!(
+                "--tui opens the interactive picker and cannot be combined with extraction options \
+                 (--since/--limit/--cwd/--model/--session/--kind/--importance/--parent/--include-subagents/--force) \
+                 or --json; drop --tui to apply them."
+            );
+        }
+        return respire::extract_tui::run();
+    }
+    if bare && interactive {
+        return respire::extract_tui::run();
+    }
+    run_extract(
+        *targets,
+        id.as_deref(),
+        *dry_run,
+        since.as_deref(),
+        *limit,
+        cwd.as_deref(),
+        model.as_deref(),
+        session.as_deref(),
+        kind,
+        importance,
+        parent,
+        *include_subagents,
+        *force,
+    )
+}
+
+/// Extract local coding-agent sessions into rsrs memories (see `extract --help`).
+fn run_extract(
+    targets_only: bool,
+    id: Option<&str>,
+    dry_run: bool,
+    since: Option<&str>,
+    limit: Option<usize>,
+    cwd: Option<&str>,
+    model_filter: Option<&str>,
+    session_filter: Option<&str>,
+    kind: &str,
+    importance: &str,
+    parent: &str,
+    include_subagents: bool,
+    force: bool,
+) -> Result<()> {
+    if !matches!(importance, "important" | "trivial") {
+        anyhow::bail!("--importance must be important or trivial");
+    }
+    if !matches!(
+        kind,
+        "context" | "decision" | "preference" | "task" | "emotion" | "time" | "skill" | "knowledge"
+    ) {
+        anyhow::bail!("--kind must be context|decision|preference|task|emotion|time|skill|knowledge");
+    }
+    if targets_only {
+        let sources = respire::session_import::source_list();
+        let installed = sources.iter().filter(|source| source.installed).count();
+        let items = sources
+            .iter()
+            .map(|source| {
+                OutputItem::new(
+                    source.id.clone(),
+                    if source.installed { OutputStatus::Ok } else { OutputStatus::Skip },
+                    if source.installed {
+                        format!("{} ({} root(s))", source.name, source.roots.len())
+                    } else {
+                        format!("{} not found", source.name)
+                    },
+                )
+            })
+            .collect();
+        let details = serde_json::Value::Array(
+            sources
+                .iter()
+                .map(|source| {
+                    serde_json::json!({
+                        "id": source.id,
+                        "name": source.name,
+                        "installed": source.installed,
+                        "roots": source.roots.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+                    })
+                })
+                .collect(),
+        );
+        let mut result = ResultEnvelope::new(
+            "extract",
+            OutputStatus::Ok,
+            serde_json::json!({"count": sources.len(), "installed": installed}),
+            items,
+        );
+        result.details = details;
+        result.actions.push("extract --all --dry-run".into());
+        return emit_result(result);
+    }
+
+    let scan_options = respire::session_import::ScanOptions {
+        roots: Vec::new(),
+        cwd: cwd.map(str::to_owned),
+        model: model_filter.map(str::to_owned),
+        since: match since {
+            None => None,
+            Some(value) => Some(
+                respire::session_import::scan_util::date_bound(value, false).ok_or_else(|| {
+                    respire_app::input_error::InputError(format!(
+                        "invalid --since '{value}': use today|yesterday|Nd|YYYY-MM-DD"
+                    ))
+                })?,
+            ),
+        },
+        until: None,
+        limit: limit.unwrap_or(200),
+        include_subagents,
+    };
+
+    let scanners: Vec<Box<dyn respire::session_import::SessionScanner>> = match id {
+        Some(id) => vec![respire::session_import::find_scanner(id).ok_or_else(|| {
+            anyhow::anyhow!("unknown platform '{id}' (run `rsrs extract --targets`)")
+        })?],
+        None => respire::session_import::scanners()
+            .into_iter()
+            .filter(|scanner| !scanner.roots().is_empty())
+            .collect(),
+    };
+    if scanners.is_empty() {
+        return emit_result(ResultEnvelope::new(
+            "extract",
+            OutputStatus::Skip,
+            serde_json::json!({"reason": "no installed session stores detected"}),
+            Vec::new(),
+        ));
+    }
+
+    let mut sessions = Vec::new();
+    for scanner in &scanners {
+        let label = format!("Scanning {} sessions", scanner.name());
+        progress::phase(&label, &label);
+        let mut found = scanner.scan(&scan_options);
+        found.retain(|session| scan_options.matches(session));
+        if let Some(filter) = session_filter {
+            found.retain(|session| session.id.contains(filter));
+        }
+        sessions.extend(found);
+    }
+    let sessions = respire::session_import::dedupe(sessions);
+    let discovered = sessions.len();
+    let mut cursor = respire::session_import::Cursor::load();
+    let fresh: Vec<respire::session_import::Session> = sessions
+        .into_iter()
+        .filter(|session| force || !cursor.is_imported(session))
+        .collect();
+    let not_imported = fresh.len();
+    let pending = respire::session_import::cap_per_platform(fresh, scan_options.limit);
+
+    let convert_options = respire::session_import::ConvertOptions {
+        kind: respire::Kind::from_str(kind),
+        importance: importance.to_owned(),
+        parent: String::new(),
+        user: respire::service::current_user(),
+        device: respire::service::device_tag(),
+        project: String::new(),
+    };
+    let mut entries: Vec<respire::MemoryEntry> = pending
+        .iter()
+        .map(|session| respire::session_import::session_entry(session, &convert_options))
+        .collect();
+
+    let platform_counts: Vec<(String, usize)> = scanners
+        .iter()
+        .map(|scanner| {
+            let id = scanner.id();
+            (
+                id.to_owned(),
+                pending.iter().filter(|session| session.platform == id).count(),
+            )
+        })
+        .filter(|(_, count)| *count > 0)
+        .collect();
+    let items: Vec<OutputItem> = platform_counts
+        .iter()
+        .map(|(id, count)| OutputItem::new(id.clone(), OutputStatus::Ok, format!("{count} session(s)")))
+        .collect();
+
+    if dry_run {
+        let mut result = ResultEnvelope::new(
+            "extract",
+            OutputStatus::Ok,
+            serde_json::json!({
+                "dry_run": true,
+                "scanned": discovered,
+                "pending": entries.len(),
+                "skipped_imported": discovered - not_imported,
+                "deferred_by_limit": not_imported - pending.len(),
+                "by_platform": platform_counts.iter().map(|(id, count)| serde_json::json!({"id": id, "count": count})).collect::<Vec<_>>(),
+            }),
+            items,
+        );
+        result.details = serde_json::json!({
+            "sessions": pending.iter().map(|session| session.to_json()).collect::<Vec<_>>(),
+        });
+        result.actions.push("extract --all".into());
+        return emit_result(result);
+    }
+
+    if entries.is_empty() {
+        let mut result = ResultEnvelope::new(
+            "extract",
+            OutputStatus::Skip,
+            serde_json::json!({"imported": 0, "scanned": discovered, "skipped_imported": discovered - not_imported, "deferred_by_limit": not_imported}),
+            Vec::new(),
+        );
+        if discovered > 0 && not_imported == 0 {
+            result.actions.push("extract --all --force".into());
+        }
+        return emit_result(result);
+    }
+
+    progress::phase("Embedding and storing memories", "Embedding and storing memories");
+    let outcome = respire::session_import::import_entries(
+        &mut entries,
+        parent,
+        |done, total| progress::phase_count("写入记忆", "Storing memories", done, total),
+        |start, completed| {
+            for (offset, ok) in completed.iter().enumerate() {
+                if *ok {
+                    cursor.mark(&pending[start + offset]);
+                }
+            }
+            cursor.save()?;
+            Ok(())
+        },
+    )?;
+    let imported = outcome.imported;
+
+    let mut result = ResultEnvelope::new(
+        "extract",
+        OutputStatus::Ok,
+        serde_json::json!({
+            "imported": imported,
+            "scanned": discovered,
+            "deferred_by_limit": not_imported - pending.len(),
+            "by_platform": platform_counts.iter().map(|(id, count)| serde_json::json!({"id": id, "count": count})).collect::<Vec<_>>(),
+        }),
+        items,
+    );
+    result
+        .actions
+        .push("tidy imported roots: rsrs list --since-resort --json".into());
+    emit_result(result)
 }
 
 /// Inject-source distribution: no args injects every detected host; --targets lists status; --id injects/uninstalls.
@@ -2306,10 +2692,11 @@ fn run_bench_run(
 
     let session = build_session()?;
     let store = build_local()?;
-    let candidates = scoped_candidates(&store)?;
+    let (candidates, index_pending, resident) = respire::resident::recall_catalog(&session, &store)?;
+    let _resident_scope = resident.enter();
     let active_ids: std::collections::HashSet<String> =
         candidates.iter().map(|m| m.id.clone()).collect();
-    let embedder = BgeEmbedder::load_model(&build_local()?.retrieval_model()?)?;
+    let embedder = BgeEmbedder::load_model(&store.retrieval_model()?)?;
 
     // Expected-id check: warn when not in the active store (deleted/merged) - those cases fail forever
     let mut missing: Vec<String> = Vec::new();
@@ -2333,7 +2720,7 @@ fn run_bench_run(
             }
         }
         let started = std::time::Instant::now();
-        let (ranked, _, fallback) = recall_select::recall(&session, &embedder, &candidates, &q)?;
+        let (ranked, _, fallback, _) = recall_select::recall(&session, &embedder, &candidates, &q)?;
         latency.push(started.elapsed().as_micros());
         selector_fallbacks += usize::from(fallback.is_some());
         let ids: Vec<String> = ranked.iter().map(|r| r.entry.id.clone()).collect();
@@ -2363,6 +2750,7 @@ fn run_bench_run(
             .into(),
     );
     params.insert("selector_fallbacks".into(), selector_fallbacks.to_string());
+    params.insert("index_pending".into(), index_pending.to_string());
     params.insert("retrieval_policy".into(), "Core-owned".into());
     if !latency.is_empty() {
         params.insert("p50_us".into(), latency[latency.len() / 2].to_string());
@@ -3816,10 +4204,6 @@ fn run_defrag(min: f32, top: usize) -> Result<()> {
     emit_result(result)?;
     Ok(())
 }
-fn load_local_session() -> Result<SessionKeys> {
-    auth::load_local_session()
-}
-
 fn run_keygen(pass: Option<&str>, force: bool) -> Result<()> {
     // v4: --pass is unused for encryption (super password is system-generated); kept for old scripts
     if pass.is_some() {
@@ -4234,6 +4618,18 @@ fn run_doctor(check_remote: bool, check_update: bool, fix: bool) -> Result<()> {
         format!("{n}/{t} - new since last tidy (TIDY when the threshold is hit; reset after tidy)"),
     );
 
+    let runtime_version = if rpc::worker_active() {
+        Some(crate::app_version::embedded().to_owned())
+    } else {
+        rpc::runtime_brief().map(|(_, _, version)| version)
+    };
+    add(
+        &mut items,
+        "Runtime version",
+        true,
+        runtime_version.clone().unwrap_or_else(|| "not connected".to_owned()),
+    );
+
     // 9) CLI version (--check-update or RSRS_UPDATE_CHECK=1 hits the network; default reads cache, no network)
     //    Doctor must not stall on the network, so it does not force a query - report known result, hint how to check if no cache.
     if respire::update_check::enabled() {
@@ -4280,6 +4676,8 @@ fn run_doctor(check_remote: bool, check_update: bool, fix: bool) -> Result<()> {
                 OutputStatus::Skip
             } else if name == "CLI version" && note.contains("not checked") {
                 OutputStatus::Skip
+            } else if name == "Runtime version" && runtime_version.is_none() {
+                OutputStatus::Skip
             } else if name == "tidy counter" && *ok && note.contains("threshold is hit") {
                 OutputStatus::Warn
             } else if model_warnings.contains(&name.as_str()) {
@@ -4312,7 +4710,7 @@ fn run_doctor(check_remote: bool, check_update: bool, fix: bool) -> Result<()> {
     let mut result = ResultEnvelope::new(
         "doctor",
         status,
-        serde_json::json!({ "version": respire::VERSION, "pass": pass, "warn": warn, "fail": fail, "skip": skip, "total": rows.len() }),
+        serde_json::json!({ "version": respire::VERSION, "runtime_version": runtime_version, "pass": pass, "warn": warn, "fail": fail, "skip": skip, "total": rows.len() }),
         rows,
     );
     result.details = serde_json::json!({
@@ -5173,6 +5571,7 @@ fn is_write_command(c: &Command) -> bool {
             | Command::Resort { .. }
             | Command::Split { .. }
             | Command::Import { .. }
+            | Command::Extract { .. }
             | Command::Repack
             | Command::RootCreate { .. }
             | Command::TreeCure { .. }
@@ -5299,6 +5698,12 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 }
 
 fn main_body() -> i32 {
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == "--core-worker-internal") {
+        return match respire_app::core_sdk::worker::run() {
+            Ok(()) => 0,
+            Err(error) => { eprintln!("Core worker stopped: {error:#}"); 1 }
+        };
+    }
     set_json_mode(std::env::args_os().any(|arg| arg == "--json")
         || respire::env::var("RSRS_JSON").is_ok_and(|value| value == "1" || value == "true"));
     if std::env::args_os().any(|arg| arg == "--client-only") {
@@ -5696,7 +6101,16 @@ fn run_local(args: Cli) -> Result<()> {
     }
 }
 
+fn commit_prepared_write<T>(simple: bool, generation: usize, action: impl FnOnce() -> Result<T>) -> Result<T> {
+    if simple && rpc::worker_active() { rpc::foreground_phase(generation, action) }
+    else { action() }
+}
+
 fn run_local_inner(args: Cli) -> Result<()> {
+    let write_generation = rpc::sync_generation();
+    let short_write = matches!(args.command.as_ref(), Some(Command::Update { .. }))
+        || matches!(args.command.as_ref(), Some(Command::Remember {
+            merge_ids: None, supersedes: None, see_also, .. }) if see_also.is_empty());
     if rpc::worker_active() {
         respire::service::ensure_runtime_profile()?;
     }
@@ -5858,6 +6272,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
         }) => return run_tree_cure(*top, id.as_deref(), parent.as_deref(), *auto, *min),
         Some(Command::TreeFloat { go, min }) => return run_tree_float(*go, *min),
         Some(Command::Split { id, go, spec }) => return run_split(id, *go, spec.as_deref()),
+        Some(command @ Command::Extract { .. }) => return run_extract_command(command),
         Some(Command::Inject {
             targets,
             id,
@@ -6387,7 +6802,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
                     eprintln!("WARN {w}");
                 }
             }
-            let session = build_session()?;
+            let (session, profile_owner) = build_session_with_owner()?;
             let store = build_local()?;
             let stamp = now_stamp();
             let mut id = Uuid::new_v4().to_string();
@@ -6404,31 +6819,29 @@ fn run_local_inner(args: Cli) -> Result<()> {
             let (mut content, mut title) = (content, title);
             if importance == "trivial" {
                 if respire::service::diary_mode() != "verbose" {
-                    // Track mode: one diary-track entry per day. Look up every same-title track (many sessions/devices may each have created one):
-                    // found -> merge all lines into the earliest by time, tombstone the rest (self-heal); none -> create with a deterministic id (same id across devices, sync converges)
+                    // Stable identity survives retitling; dated titles remain a fallback
+                    // for legacy tracks created before deterministic IDs were used.
                     let now_local = chrono::Local::now();
                     let day = now_local.format("%Y-%m-%d").to_string();
                     let track_title = format!("活动轨迹 {day}");
                     let line = format!("【{}】{}", now_local.format("%H:%M"), content.trim());
                     let all = store.all(false)?;
-                    // Track identity is the title only (the dated track title is specific enough):
-                    // do not also require importance - a merged/old-peer copy may be normal,
-                    // and that filter kicked the track off the day's chain, old lines flowing back (reproduced 2026-09-11)
-                    let mut tracks: Vec<&respire::StoredMemory> = all
-                        .iter()
-                        .filter(|m| !m.deleted && m.local_title == track_title)
-                        .collect();
-                    tracks.sort_by(|a, b| a.local_created_at.cmp(&b.local_created_at));
+                    let user = current_user();
                     let track_id = uuid::Uuid::new_v5(
                         &uuid::Uuid::NAMESPACE_URL,
-                        format!("activity-track/{}/{}", current_user(), day).as_bytes(),
+                        format!("activity-track/{user}/{day}").as_bytes(),
                     )
                     .to_string();
+                    let tracks = select_diary_tracks(&all, &track_id, &track_title, |memory| {
+                        let author = MemoryEngine::open(&session, memory)?.user;
+                        Ok(author == user || profile_owner.as_deref() == Some(author.as_str()))
+                    })?;
                     if !tracks.is_empty() {
-                        // Primary = earliest created; other entries' lines merge in, then tombstone (self-heal merge)
+                        // Prefer the stable ID; otherwise keep the earliest legacy track.
+                        // The source-checked transaction still protects every merged row.
                         let main = tracks[0];
                         let mut merged = String::new();
-                        for (i, t) in tracks.iter().enumerate() {
+                        for t in &tracks {
                             let full = MemoryEngine::open(&session, t)?;
                             for row in full.content.lines() {
                                 if row.trim() == format!("【活动轨迹】{day}")
@@ -6439,49 +6852,19 @@ fn run_local_inner(args: Cli) -> Result<()> {
                                 merged.push_str(row.trim_end());
                                 merged.push('\n');
                             }
-                            if i > 0 {
-                                MemoryTransport::forget(&store, &t.id).map_err(|e| {
-                                    anyhow::anyhow!(
-                                        "failed to tombstone merged track ({}): {e}",
-                                        t.id
-                                    )
-                                })?;
-                            }
+
                         }
                         merged.push_str(&line);
-                        let e = respire::MemoryEntry {
-                            supersedes: String::new(),
-                            superseded_by: String::new(),
-                            see_also: Vec::new(),
-                            id: main.id.clone(),
-                            kind: respire::memory::model::Kind::from_str(&main.local_kind),
-                            tags: vec![],
-                            title: track_title.clone(),
-                            content: merged,
-                            user: main.user.clone(),
-                            computer: if main.local_computer.is_empty() {
-                                respire::service::device_tag()
-                            } else {
-                                main.local_computer.clone()
-                            },
-                            device: if main.local_device.is_empty() {
-                                respire::service::device_tag()
-                            } else {
-                                main.local_device.clone()
-                            },
-                            modified_by: respire::service::device_tag(),
-                            project: main.local_project.clone(),
-                            created_at: main.local_created_at.clone(),
-                            updated_at: stamp.clone(),
-                            emotion: 0.0,
-                            parent_id: main.local_parent_id.clone(),
-                            importance: "trivial".to_owned(),
-                        };
-                        let stored = MemoryEngine::seal(&session, embedder!(), &e, &e.user)?;
-                        store.put(&stored)?;
+                        // Appending must preserve a user's title and other metadata.
+                        let mut e = MemoryEngine::open(&session, main)?;
+                        e.content = merged;
+                        e.updated_at = store.edit_stamp(&main.id)?;
+                        e.modified_by = respire::service::device_tag();
+                        let stored = MemoryEngine::seal(&session, embedder!(), &e, &main.user)?;
+                        anyhow::ensure!(commit_prepared_write(short_write, write_generation, || store.put_diary_checked(&stored, &main.ciphertext, &tracks[1..]))?, "diary was not saved");
                         respire::hooks::fire(
                             respire::hooks::HookEvent::PostRemember,
-                            respire::hooks::remember_done_payload(&stored.id, &title, "trivial"),
+                            respire::hooks::remember_done_payload(&stored.id, &e.title, &e.importance),
                         );
                         // A sealed StoredMemory contains the encrypted payload and local
                         // storage columns.  It is an internal persistence shape, not a
@@ -6492,8 +6875,9 @@ fn run_local_inner(args: Cli) -> Result<()> {
                             OutputStatus::Ok,
                             serde_json::json!({
                                 "action": "diary_appended",
+                                "index_state": if stored.local_artifact.is_empty() { "pending" } else { "ready" },
                                 "id": stored.id,
-                                "title": track_title,
+                                "title": e.title,
                             }),
                             vec![OutputItem::new(
                                 "write",
@@ -6519,7 +6903,9 @@ fn run_local_inner(args: Cli) -> Result<()> {
             // -- Judge-then-store (dedup first, then choose): unless --force/--merge-ids/--parent (explicit attach is intent)
             //    run an internal recall of similar candidates; diary trivia skips dedup (daily log is not a duplicate event; it goes on the time chain) --
             if !force && merge_ids.is_none() && supersedes.is_none() && see_also.is_empty() && parent.is_empty() && importance != "trivial" {
-                let candidates_all = scoped_candidates(&store)?;
+                let (candidates_all, pending, lease) = respire::resident::recall_catalog(&session, &store)?;
+                let _resident = lease.enter();
+                if pending > 0 { rpc::kick_index(); }
                 let q = MemoryQuery::new(&content).limit(5);
                 let candidates =
                     MemoryEngine::remember_candidates(&session, embedder!(), &candidates_all, &q)?;
@@ -6570,6 +6956,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
                     result
                         .actions
                         .push("rsrs remember \"<content>\" --force to write as new entry".into());
+                    result.actions.extend(respire::service::write_decision_actions().iter().map(|action| (*action).to_owned()));
                     emit_result(result)?;
                     return Ok(());
                 }
@@ -6605,6 +6992,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
                     result
                         .actions
                         .push("rsrs remember \"<content>\" --force to write as new entry".into());
+                    result.actions.extend(respire::service::write_decision_actions().iter().map(|action| (*action).to_owned()));
                     emit_result(result)?;
                     return Ok(());
                 }
@@ -6737,7 +7125,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
                 respire::service::store_related(&session,&store,embedder!(),&mut entry,supersedes.as_deref(),&see_also)?
             } else {
                 let sealed = MemoryEngine::seal(&session, embedder!(), &entry, &entry.user)?;
-                anyhow::ensure!(store.put(&sealed)?, "memory was not saved");
+                anyhow::ensure!(commit_prepared_write(short_write, write_generation, || store.put_checked(&sealed, None))?, "memory was not saved");
                 sealed
             };
             // Plugin hook post-remember: observe only, never blocks (failure policy is inside hooks::fire)
@@ -6767,6 +7155,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
                 status,
                 serde_json::json!({
                     "action": "created",
+                    "index_state": if stored.local_artifact.is_empty() { "pending" } else { "ready" },
                     "id": entry.id,
                     "parent": parent_id,
                     "maintenance_hint": hint,
@@ -6843,8 +7232,11 @@ fn run_local_inner(args: Cli) -> Result<()> {
             let recall_generation = rpc::sync_generation();
             let session = build_session()?;
             let store = build_local()?;
+            let (candidates, index_pending, resident) = respire::resident::recall_catalog(&session, &store)?;
+            let _resident_scope = resident.enter();
+            if index_pending > 0 { rpc::kick_index(); }
             if trace {
-                let preview = candidates_preview(&store)?;
+                let preview = &candidates;
                 let primary = candidates_count_primary(&preview);
                 let normals = candidates_count_normal(&preview);
                 eprintln!(
@@ -6863,9 +7255,8 @@ fn run_local_inner(args: Cli) -> Result<()> {
             if let Some(p) = &project {
                 q = q.of_project(p);
             }
-            let candidates = scoped_candidates(&store)?;
             // 3. small-to-big: hit body + ancestor bodies (budget is built-in; RSRS_ANCESTOR_BUDGET=0 turns it off)
-            let (ranked, recall_mode, selection_fallback) = match mode {
+            let (ranked, recall_mode, selection_fallback, routing) = match mode {
                 Some(mode) => {
                     recall_select::recall_with_mode(&session, embedder!(), &candidates, &q, &mode)?
                 }
@@ -6916,7 +7307,8 @@ fn run_local_inner(args: Cli) -> Result<()> {
                     "recall",
                     OutputStatus::Skip,
                     serde_json::json!({"query":query,"count":0,"recall_mode":recall_mode,
-                        "selection_fallback":selection_fallback,"embedding_model":store.retrieval_model()?}),
+                        "selection_fallback":selection_fallback,"embedding_model":store.retrieval_model()?,"routing":routing,
+                        "index_pending":index_pending,"indexed_candidates":candidates.len().saturating_sub(index_pending),"lexical_candidates":index_pending}),
                     vec![OutputItem::new("results", OutputStatus::Skip, "0")],
                 ))?;
                 return Ok(());
@@ -6946,7 +7338,8 @@ fn run_local_inner(args: Cli) -> Result<()> {
                 "recall",
                 OutputStatus::Ok,
                 serde_json::json!({"query":query,"count":ranked.len(),"limit":limit,"project":project,
-                    "recall_mode":recall_mode,"selection_fallback":selection_fallback,"embedding_model":store.retrieval_model()?,"related":associations.related.len()}),
+                    "recall_mode":recall_mode,"selection_fallback":selection_fallback,"embedding_model":store.retrieval_model()?,"related":associations.related.len(),"routing":routing,
+                    "index_pending":index_pending,"indexed_candidates":candidates.len().saturating_sub(index_pending),"lexical_candidates":index_pending}),
                 items,
             );
             result.related = associations.related;
@@ -8055,6 +8448,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
             );
             result.details = serde_json::json!({"merge":report.merge,"parent":report.parent});
             result.actions.push("candidates <content> --json".into());
+            result.actions.extend(respire::service::write_decision_actions().iter().map(|action| (*action).to_owned()));
             emit_result(result)?;
         }
         Command::V => unreachable!("version is printed before run_local work"),
@@ -8223,6 +8617,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
                 .find(|m| m.id == full && !m.deleted)
                 .ok_or_else(|| anyhow!("not found #{id}"))?;
             let mut entry = MemoryEngine::open(&session, stored)?;
+            let original_entry = entry.clone();
             if let Some(t) = title {
                 entry.title = t;
             }
@@ -8252,15 +8647,21 @@ fn run_local_inner(args: Cli) -> Result<()> {
             entry.updated_at = store.edit_stamp(&stored.id)?;
             entry.modified_by = respire::service::device_tag();
             let user = entry.user.clone();
-            let new_stored = MemoryEngine::seal(&session, embedder!(), &entry, &user)?;
-            store.put(&new_stored)?;
+            let mut new_stored = MemoryEngine::seal(&session, embedder!(), &entry, &user)?;
+            if respire::core_sdk::indexing_deferred() && !stored.local_artifact.is_empty() {
+                let reusable: bool = respire::core_sdk::execute("index_reusable",
+                    serde_json::json!({"before":original_entry,"after":entry}))?;
+                if reusable { new_stored.local_artifact = stored.local_artifact.clone(); }
+            }
+            anyhow::ensure!(commit_prepared_write(short_write, write_generation, || store.put_checked(&new_stored, Some(&stored.ciphertext)))?, "memory was not saved");
             // Adoption: an update is adoption - if a query in the last 10 minutes hit this entry, record it in query_log
             let _ = store.mark_adopted(&stored.id);
             let hint = note_write_maintenance();
             let mut result = ResultEnvelope::new(
                 "update",
                 OutputStatus::Ok,
-                serde_json::json!({"action":"written", "id": stored.id, "maintenance_hint": hint}),
+                serde_json::json!({"action":"written", "id": stored.id, "maintenance_hint": hint,
+                    "index_state": if new_stored.local_artifact.is_empty() { "pending" } else { "ready" }}),
                 vec![OutputItem::new(
                     "entry",
                     OutputStatus::Ok,
@@ -8283,6 +8684,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
         | Command::TreeCure { .. }
         | Command::TreeFloat { .. }
         | Command::Split { .. }
+        | Command::Extract { .. }
         | Command::Inject { .. }
         | Command::TreeDeepen { .. }
         | Command::Config { .. }
@@ -8411,6 +8813,7 @@ mod capture_tests {
         crate::rpc::set_worker_active(true);
         respire::service::keygen()?;
         let missing = dir.path().join("missing.json").to_string_lossy().into_owned();
+        let missing_output = dir.path().join("absent").join("export.json").to_string_lossy().into_owned();
         for command in [
             vec!["restore", "deadbeef"],
             vec!["grant", "create", "--root", "deadbeef", "--label", "probe"],
@@ -8419,6 +8822,9 @@ mod capture_tests {
             vec!["import", &missing],
             vec!["bench", "run", &missing],
             vec!["share-import", &missing],
+            vec!["export", &missing_output],
+            vec!["backup", &missing_output],
+            vec!["agent-config", "--set", "workspace_mode=bogus"],
         ] {
             let mut args = vec!["--json".to_owned()];
             args.extend(command.iter().map(|arg| (*arg).to_owned()));
@@ -8435,6 +8841,53 @@ mod capture_tests {
         let error = respire_app::input_error::read_file(&invalid, "fixture").err()
             .ok_or_else(|| anyhow::anyhow!("invalid UTF-8 was accepted"))?;
         assert_eq!(super::command_failure(&error).1, 1);
+        let existing = dir.path().join("existing-backup.db");
+        std::fs::write(&existing, b"preserve existing backup")?;
+        let error = respire::service::backup_db(&existing).err()
+            .ok_or_else(|| anyhow::anyhow!("existing backup was overwritten"))?;
+        assert_eq!(super::command_failure(&error).1, 1);
+        assert_eq!(std::fs::read(&existing)?, b"preserve existing backup");
+        assert!(!dir.path().join("absent").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn bench_runs_on_pending_resident_snapshot_without_writing_index() -> anyhow::Result<()> {
+        use respire::MemoryTransport;
+        let _lock = crate::TEST_ENV_LOCK.lock().map_err(|error| anyhow::anyhow!("{error}"))?;
+        let dir = tempfile::tempdir()?;
+        let _guard = EnvGuard { prev: respire::env::var("RSRS_DATA_DIR").ok() };
+        std::env::set_var("RSRS_DATA_DIR", dir.path());
+        crate::rpc::set_worker_active(true);
+        respire::service::keygen()?;
+        let keys = super::build_session()?;
+        let store = super::build_local()?;
+        let entry: respire::MemoryEntry = serde_json::from_value(serde_json::json!({
+            "id":"pending-bench","kind":"Context","tags":[],"title":"benchmark pending needle",
+            "content":"benchmark pending needle","user":"test","computer":"test","project":"",
+            "created_at":"2026-10-10T00:00:00Z","updated_at":"2026-10-10T00:00:00Z",
+            "emotion":0,"parent_id":"","importance":"important"
+        }))?;
+        let stored = {
+            let _defer = respire::core_sdk::defer_indexing();
+            respire::MemoryEngine::seal(&keys, &respire::core_sdk::search::HashingEmbedder::new(1024), &entry, "test")?
+        };
+        store.put_checked(&stored, None)?;
+        let eval = dir.path().join("eval.jsonl");
+        let output = dir.path().join("bench.json");
+        std::fs::write(&eval, r#"{"query":"benchmark pending needle","expect":["pending-bench"]}"#)?;
+        let captured = capture_run(vec!["--json".into(), "bench".into(), "run".into(),
+            eval.to_string_lossy().into_owned(), "--save".into(), output.to_string_lossy().into_owned()]);
+        assert_eq!(captured.exit, 0, "{:?}", captured.envelope);
+        let report: super::bench::BenchReport = serde_json::from_slice(&std::fs::read(output)?)?;
+        assert_eq!(report.params.get("index_pending").map(String::as_str), Some("1"));
+        assert_eq!(report.metrics.hit1, 1.0);
+        assert_eq!(report.n_entries, 1);
+        let current = store.all(false)?;
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].ciphertext, stored.ciphertext);
+        assert!(current[0].local_artifact.is_empty());
+        respire::resident::clear()?;
         Ok(())
     }
 
@@ -8487,6 +8940,15 @@ mod capture_tests {
             if total == 0 || captured.envelope.items.is_empty() {
                 return Err("doctor envelope has no checks".to_owned());
             }
+            if captured.envelope.summary["runtime_version"] != crate::app_version::embedded() {
+                return Err("doctor did not report the executing runtime version".to_owned());
+            }
+            let runtime = captured.envelope.items.iter()
+                .find(|item| item.name == "Runtime version")
+                .ok_or("doctor did not include the runtime version check")?;
+            if runtime.value != crate::app_version::embedded() || !matches!(runtime.status, crate::OutputStatus::Ok) {
+                return Err("doctor runtime version check differs from the executing binary".to_owned());
+            }
             let want = match captured.envelope.status {
                 crate::OutputStatus::Ok | crate::OutputStatus::Skip => 0,
                 crate::OutputStatus::Warn | crate::OutputStatus::Pending => 2,
@@ -8524,6 +8986,74 @@ mod capture_tests {
             Some(value) => std::env::set_var("RSRS_BIN_DIR", value),
             None => std::env::remove_var("RSRS_BIN_DIR"),
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod diary_identity_tests {
+    use super::*;
+
+    /// Construct selection-only metadata without opening a vault.
+    fn track(id: &str, user: &str, title: &str, created: &str) -> respire::StoredMemory {
+        let mut memory = respire::StoredMemory::new_pending(id.into(), user.into());
+        memory.local_title = title.into();
+        memory.local_created_at = created.into();
+        memory
+    }
+
+    /// Stable identity wins over older same-title legacy rows.
+    #[test]
+    fn stable_id_precedes_legacy_titles_and_preserves_importance_compatibility() -> Result<()> {
+        let mut legacy = track("legacy", "alice", "活动轨迹 2026-10-13", "2026-10-13T00:00:00Z");
+        legacy.local_importance = "normal".into();
+        let canonical = track("stable", "server-routing-owner", "User's renamed day", "2026-10-13T01:00:00Z");
+        let rows = vec![legacy, canonical];
+        let tracks = select_diary_tracks(&rows, "stable", "活动轨迹 2026-10-13", |row| Ok(row.id == "stable" || row.user == "alice"))?;
+        assert_eq!(tracks.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), ["stable", "legacy"]);
+        Ok(())
+    }
+
+    /// An unrelated canonical payload must fail before legacy candidates can be merged.
+    #[test]
+    fn canonical_author_mismatch_is_not_a_legacy_fallback() -> Result<()> {
+        let rows = vec![track("stable", "wire-owner", "renamed", "1"),
+            track("legacy", "alice", "活动轨迹 2026-10-13", "0")];
+        let result = select_diary_tracks(&rows, "stable", "活动轨迹 2026-10-13", |row| Ok(row.id != "stable"));
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    /// Blank titles remain valid while deleted and unrelated tracks stay separate.
+    #[test]
+    fn blank_title_deleted_rows_other_users_and_days_are_handled_separately() -> Result<()> {
+        let mut deleted = track("deleted", "alice", "活动轨迹 2026-10-13", "0");
+        deleted.deleted = true;
+        let rows = vec![
+            track("stable", "alice", "", "1"),
+            deleted,
+            track("other-user", "bob", "活动轨迹 2026-10-13", "0"),
+            track("other-day", "alice", "活动轨迹 2026-10-12", "0"),
+        ];
+        let tracks = select_diary_tracks(&rows, "stable", "活动轨迹 2026-10-13", |row| Ok(row.user == "alice"))?;
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].id, "stable");
+        assert!(select_diary_tracks(&rows, "charlie-stable", "活动轨迹 2026-10-14", |row| Ok(row.user == "charlie"))?.is_empty());
+        Ok(())
+    }
+
+    /// Live legacy tracks retain their deterministic earliest-created ordering.
+    #[test]
+    fn missing_or_deleted_stable_id_keeps_earliest_legacy_track() -> Result<()> {
+        let mut deleted = track("stable", "alice", "renamed", "0");
+        deleted.deleted = true;
+        let rows = vec![
+            track("later", "alice", "活动轨迹 2026-10-13", "2"),
+            track("earlier", "alice", "活动轨迹 2026-10-13", "1"),
+            deleted,
+        ];
+        let tracks = select_diary_tracks(&rows, "stable", "活动轨迹 2026-10-13", |row| Ok(row.user == "alice"))?;
+        assert_eq!(tracks.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), ["earlier", "later"]);
         Ok(())
     }
 }

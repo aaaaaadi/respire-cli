@@ -4,7 +4,8 @@
 flowchart LR
   Host[Host terminal] -->|owns lifecycle| Runtime[Loopback HTTP runtime]
   Sandbox[Sandbox CLI / TUI / MCP] -->|client-only| Runtime
-  Runtime --> Inference[Shared ONNX session inside runtime]
+  Runtime -->|anonymous stdin/stdout| Worker[Supervised Core worker]
+  Worker --> Inference[Shared native model session]
 ```
 
 | Context | Behavior |
@@ -27,6 +28,30 @@ rsrs --client-only recall "query" --titles --json
 Client-only mode forbids lifecycle changes, binary copies, upgrades, CPU recovery and
 `--direct` execution. MCP stdio does not copy the executable. A failed request never
 triggers sandbox takeover. An idle runtime stays running until the host stops it.
+
+`rsrs doctor` includes a `Runtime version` check. Its JSON summary exposes
+`runtime_version`, which is `null` when no runtime is connected. The TUI home
+and version pages show the connected runtime's version separately from the CLI
+version. A disconnected TUI shows `Runtime not connected` instead of a cached
+version. Reading this version does not start or replace a runtime.
+
+The TUI Models/inference page includes **Inference / Recall Benchmark**. Enter a
+query to measure one initial call and eight repeated rounds against the existing
+local runtime. The report separates the SDK's reported inference-probe time,
+full probe-request time, and full fast-Recall request
+time. It shows mean, P50, P95 and estimated sequential operations per second.
+Full request times include RPC and any scheduling waits; they do not isolate
+queue time. The first call is not necessarily a cold start, and repeated Recall
+can reuse query caches. Indexed-candidate ranges and pending-index counts identify
+an empty or changing library. These are current-load measurements, not retrieval
+quality scores or hardware guarantees. The benchmark never calls the quality
+selector API or changes the saved engine/mode; normal Recall logs and hit counts
+are still updated. Esc finishes the in-flight request and stops further rounds.
+
+Command progress labels inference activity and its waiting-task count as **global
+inference service** state. A zero count means no pending inference tasks, not that
+the displayed CLI command is waiting for inference. Read commands such as `show`
+do not perform inference; a multi-command script may be busy in a later write.
 
 Host `account <name>`, `account use <name>`, `space use <name>` and
 `config --data-dir <path>` coordinate shutdown, profile selection and restart.
@@ -52,6 +77,13 @@ matching active task. Cancellation must release its model slot before restart.
 | `RSRS_CLIENT_ONLY=1` | Host runtime client mode |
 | `RSRS_NO_AUTOSTART=1` | Compatibility synonym |
 | `RSRS_RPC_PORT` | Override the default port `15169` |
+
+Runtime RPC uses HTTP over loopback TCP only. Startup does not create or probe
+Unix-domain sockets or Windows named-pipe listeners, and there is no legacy
+pipe fallback. A process-lifetime installation lock prevents a second host on
+another port; library ownership is acquired before health/endpoint readiness.
+Core worker stdin/stdout and MCP stdio are anonymous inherited
+process streams, not runtime RPC listeners; their protocols are unchanged.
 
 CLI / TUI / MCP stdio connect to `127.0.0.1` without reading a token file or
 requiring token injection. Loopback listeners do not create a token. The runtime

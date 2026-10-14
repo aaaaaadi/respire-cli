@@ -94,7 +94,8 @@ class Smoke(support.Smoke):
             )
             category = next((name for name, terms in categories if any(term in text for term in terms)), "unclassified")
             self.report["cli_failure"] = {"command": args[0], "exit_code": output.returncode,
-                "error_class": category, "json_envelope": isinstance(value, dict)}
+                "error_class": category, "json_envelope": isinstance(value, dict),
+                "error": self.redacted_cli_error(env, output)}
             self.report["cli_failure"]["runtime_signals"] = [name for name, term in (
                 ("child_exited", "host runtime exited before readiness"),
                 ("startup_identity_changed", "runtime owner changed during startup"),
@@ -245,6 +246,7 @@ class Smoke(support.Smoke):
         env = dict(env, RSRS_DATA_DIR=str(path))
         user, password = "ci-migrate-" + secrets.token_hex(8), "ci-" + secrets.token_urlsafe(32)
         self.reserve_account(user)
+        self.diagnostic_secrets.add(password)
         if service == "rsrs" and self.keys.name == "linux-secret-service":
             self.keys.register_current_target(user)
         account = {"user": user, "token": None, "confirmed": False,
@@ -263,6 +265,7 @@ class Smoke(support.Smoke):
         account["pass_hash"] = hashlib.pbkdf2_hmac("sha256", password.encode(), auth_salt, 100_000, 32).hex()
         code = value["summary"].get("super")
         require(isinstance(code, str) and bool(code), "migration_super_missing")
+        self.diagnostic_secrets.update((code, session["token"], account["pass_hash"]))
         self.report["fixture_operation"] = "verify_registered_native_credentials"
         self.save()
         if sys.platform != "darwin":
@@ -603,6 +606,7 @@ class Smoke(support.Smoke):
         version = subprocess.run([str(self.args.binary), "--version"], env=env, capture_output=True, timeout=20)
         require(version.returncode == 0 and re.search(r"(?<!\S)" + re.escape(self.args.version) + r"(?!\S)", version.stdout.decode()), "binary_version_mismatch")
         self.cli(env, "model", "install-m3", timeout=900)
+        support.share_cpu_container(self.root, env, self.model)
         require(all(digest(self.model / p) == h for p, h in support.MODEL_HASHES.items()), "model_hash_mismatch")
         self.cli(env, "model", "engine", "cpu")
         probe = self.cli(env, "model", "probe", "--model", "m3")["summary"]

@@ -11,7 +11,7 @@ on:
         type: boolean
         default: false
       artifact_run:
-        description: Existing seven-platform validation run with the GNU artifact
+        description: Existing release validation run with the GNU artifact
         required: false
         type: string
       artifact_source:
@@ -23,7 +23,7 @@ on:
         required: false
         type: string
   push:
-    branches: [main]
+    branches: [main, 'fix/prompt-*']
   pull_request:
     branches: [main]
 permissions:
@@ -34,7 +34,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   platform-build:
-    # Release builds all seven targets. Keep the separate compile matrix manual.
+    # Release builds all four targets. Keep the separate compile matrix manual.
     if: ${{ github.event_name == 'workflow_dispatch' && !inputs.native_published_only && !inputs.artifact_run && !inputs.version_upgrade_only }}
     name: Compile (${{ matrix.target }})
     strategy:
@@ -43,18 +43,12 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
           - os: macos-latest
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -122,6 +116,7 @@ jobs:
       # Their own parallel-request checks still create concurrent client threads.
       RSRS_CORE_TEST_MODE: '1'
       RUST_TEST_THREADS: '1'
+      RUST_MIN_STACK: '16777216'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -146,7 +141,7 @@ jobs:
       - name: CLI line coverage ≥ 90% (exclude entry points, UI and network adapters)
         run: |
           cargo llvm-cov --locked -p respire --fail-under-lines 90 \
-            --ignore-filename-regex '(main\.rs|web\.rs|rpc\.rs|runtime_(policy|error|http)\.rs|inject_tui\.rs|shell\.rs|/shell/|/core/|model_(install|progress)\.rs|space\.rs|update_check\.rs|classify(_config)?\.rs|recall_select\.rs)'
+            --ignore-filename-regex '(main\.rs|web\.rs|rpc\.rs|runtime_(policy|error|http)\.rs|extract_tui\.rs|inject_tui\.rs|shell\.rs|/shell/|/core/|model_(install|progress)\.rs|space\.rs|update_check\.rs|classify(_config)?\.rs|recall_select\.rs)'
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -154,7 +149,13 @@ jobs:
       - run: node --check npm/scripts/release-notes.mjs
       - run: node npm/scripts/check-manifest.mjs
       - run: node npm/scripts/test-wrapper.mjs
+      - run: node --test npm/scripts/test-registry-publication.mjs npm/scripts/test-release-publication.mjs npm/scripts/test-dev6-publication-recovery.mjs npm/scripts/test-parallel-publication.mjs
+      - run: node --test scripts/test-stage-core-runtime.mjs
       - run: python3 scripts/test-dev-smoke-gate.py
+      - run: python3 scripts/test-dev-api-contract.py
+      - run: python3 scripts/test-dev-model-fixture.py
+      - run: python3 scripts/test-dev-fixture-tty.py
+      - run: python3 scripts/test-core-payload-lifetime.py
 
   native-published-m3:
     if: ${{ inputs.native_published_only && !inputs.version_upgrade_only }}
@@ -229,6 +230,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
+          retention-days: 1
           name: native-published-m3-${{ matrix.target }}
           path: native-model-results/real-account-return-verification.json
           if-no-files-found: warn
@@ -321,7 +323,7 @@ jobs:
           script="$(realpath scripts/test-real-m3-account-switch.py)"
           cd "$RUNNER_TEMP/dev13-owned-upgrade"
           "$RUNNER_TEMP/recovery-python/bin/python" "$script" --binary "$binary" \
-            --seed-binary "$RUNNER_TEMP/dev12-seed/rsrs" --expect-in-process \
+            --seed-binary "$RUNNER_TEMP/dev12-seed/rsrs" --expect-supervised-worker \
             --model-dir "$RUNNER_TEMP/release-probe/models/bge-m3" \
             --legacy-model-dir "$RUNNER_TEMP/release-probe/models/bge-m3" --legacy-model-file model_quantized.onnx \
             --output-dir "$RUNNER_TEMP/dev13-version-upgrade"
@@ -340,12 +342,14 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: ${{ success() && inputs.version_upgrade_only }}
         with:
+          retention-days: 1
           name: dev13-version-upgrade
           path: ${{ runner.temp }}/dev13-version-upgrade/version-upgrade-coverage.json
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         if: ${{ always() && !inputs.version_upgrade_only }}
         with:
+          retention-days: 1
           name: gnu-login-interruption
           path: |
             ${{ runner.temp }}/gnu-login-interruption/

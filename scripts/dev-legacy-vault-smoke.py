@@ -15,6 +15,8 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from dev_model_fixture import share_cpu_container
+from dev_fixture_tty import run_hidden
 
 UPSTREAM = "https://api.dev.rsrs.rs"
 REQUIRED = ("model_cpu_real", "local_v1_upgrade", "cloud_v2_recovery_upgrade", "cloud_v3_secret_key_recovery_upgrade")
@@ -122,10 +124,33 @@ class Smoke:
             self.keys.configure_env(env)
         return env
 
-    def cli(self, env, *args, timeout=180):
+    def redacted_cli_error(self, env, output):
         try:
-            output = subprocess.run([str(self.args.binary), "--direct", "--json", *args],
-                cwd=self.root, env=env, capture_output=True, timeout=timeout)
+            value = json.loads(output.stdout)
+            errors = value.get("errors", []) if isinstance(value, dict) else []
+            diagnostic = "; ".join(str(error) for error in errors)
+        except (ValueError, UnicodeError):
+            diagnostic = ""
+        diagnostic = diagnostic or output.stderr.decode("utf-8", errors="replace")[-1500:]
+        secrets_to_redact = set(self.diagnostic_secrets)
+        data_dir = env.get("RSRS_DATA_DIR")
+        session_path = Path(data_dir) / "session.json" if data_dir else None
+        if session_path is not None and session_path.is_file():
+            session = json.loads(session_path.read_text())
+            secrets_to_redact.update(session.get(key) for key in
+                ("pass", "pass_hash", "super", "token", "secret", "secret_key", "wrapped_urk", "urk_nonce", "kdf_salt")
+                if isinstance(session.get(key), str) and session[key])
+        for secret in sorted(secrets_to_redact, key=len, reverse=True):
+            diagnostic = diagnostic.replace(secret, "[redacted]")
+        diagnostic = re.sub(r"(?i)bearer\s+\S+", "Bearer [redacted]", diagnostic)
+        diagnostic = re.sub(r"(?i)\b(?:A3-)?[a-f0-9]{24,}\b", "[redacted]", diagnostic)
+        return diagnostic[:1500] or "no structured error"
+
+    def cli(self, env, *args, timeout=180, prompts=None):
+        try:
+            argv = [str(self.args.binary), "--direct", "--json", *args]
+            output = run_hidden(argv, prompts=prompts, cwd=self.root, env=env, timeout=timeout) if prompts is not None else subprocess.run(
+                argv, cwd=self.root, env=env, capture_output=True, timeout=timeout)
         finally:
             # Login and automatic indexing can start this fixture's runtime.
             # Release it before subsequent direct database consumers.
@@ -133,26 +158,8 @@ class Smoke:
                 cwd=self.root, env=env, capture_output=True, timeout=60)
             require(stopped.returncode in (0, 2), 'owned_runtime_stop_failed')
         if output.returncode != 0:
-            try:
-                value = json.loads(output.stdout)
-                errors = value.get("errors", []) if isinstance(value, dict) else []
-                diagnostic = "; ".join(str(error) for error in errors)
-            except (ValueError, UnicodeError):
-                diagnostic = ""
-            diagnostic = diagnostic or output.stderr.decode("utf-8", errors="replace")[-1500:]
-            secrets_to_redact = set(self.diagnostic_secrets)
-            session_path = Path(env["RSRS_DATA_DIR"]) / "session.json"
-            if session_path.is_file():
-                session = json.loads(session_path.read_text())
-                secrets_to_redact.update(session.get(key) for key in
-                    ("pass", "pass_hash", "super", "token", "secret", "secret_key", "wrapped_urk", "urk_nonce", "kdf_salt")
-                    if isinstance(session.get(key), str) and session[key])
-            for secret in sorted(secrets_to_redact, key=len, reverse=True):
-                diagnostic = diagnostic.replace(secret, "[redacted]")
-            diagnostic = re.sub(r"(?i)bearer\s+\S+", "Bearer [redacted]", diagnostic)
-            diagnostic = re.sub(r"(?i)\b(?:A3-)?[a-f0-9]{24,}\b", "[redacted]", diagnostic)
             self.report["cli_failure"] = {"command": args[0], "exit_code": output.returncode,
-                "stage": self.report.get("stage"), "error": diagnostic[:1500] or "no structured error"}
+                "stage": self.report.get("stage"), "error": self.redacted_cli_error(env, output)}
             self.save()
             raise RuntimeError("cli_failed_" + args[0])
         try:
@@ -161,6 +168,14 @@ class Smoke:
             raise RuntimeError("invalid_cli_json_" + args[0]) from None
         require(not value.get("errors") and value.get("status") not in ("error", "failed"), "cli_error_" + args[0])
         return value
+
+    def password_login(self, env, user, password, version, original_super):
+        """Authorize this synthetic account through the existing hidden TTY prompts."""
+        prompts = [("  login method: 1 OAuth (default), 2 password/TOTP: ", "2"),
+            ("  login password: ", password)]
+        if version != 1:
+            prompts.append(("  super password (A3-…): ", original_super))
+        return self.cli(env, "login", "--interactive", "--addr", UPSTREAM, "--user", user, prompts=prompts)
 
     def session(self, env):
         return json.loads((Path(env["RSRS_DATA_DIR"]) / "session.json").read_text())
@@ -211,7 +226,8 @@ class Smoke:
         self.accounts.append(account)
         self.report["cloud_cleanup"]["remaining_users"].append(user)
         self.save()
-        registered = self.cli(env, "register", "--addr", UPSTREAM, "--user", user, "--pass=" + password)
+        registered = self.cli(env, "register", "--addr", UPSTREAM, "--user", user,
+            prompts=[("  login password (for the server; can be reset): ", password)])
         session = self.session(env)
         require(registered["summary"].get("ok") is True and registered["summary"].get("user") == user
             and session.get("user") == user and session.get("addr") == UPSTREAM and bool(session.get("token")),
@@ -283,8 +299,7 @@ class Smoke:
         elif version == 3:
             recovery["secret_key"] = secret
         self.write_session(old_login_env, recovery)
-        self.cli(old_login_env, "login", "--interactive", "--addr", UPSTREAM, "--user", user,
-            "--pass=" + password, *([] if version == 1 else ["--super=" + original_super]))
+        self.password_login(old_login_env, user, password, version, original_super)
         old_login = self.session(old_login_env)
         self.diagnostic_secrets.add(old_login.get("token", ""))
         require(old_login.get("user") == user and bool(old_login.get("token"))
@@ -327,9 +342,10 @@ class Smoke:
             require(self.keys.read("rsrs", "super:" + alias) == original_super, "original_super_not_retained")
         if version == 1:
             require(upgraded.get("secret") == secret, "original_account_secret_not_retained")
-        factors = ["--secret-key=" + secret] if version == 1 else ["--super=" + original_super]
+        # Recovery factors already exist in this fixture's verified migrated
+        # session/isolated keyring; only the password needs terminal input.
         result = self.cli(upgraded_env, "migrate", "--vault", "--addr", UPSTREAM, "--user", user,
-            "--pass=" + password, *factors)
+            prompts=[("  login password: ", password)])
         require(result["summary"].get("super_issued") is None, "migration_generated_replacement_super")
         committed = self.session(upgraded_env)
         account["token"] = committed["token"]
@@ -359,8 +375,7 @@ class Smoke:
         if version == 3:
             # Explicitly restore the original second recovery factor.
             self.write_session(final_env, {"user": user, "secret_key": secret})
-        self.cli(final_env, "login", "--interactive", "--addr", UPSTREAM, "--user", user,
-            "--pass=" + password, *([] if version == 1 else ["--super=" + original_super]))
+        self.password_login(final_env, user, password, version, original_super)
         recovered_session = self.session(final_env)
         require(recovered_session.get("user") == user and bool(recovered_session.get("token"))
             and self.api(dict(account, token=recovered_session["token"]), "GET", "/api/self").get("user") == user
@@ -388,13 +403,12 @@ class Smoke:
             require(db.execute("SELECT ciphertext,nonce FROM memories WHERE id=?", (memory_id,)).fetchone() == converted,
                 "new_device_ciphertext_differs")
         if version == 1:
-            # --pass authorizes login; matching RSRS_PASS exercises the headless
+            # Hidden terminal input authorizes login; matching RSRS_PASS exercises the headless
             # commit and follow-up read contract, not authorization fallback.
             # Owned native passwords remain available, so this does not prove
             # recovery on a host without any native credential store.
             headless_env = dict(final_env, RSRS_PASS=password)
-            self.cli(headless_env, "login", "--interactive", "--addr", UPSTREAM, "--user", user,
-                "--pass=" + password)
+            self.password_login(headless_env, user, password, version, original_super)
             headless = self.session(headless_env)
             account["token"] = headless["token"]
             require("pass" not in headless and "keyring_account" not in headless,
@@ -465,6 +479,7 @@ class Smoke:
         output = subprocess.run([str(self.args.binary), "--version"], env=env, capture_output=True, timeout=20)
         require(output.returncode == 0 and re.search(r"(?<!\S)" + re.escape(self.args.version) + r"(?!\S)", output.stdout.decode()), "binary_version_mismatch")
         self.cli(env, "model", "install-m3", timeout=900)
+        share_cpu_container(self.root, env, self.model)
         require(all(digest(self.model / p) == h for p, h in MODEL_HASHES.items()), "model_hash_mismatch")
         self.cli(env, "model", "engine", "cpu")
         probe = self.cli(env, "model", "probe", "--model", "m3", "--text", "Legacy recovery CPU probe")["summary"]

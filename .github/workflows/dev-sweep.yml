@@ -153,6 +153,7 @@ jobs:
         if: ${{ always() && !inputs.local_api_only && !inputs.auth_salt_only }}
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 1
           name: base-sweep-report-${{ matrix.os }}
           path: |
             ${{ runner.temp }}/om-sweep/report.md
@@ -204,10 +205,8 @@ jobs:
           RSRS_DEV_SERVER_SHA: ${{ vars.RESPIRE_DEV_SERVER_SHA }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if ($IsMacOS) {
-            python -m pip install --only-binary=:all: cryptography==46.0.3
-            if ($LASTEXITCODE -ne 0) { throw 'macOS migration fixture dependencies failed' }
-          }
+          python -m pip install --only-binary=:all: cryptography==46.0.3
+          if ($LASTEXITCODE -ne 0) { throw 'Native migration fixture dependencies failed' }
           $binary = Join-Path (Resolve-Path validated-cli) $(if ($IsWindows) { 'rsrs.exe' } else { 'rsrs' })
           $checksum = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
           New-Item -ItemType Directory -Force -Path (Join-Path $env:RUNNER_TEMP 'dev-supplements') | Out-Null
@@ -246,6 +245,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 1
           name: sweep-report-${{ matrix.os }}
           path: |
             ${{ runner.temp }}/om-sweep/report.md
@@ -277,7 +277,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Check all development API contracts
+      - name: Check all baseline CLI API contracts and GitHub transport
         env:
           RSRS_DEV_MAIL_ADDRESS: ${{ vars.RESPIRE_DEV_MAIL_ADDRESS }}
           RSRS_DEV_IMAP_HOST: ${{ vars.RESPIRE_DEV_IMAP_HOST }}
@@ -294,6 +294,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
+          retention-days: 1
           name: dev-api-coverage
           path: |
             ${{ runner.temp }}/dev-api-coverage.json

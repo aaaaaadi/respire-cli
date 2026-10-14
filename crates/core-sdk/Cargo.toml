@@ -1,6 +1,6 @@
 [package]
 name = "respire_core_sdk"
-version = "2.0.0-dev.2"
+version = "2.0.0-dev.3"
 edition = "2021"
 rust-version = "1.95"
 license-file = "LICENSE"
@@ -10,6 +10,11 @@ readme = "README.md"
 include = ["Cargo.toml", "src/**", "notices/**", "build.rs", "host-winml-build.rs", "README.md", "LICENSE", "core-sdk.lock.json", "prepare-sdk.mjs"]
 links = "respire_core_ffi"
 publish = ["crates-io"]
+
+[features]
+default = ["cpu-owned-ort-experiment"]
+native-fault-tests = []
+cpu-owned-ort-experiment = []
 
 [dependencies]
 anyhow = "1.0"

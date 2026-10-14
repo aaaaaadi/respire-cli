@@ -22,6 +22,18 @@ use crate::transport::MemoryTransport;
 
 mod merge;
 pub use merge::merge_entries;
+
+/// Shared candidate receipt contract for agent and client consumers.
+pub fn write_decision_actions() -> &'static [&'static str] {
+    &[
+        "① duplicate (bool)：两文同一事实且无新增细节？成立时 merge-ids 合并；先查子孙、先备份。",
+        "② contradiction (bool)：同时点上互斥？成立时合并，以新者为准并留弃因。",
+        "③ obsolete (bool)：新文明确取代旧文？成立时 update 旧条，尾注取代关系，不删旧文。",
+        "④ linkable (bool)：相连有助日后召回？成立时用 --parent 挂因果。",
+        "⑤ representation (keep_separate|merge|promote|uncertain)：该分开、合并、升格还是存疑？各留／合写综合版／重复事件升格为规律条／存疑缓办。",
+        "逐问回答后择一执行：update ＞ merge ＞ parent ＞ force；候选回执不表示已写入。",
+    ]
+}
 mod related;
 pub use related::{store_related, remap_relations};
 
@@ -96,6 +108,24 @@ pub fn require_candidates_ready(store: &LocalStore, candidates: &[crate::StoredM
     Ok(())
 }
 
+/// Recall stays available while synchronized sources await background indexing.
+/// Only current, source-checked artifacts may participate in semantic retrieval.
+pub fn recall_candidates(store: &LocalStore) -> Result<(Vec<crate::StoredMemory>, usize)> {
+    let candidates = store.all(false)?;
+    let (ready, pending): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|memory| !memory.local_artifact.is_empty());
+    let pending_count = pending.len();
+    if pending_count > 0 {
+        notify_index();
+        if ready.is_empty() {
+            return Err(IndexPending.into());
+        }
+    }
+    require_candidates_ready(store, &ready)?;
+    Ok((ready, pending_count))
+}
+
 /// The resident runtime installs its single durable-outbox worker notifier.
 pub fn install_autosync_notifier(notify: fn()) {
     let _ = AUTO_SYNC_NOTIFY.set(notify);
@@ -163,8 +193,7 @@ impl App {
         if let Some(k) = kind {
             q = q.of_kind(k);
         }
-        let candidates = self.store.all(false)?;
-        require_candidates_ready(&self.store, &candidates)?;
+        let (candidates, _) = recall_candidates(&self.store)?;
         let ranked =
             MemoryEngine::recall_local_scored(&self.keys, &self.embedder, &candidates, &q)?;
         for (score, e) in &ranked {
@@ -1243,7 +1272,9 @@ pub fn workspace_mode() -> &'static str {
 /// Device service mode lives beside the active-profile pointer, never in an account.
 /// Existing team permissions remain effective even when the device returns to normal.
 pub fn set_workspace_mode(mode: &str) -> Result<()> {
-    anyhow::ensure!(matches!(mode, "normal" | "readonly" | "off"), "unknown mode `{mode}` — choose: normal | readonly | off");
+    if !matches!(mode, "normal" | "readonly" | "off") {
+        return Err(crate::input_error::InputError(format!("unknown mode `{mode}` — choose: normal | readonly | off")).into());
+    }
     let mut config = read_client_config().unwrap_or_else(|| serde_json::json!({}));
     anyhow::ensure!(config.is_object(), "client config must be an object");
     config["service_mode"] = serde_json::json!(mode);
@@ -1470,8 +1501,8 @@ pub fn set_cure_auto(on: bool) -> Result<()> {
     write_client_config(&data)
 }
 
-/// Saved RPC worker cap (`client.json` `rpc_parallelism`). `None` means follow CPU count, never above 4. Writes still queue.
-/// The runtime never runs more than 4 jobs at once. `0` is stored as absent.
+/// Saved RPC compute worker limit (`client.json` `rpc_parallelism`), bounded by available CPU parallelism.
+/// Two extra lightweight read slots remain available. `0` is stored as absent.
 /// The resident runtime reads this only at start.
 pub fn rpc_parallelism_setting() -> Option<usize> {
     read_client_config()
@@ -1681,6 +1712,7 @@ impl App {
 
 /// Export all plaintext memories as JSON (backup/migrate).
 pub fn export_json(path: &std::path::Path) -> Result<usize> {
+    crate::input_error::validate_output_parent(path)?;
     let keys = auth::load_local_session()?;
     let store = open_store()?;
     let blobs = store.all(false)?;
@@ -2196,6 +2228,7 @@ pub fn import_share_payload(
 
 /// SQLite consistent snapshot, including committed WAL; dest must be a new file, never overwrite existing data.
 pub fn backup_db(dest: &std::path::Path) -> Result<PathBuf> {
+    crate::input_error::validate_output_parent(dest)?;
     let src = database_path(&data_dir())?;
     let connection =
         rusqlite::Connection::open_with_flags(&src, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -3445,6 +3478,56 @@ mod tests {
             kind: "context".to_owned(),
             ..CreateReq::default()
         }
+    }
+
+    #[test]
+    fn recall_keeps_indexed_memories_available_during_sync() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let app = test_app(dir.path())?;
+        let (empty, pending) = recall_candidates(&app.store)?;
+        assert!(empty.is_empty());
+        assert_eq!(pending, 0);
+        let indexed = app.create(&important("indexed", "rust memory"))?;
+        let mut incoming = app.create(&important("incoming", "rust memory"))?;
+        incoming.updated_at = "2099-01-01T00:00:00Z".into();
+        incoming.content = "synchronized rust memory".into();
+        let mut source = MemoryEngine::seal(&app.keys,
+            &crate::memory::search::HashingEmbedder::default(), &incoming, "fixture")?;
+        source.local_artifact.clear();
+        app.store.put_synced(&source)?;
+        let (ready, pending) = recall_candidates(&app.store)?;
+        assert_eq!(pending, 1);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, indexed.id);
+        let hits = app.search("rust memory", 10, None)?;
+        assert!(hits.iter().any(|hit| hit.entry.id == indexed.id));
+        assert!(hits.iter().all(|hit| hit.entry.id != incoming.id));
+        assert_eq!(app.store.rebuild_index_with_progress(
+            &app.keys, &crate::memory::search::HashingEmbedder::default(), "m3", |_, _| Ok(())
+        )?, 1);
+        let (ready, pending) = recall_candidates(&app.store)?;
+        assert_eq!(ready.len(), 2);
+        assert_eq!(pending, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn recall_preserves_all_pending_and_corrupt_index_errors() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let app = test_app(dir.path())?;
+        let mut memory = app.create(&important("source", "rust memory"))?;
+        memory.updated_at = "2099-01-01T00:00:00Z".into();
+        let mut source = MemoryEngine::seal(&app.keys,
+            &crate::memory::search::HashingEmbedder::default(), &memory, "fixture")?;
+        source.local_artifact.clear();
+        app.store.put_synced(&source)?;
+        let error = recall_candidates(&app.store).err()
+            .ok_or_else(|| anyhow!("all-pending recall succeeded"))?;
+        assert!(error.downcast_ref::<IndexPending>().is_some());
+        source.local_artifact = b"invalid artifact".to_vec();
+        app.store.put_inner(&source, false)?;
+        assert!(recall_candidates(&app.store).is_err());
+        Ok(())
     }
 
     #[test]

@@ -24,19 +24,12 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
           - os: macos-latest
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            rustflags: -C target-feature=-crt-static
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
             rustflags: -C target-feature=-crt-static
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
@@ -96,7 +89,14 @@ jobs:
             py="$RUNNER_TEMP/upgrade-python/Scripts/python.exe"
             exe="$exe.exe"
           fi
-          "$py" -m pip install --only-binary=:all: cryptography==46.0.3 psutil==7.1.0
+          "$py" -m pip install --only-binary=:all: cryptography==46.0.3
+          if [ "$RUNNER_OS" = Windows ]; then
+            # PyPI 7.2.2 predates the fixed Windows handle-query implementation.
+            # Build the exact upstream fix, not a moving branch or local patch.
+            "$py" -m pip install --no-deps 'psutil @ https://github.com/giampaolo/psutil/archive/078f2f08d2ccea916a42f9571ab8bd40d958e7a1.tar.gz#sha256=8073a6389894b1ea3edc4f0feb47dba742b5552eab93f28ba6f45d2b19f11e4b'
+          else
+            "$py" -m pip install --only-binary=:all: psutil==7.1.0
+          fi
           # Only the real historical baseline uses FP16; the candidate uses quantized.
           mkdir -p native-legacy-model/onnx
           cp "$RUNNER_TEMP/release-probe/models/bge-m3/tokenizer.json" native-legacy-model/tokenizer.json
@@ -108,9 +108,37 @@ jobs:
             --model-dir "$RUNNER_TEMP/release-probe/models/bge-m3" \
             --legacy-model-dir native-legacy-model \
             --output-dir "$RUNNER_TEMP/published-upgrades"
+      - name: Verify resident foreground and background inference under concurrent CLI load
+        shell: bash
+        run: |
+          set -euo pipefail
+          py="$RUNNER_TEMP/upgrade-python/bin/python"
+          exe="target/ci/${{ matrix.target }}/release/rsrs"
+          if [ "$RUNNER_OS" = Windows ]; then
+            py="$RUNNER_TEMP/upgrade-python/Scripts/python.exe"
+            exe="$exe.exe"
+          fi
+          "$py" scripts/test-native-fixture-process.py --output-dir "$RUNNER_TEMP/native-fixture-bounds"
+          "$py" scripts/test-real-m3-account-switch.py --binary "$exe" \
+            --model-dir "$RUNNER_TEMP/release-probe/models/bge-m3" \
+            --output-dir "$RUNNER_TEMP/resident-concurrency" --expect-supervised-worker --resident-stress
       - uses: actions/upload-artifact@v4
         if: always()
         with:
+          retention-days: 1
+          name: resident-concurrency-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/resident-concurrency/real-account-return-verification.json
+            ${{ runner.temp }}/resident-concurrency/resident-stress-metrics.json
+            ${{ runner.temp }}/resident-concurrency/fixture-dependencies.json
+            ${{ runner.temp }}/resident-concurrency/**/boundary-inspector/inspector.log
+            ${{ runner.temp }}/resident-concurrency/**/boundary-inspector/inspection-failure.json
+            ${{ runner.temp }}/native-fixture-bounds/fixture-process-verification.json
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          retention-days: 1
           name: published-upgrades-${{ matrix.target }}
           path: |
             ${{ runner.temp }}/published-upgrades/published-upgrades.json
@@ -129,6 +157,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always() && matrix.target == 'x86_64-unknown-linux-gnu'
         with:
+          retention-days: 1
           name: gnu-login-interruption
           path: ${{ runner.temp }}/gnu-login-interruption/interruption-coverage.json
           if-no-files-found: error
