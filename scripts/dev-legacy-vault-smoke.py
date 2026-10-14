@@ -392,7 +392,7 @@ class Smoke:
         self.save()
         self.cli(final_env, "sync")
         self.read_entry(final_env, memory_id, plaintext)
-        if self.args.auth_salt_only:
+        if version == 2:
             new_title = "Post authentication migration write"
             new_plaintext = "Original credentials still permit new encrypted memory writes after authentication salt migration."
             self.cli(final_env, "remember", new_plaintext, "--title", new_title, "--force", "--importance", "important")
@@ -439,7 +439,7 @@ class Smoke:
             "real_server_legacy_salt_login": True, "ordinary_login_preserved_legacy_salt": True,
             "explicit_migration_changed_to_rsrs_salt": True, "old_hash_rejected": True,
             "fresh_cli_login_original_password": True, "fresh_cli_login_new_salt": True}
-        if self.args.auth_salt_only:
+        if version == 2:
             self.report["cases"][REQUIRED[version]]["authentication"]["new_memory_write_sync_restart_read"] = True
         self.save()
 

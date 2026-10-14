@@ -1,4 +1,5 @@
 """Synthetic Linux PTY checks; no accounts, network, keyring or real secrets."""
+import ast
 import os
 from pathlib import Path
 import subprocess
@@ -6,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 
 from dev_fixture_tty import run_hidden
 
@@ -57,6 +59,36 @@ with tempfile.TemporaryDirectory() as directory:
         with tempfile.TemporaryDirectory() as directory:
             result = subprocess.run([sys.executable, "-c", script], capture_output=True, env=fixture_env(directory))
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_post_migration_write_scope_in_full_and_focused_suites(self):
+        """The real write check and report run for v2 in both workflow scopes."""
+        source = Path(__file__).with_name("dev-legacy-vault-smoke.py").read_text()
+        tree = ast.parse(source)
+        method = next(node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "run_version")
+        guards = []
+        for node in ast.walk(method):
+            if not isinstance(node, ast.If):
+                continue
+            for statement in node.body:
+                if not isinstance(statement, ast.Assign):
+                    continue
+                write_check = any(isinstance(target, ast.Name) and target.id == "new_title"
+                    for target in statement.targets)
+                report_field = any(isinstance(value, ast.Constant)
+                    and value.value == "new_memory_write_sync_restart_read"
+                    for target in statement.targets for value in ast.walk(target))
+                if write_check or report_field:
+                    guards.append(node.test)
+        self.assertEqual(len(guards), 2, "write assertion and report must both retain explicit scope")
+        for guard in guards:
+            code = compile(ast.Expression(guard), "fixture-write-scope", "eval")
+            for focused in (False, True):
+                for version in (1, 2, 3):
+                    with self.subTest(focused=focused, version=version):
+                        fixture = SimpleNamespace(args=SimpleNamespace(auth_salt_only=focused))
+                        self.assertEqual(eval(code, {"__builtins__": {}},
+                            {"self": fixture, "version": version}), version == 2)
 
     def test_ordered_hidden_input_and_json(self):
         """Preserve JSON while submitting passwords through a no-echo terminal."""
