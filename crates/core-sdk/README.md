@@ -18,6 +18,10 @@ flowchart LR
 | `rs_core_call_with_transport` | Execute using borrowed synchronous host transport callbacks |
 | `rs_core_model_load` | Initialize inference from borrowed model and tokenizer bytes |
 | `rs_core_model_load_with_host` | Initialize with a synchronous host native-options callback |
+| `rs_core_model_input_begin` | Reserve a bounded model upload for this handle |
+| `rs_core_model_input_append` | Append the next bounded chunk at its exact offset |
+| `rs_core_model_input_commit` | Consume the upload and initialize from its owned bytes |
+| `rs_core_model_input_abort` | Cancel a pending upload and release its reservation |
 | `rs_core_register_providers` | Let the host register installed native providers |
 | `rs_core_buffer_free` | Release Core-allocated output |
 | `rs_core_destroy` | Release the handle |
@@ -25,6 +29,17 @@ flowchart LR
 Business calls prepare opaque index data, query memories, return maintenance
 results and check model health. Local index references remain opaque. Errors stay
 explicit. The binding owns buffer/handle cleanup, and handles cannot cross threads.
+
+The pinned SDK advertises model input stream contract 1. The default CPU-owned
+ORT path reads model files in 1 MiB chunks, verifies length and SHA256 on the host,
+and transfers ownership to Core. Profiling, GPU/NPU and the explicit legacy CPU
+setting retain borrowed ONNX initialization. Building against an older SDK requires
+updating its exact manifest pin and disabling the default stream feature; enabling
+it without contract 1 fails clearly. Stream contract 1 responses carry
+`schema_version: 1` and an empty `request_id`; the synchronous ABI call, upload
+ticket and append offset identify the operation. The binding validates this
+envelope for successful begin, append, commit and abort responses; nonzero ABI
+status codes are rejected before the envelope check.
 
 The public host adapter owns model discovery, file reads, engine configuration and
 opaque artifact persistence. Core receives model/tokenizer buffers and explicit
