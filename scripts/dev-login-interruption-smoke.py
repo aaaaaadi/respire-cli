@@ -303,6 +303,7 @@ def main():
         source_session = source_path / "session.json"
         source_value = json.loads(source_session.read_bytes())
         source_value["addr"] = "https://previous.invalid"
+        source_value["super"] = old_super  # Synthetic source factor differs from the target env key.
         source_session.write_text(json.dumps(source_value), encoding="utf-8")
         source_before = source_session.read_bytes(), legacy.digest(source_path / "rsrs.db")
         cloud_urk = secrets.token_bytes(32)
