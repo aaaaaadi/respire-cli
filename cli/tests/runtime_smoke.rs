@@ -225,6 +225,7 @@ fn runtime_serves_status_and_stops() -> Result<(), Box<dyn std::error::Error>> {
 /// failures before commit and the host/runtime account verification after commit.
 fn authorization_preserves_and_commits_profiles() -> Result<(), Box<dyn std::error::Error>> {
     use respire_app::memory::{crypto, SessionKeys};
+    use respire_app::transport::{local::LocalStore, MemoryTransport};
     use serde_json::{json, Value};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -543,6 +544,47 @@ fn authorization_preserves_and_commits_profiles() -> Result<(), Box<dyn std::err
         if !stopped.status.success() {
             return Err("could not stop the isolated OAuth runtime".into());
         }
+
+        // A different server's source uses another URK, even with the same recovery code.
+        let source_urk = [43_u8; 32];
+        let source_salt = crypto::random_hex(16);
+        let (source_nonce, source_wrap) = crypto::wrap_key(
+            &source_urk, &crypto::derive_kek_v4(&super_password, &source_salt)?)?;
+        let source_session = serde_json::to_vec(&json!({"user":"original","addr":"https://previous.invalid",
+            "vault_version":4,"kdf_salt":source_salt,"wrapped_urk":source_wrap,"urk_nonce":source_nonce}))?;
+        std::fs::write(original.join("session.json"), &source_session)?;
+        let selected = execute(&["--json", "account", "use", "original"])?;
+        assert!(selected.status.success(), "{}", String::from_utf8_lossy(&selected.stdout));
+        let created = execute(&["--json", "remember", "Synthetic cross-server transfer body",
+            "--title", "Transfer fixture", "--importance", "important", "--force"])?;
+        assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stdout));
+        let transfer = ["--json", "login", "--oauth", "--addr", &addr, "--dashboard", &addr,
+            "--no-open", "--super", &super_password, "--migrate-local"];
+        let copied = execute(&transfer)?;
+        assert!(copied.status.success(), "{} {}", String::from_utf8_lossy(&copied.stdout), String::from_utf8_lossy(&copied.stderr));
+        let copied: Value = serde_json::from_slice(&copied.stdout)?;
+        assert_eq!(copied["summary"]["import"]["imported"], 1, "{copied}");
+        assert_eq!(copied["summary"]["import"]["duplicates"], 0);
+        assert!(copied["summary"]["sync"].is_object());
+        let db = LocalStore::open(&target.join("rsrs.db"))?;
+        let rows = db.all(false)?;
+        assert_eq!(rows.len(), 1);
+        let cloud_snapshot = cloud.lock().map_err(|error| error.to_string())?.clone();
+        let keys = SessionKeys::unlock_v4(&super_password,
+            cloud_snapshot["kdf_salt"].as_str().ok_or("missing cloud salt")?,
+            cloud_snapshot["wrapped_urk"].as_str().ok_or("missing cloud wrap")?,
+            cloud_snapshot["urk_nonce"].as_str().ok_or("missing cloud nonce")?)?;
+        let stored = rows.first().ok_or("transferred row missing")?;
+        assert_eq!(respire_app::memory::MemoryEngine::open(&keys, stored)?.content, "Synthetic cross-server transfer body");
+        drop(db);
+        assert!(execute(&["--json", "account", "use", "original"])?.status.success());
+        let retry = execute(&transfer)?;
+        assert!(retry.status.success(), "{}", String::from_utf8_lossy(&retry.stdout));
+        let retry: Value = serde_json::from_slice(&retry.stdout)?;
+        assert_eq!(retry["summary"]["import"]["imported"], 0, "{retry}");
+        assert_eq!(retry["summary"]["import"]["duplicates"], 1);
+        assert_eq!(std::fs::read(original.join("session.json"))?, source_session);
+        assert!(execute(&["--runtime-internal", "--stop"])?.status.success());
 
         let legacy_super = "synthetic-legacy-passphrase";
         let salt = crypto::random_hex(16);

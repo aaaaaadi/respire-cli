@@ -159,7 +159,11 @@ fn runtime_uses_only_tcp_and_preserves_owner() -> Result<(), String> {
         let started = Instant::now();
         let status = loop {
             if let Some(status) = other.try_wait().map_err(|err| err.to_string())? { break status; }
-            if std::net::TcpStream::connect(("127.0.0.1", other_port)).is_ok()
+            // Windows connection refusal can block for seconds and consume the startup deadline.
+            if std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], other_port)),
+                Duration::from_millis(50),
+            ).is_ok()
                 || started.elapsed() > Duration::from_secs(20) {
                 let _ = other.kill(); let _ = other.wait();
                 return Err("another port bypassed runtime ownership or did not reject startup".into());
