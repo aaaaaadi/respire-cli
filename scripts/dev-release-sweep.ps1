@@ -1406,18 +1406,31 @@ Assert-Smoke 'cloud-full-logout-recovery-preserves-library' ($recoveredAfterFull
 $resetDir = Join-Path $Root 'reset-vault'
 Invoke-Om -Name 'reset-vault-config' -ArgList @('--json', 'config', '--addr', $Server, '--autosync', 'false') -DataDir $resetDir | Out-Null
 Invoke-Om -Name 'reset-vault-baseline-login' -ArgList @('--json', 'login', '--interactive', '--addr', $Server, '--user', $user, '--pass', $pass, '--super', $newSuper) -DataDir $resetDir -Secret -HostProfile | Out-Null
-Invoke-Om -Name 'reset-vault-local-keygen' -ArgList @('--json', 'keygen', '--force') -DataDir $resetDir -Secret -HostProfile | Out-Null
+$resetKeys = Invoke-Om -Name 'reset-vault-local-keygen' -ArgList @('--json', 'keygen', '--force') -DataDir $resetDir -Secret -HostProfile
 $mismatched = Invoke-Om -Name 'reset-vault-old-local-write' -ArgList @('--json', 'remember', "reset-local-old-key-$stamp", '--title', "reset-local-$stamp", '--importance', 'important', '--force') -DataDir $resetDir
 $mismatchedId = [string]$mismatched.Envelope.summary.id
-Assert-Smoke 'reset-vault-mismatched-fixture-written' ($mismatched.Ok -and [bool]$mismatchedId)
+Assert-Smoke 'reset-vault-mismatched-fixture-written' ($resetKeys.Ok -and [bool]$resetKeys.Envelope.summary.super -and $mismatched.Ok -and [bool]$mismatchedId)
 $resetProfile = [string](Invoke-Om -Name 'reset-vault-selected-profile' -ArgList @('--json', 'config') -DataDir $resetDir).Envelope.summary.data_dir
 $resetSession = Join-Path $resetProfile 'session.json'
+# keygen clears identity; bind this fixture to the same remote identity to exercise the overwrite guard.
+$resetIdentity = Get-Content -LiteralPath $resetSession -Raw -Encoding utf8 | ConvertFrom-Json -AsHashtable
+$resetIdentity['user'] = $user
+$resetIdentity['addr'] = $Server
+[IO.File]::WriteAllText($resetSession, ($resetIdentity | ConvertTo-Json -Depth 20) + "`n", [Text.UTF8Encoding]::new($false))
 $beforeResetSession = (Get-FileHash -LiteralPath $resetSession -Algorithm SHA256).Hash
-$resetGuard = Invoke-Om -Name 'reset-vault-mismatch-refused' -ArgList @('--json', 'login', '--interactive', '--addr', $Server, '--user', $user, '--pass', $pass, '--super', $newSuper) -DataDir $resetDir -Secret -HostProfile -AllowStatus @('fail')
-Assert-Smoke 'reset-vault-mismatch-guard' ($resetGuard.Ok -and $resetGuard.Exit -eq 1 -and ($resetGuard.Envelope.errors -join ' ') -match 'different key material|destination belongs to another account')
-Assert-Smoke 'login-key-mismatch-original-session-preserved' ((Get-FileHash -LiteralPath $resetSession -Algorithm SHA256).Hash -ceq $beforeResetSession)
-$resetRead = Invoke-Om -Name 'login-key-mismatch-original-readback' -ArgList @('--json', 'show', $mismatchedId) -DataDir $resetDir
-Assert-Smoke 'login-key-mismatch-original-data-readable' ($resetRead.Ok -and [string]$resetRead.Envelope.details.entry.content -ceq "reset-local-old-key-$stamp")
+$previousResetSuper = $env:RSRS_SUPER
+try {
+    # Keep the disposable local key usable without storing its Super password in the session.
+    $env:RSRS_SUPER = [string]$resetKeys.Envelope.summary.super
+    $resetGuard = Invoke-Om -Name 'reset-vault-mismatch-refused' -ArgList @('--json', 'login', '--interactive', '--addr', $Server, '--user', $user, '--pass', $pass, '--super', $newSuper) -DataDir $resetDir -Secret -HostProfile -AllowStatus @('fail')
+    Assert-Smoke 'reset-vault-mismatch-guard' ($resetGuard.Ok -and $resetGuard.Exit -eq 1 -and ($resetGuard.Envelope.errors -join ' ') -match 'different key material|destination belongs to another account')
+    Assert-Smoke 'login-key-mismatch-original-session-preserved' ((Get-FileHash -LiteralPath $resetSession -Algorithm SHA256).Hash -ceq $beforeResetSession)
+    $resetRead = Invoke-Om -Name 'login-key-mismatch-original-readback' -ArgList @('--json', 'show', $mismatchedId) -DataDir $resetDir
+    Assert-Smoke 'login-key-mismatch-original-data-readable' ($resetRead.Ok -and [string]$resetRead.Envelope.details.entry.content -ceq "reset-local-old-key-$stamp")
+} finally {
+    if ($null -eq $previousResetSuper) { Remove-Item Env:RSRS_SUPER -ErrorAction SilentlyContinue }
+    else { $env:RSRS_SUPER = $previousResetSuper }
+}
 Invoke-Om -Name 'sync-reset' -ArgList @('--json', 'sync-reset') -DataDir $DirA -TimeoutSec 180 -Note '一次性账号上的快照重建' | Out-Null
 
 # Web opens the hosted dashboard; runtime lifecycle is a separate hidden command.
