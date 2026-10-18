@@ -14,6 +14,6 @@ In TUI Accounts > Login, enter the target server and confirm copying the selecte
 
 Migration copies a committed local snapshot, decrypts it in memory and reencrypts it for the target. No plaintext export file is created. The source is retained. Existing target bodies are kept; exact duplicate bodies are skipped, and new parent/association references are remapped. Different content remains distinct. Changed source records after the snapshot are not part of that transfer.
 
-The login result includes import counts and a sync result. A sync warning after successful login means the local copy remains available; inspect the reported error and retry `rsrs sync` when connectivity returns. It does not mean the source was removed. A failed profile commit restores the previous selection. Repeating a transfer skips bodies already copied.
+The login result includes import counts and a sync result. Exit code 2 with a sync warning after successful login means the local copy remains available; inspect the reported error and retry `rsrs sync` when connectivity returns. It does not mean the source was removed. A failed profile commit restores the previous selection. Repeating a transfer skips bodies already copied.
 
 For support, collect `rsrs --version`, `rsrs --json status`, `rsrs --json account list`, `rsrs --json config` and `rsrs --json doctor`. Include the command, failed stage and target origin. Redact personal paths/usernames when unnecessary. Never send session files, Super passwords, account secrets, tokens or private keys.

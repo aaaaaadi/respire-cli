@@ -312,7 +312,9 @@ def main():
             "wrapped_urk": legacy.PREFIX + AESGCM(legacy.v4_kek(code, cloud_salt, legacy.PREFIX)).encrypt(cloud_nonce, cloud_urk, None).hex()}
         transfer = ("--json", "login", "--interactive", "--addr", addr, "--user", "synthetic",
                     "--pass=synthetic-password", "--super", code, "--migrate-local")
-        first = json.loads(cli(*transfer).stdout)["summary"]
+        first_result = cli(*transfer, success=False)
+        require(first_result.returncode == 2, "server_transfer_sync_warning_missing")
+        first = json.loads(first_result.stdout)["summary"]
         require(first["import"]["imported"] == 1 and first["import"]["duplicates"] == 0,
                 "server_transfer_count_failed")
         target = Path(first["dir"])
@@ -323,7 +325,9 @@ def main():
                 == legacy.decrypt_content(urk, original_rows[0][1], original_rows[0][2]),
                 "server_transfer_not_reencrypted")
         cli("--json", "account", "use", source_name)
-        retry = json.loads(cli(*transfer).stdout)["summary"]
+        retry_result = cli(*transfer, success=False)
+        require(retry_result.returncode == 2, "server_transfer_retry_sync_warning_missing")
+        retry = json.loads(retry_result.stdout)["summary"]
         require(retry["import"]["imported"] == 0 and retry["import"]["duplicates"] == 1,
                 "server_transfer_retry_duplicated")
         require((source_session.read_bytes(), legacy.digest(source_path / "rsrs.db")) == source_before,

@@ -42,7 +42,7 @@ mod tests {
             std::fs::create_dir_all(&case_dir)?;
             std::fs::write(case_dir.join("session.json"), br#"{"user":"shiningray","addr":"https://old.invalid"}"#)?;
             let cloud_dir = login_directory("https://cloud.invalid", "ShiningRay")?;
-            ensure!(cloud_dir != case_dir, "case collision reused source");
+            ensure!(cloud_dir != case_dir && !cloud_dir.exists(), "case collision reused source");
             let second_server = login_directory("https://cloud.invalid", "shiningray")?;
             ensure!(second_server != case_dir, "server change reused source");
             ensure!(login_directory("https://old.invalid", "shiningray")? == case_dir, "original identity was not reused");

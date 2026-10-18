@@ -338,6 +338,10 @@ fn authorization_preserves_and_commits_profiles() -> Result<(), Box<dyn std::err
                             .clone()
                     }
                 }
+                "/sync/capabilities" => {
+                    status = 503;
+                    json!({"error":"synthetic sync outage"})
+                }
                 _ => return Err(format!("unexpected authorization request: {path}")),
             };
             request
@@ -561,11 +565,12 @@ fn authorization_preserves_and_commits_profiles() -> Result<(), Box<dyn std::err
         let transfer = ["--json", "login", "--oauth", "--addr", &addr, "--dashboard", &addr,
             "--no-open", "--super", &super_password, "--migrate-local"];
         let copied = execute(&transfer)?;
-        assert!(copied.status.success(), "{} {}", String::from_utf8_lossy(&copied.stdout), String::from_utf8_lossy(&copied.stderr));
+        assert_eq!(copied.status.code(), Some(2), "{} {}", String::from_utf8_lossy(&copied.stdout), String::from_utf8_lossy(&copied.stderr));
         let copied: Value = serde_json::from_slice(&copied.stdout)?;
+        assert_eq!(copied["status"], "warn");
         assert_eq!(copied["summary"]["import"]["imported"], 1, "{copied}");
         assert_eq!(copied["summary"]["import"]["duplicates"], 0);
-        assert!(copied["summary"]["sync"].is_object());
+        assert_eq!(copied["summary"]["sync"]["status"], "fail");
         let db = LocalStore::open(&target.join("rsrs.db"))?;
         let rows = db.all(false)?;
         assert_eq!(rows.len(), 1);
@@ -579,12 +584,14 @@ fn authorization_preserves_and_commits_profiles() -> Result<(), Box<dyn std::err
         drop(db);
         assert!(execute(&["--json", "account", "use", "original"])?.status.success());
         let retry = execute(&transfer)?;
-        assert!(retry.status.success(), "{}", String::from_utf8_lossy(&retry.stdout));
+        assert_eq!(retry.status.code(), Some(2), "{}", String::from_utf8_lossy(&retry.stdout));
         let retry: Value = serde_json::from_slice(&retry.stdout)?;
         assert_eq!(retry["summary"]["import"]["imported"], 0, "{retry}");
         assert_eq!(retry["summary"]["import"]["duplicates"], 1);
         assert_eq!(std::fs::read(original.join("session.json"))?, source_session);
+        assert!(execute(&["--json", "purge", &stored.id])?.status.success());
         assert!(execute(&["--runtime-internal", "--stop"])?.status.success());
+        std::fs::write(original.join("session.json"), session_bytes)?;
 
         let legacy_super = "synthetic-legacy-passphrase";
         let salt = crypto::random_hex(16);

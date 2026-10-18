@@ -1811,15 +1811,21 @@ pub fn import_json_text(text: &str) -> Result<ImportReport> {
     let items: Vec<ImportItem> = serde_json::from_str(text)
         .map_err(|e| anyhow!("failed to parse import JSON: {e}"))?;
     let mut report = ImportReport { imported: 0, skipped: 0, duplicates: 0, reattached: 0, orphaned: 0 };
-    let mut entries = Vec::new();
-    let mut old_ids = HashMap::new();
+    let mut entries: Vec<MemoryEntry> = Vec::new();
+    let mut old_ids: HashMap<String, usize> = HashMap::new();
     for (index, item) in items.into_iter().enumerate() {
         if item.id.is_empty() && item.content.trim().is_empty() {
             report.skipped += 1;
             continue;
         }
-        if !item.id.is_empty() && old_ids.insert(item.id, entries.len()).is_some() {
-            anyhow::bail!("duplicate id at record {}", index + 1);
+        if !item.id.is_empty() {
+            if let Some(previous) = old_ids.get(&item.id) {
+                ensure!(entries[*previous].content == item.content, "duplicate id with different content at record {}", index + 1);
+                report.skipped += 1;
+                report.duplicates += 1;
+                continue;
+            }
+            old_ids.insert(item.id, entries.len());
         }
         let kind = item.kind.unwrap_or_else(|| "context".to_owned()).to_lowercase();
         if !matches!(kind.as_str(), "context" | "decision" | "preference" | "task" | "emotion" | "time" | "skill" | "knowledge") {
@@ -1883,6 +1889,8 @@ pub fn import_json_text(text: &str) -> Result<ImportReport> {
         let mut fresh: Vec<MemoryEntry> = retained.into_iter().map(|index| entries[index].clone()).collect();
         remap_relations(&mut fresh, &ids)?;
         for entry in &mut fresh {
+            entry.see_also.sort();
+            entry.see_also.dedup();
             if entry.parent_id.is_empty() { continue; }
             match ids.get(&entry.parent_id) {
                 Some(id) if id != &entry.id => {
@@ -3661,11 +3669,11 @@ mod tests {
                 "user":"fixture","vault_version":4,"kdf_salt":salt,"wrapped_urk":wrapped,"urk_nonce":nonce
             }))?;
             let _deferred = respire_core_sdk::defer_indexing();
-            let snapshot = r#"[{"id":"parent","content":"unique parent","title":"parent"},{"id":"child","content":"unique child","parent_id":"parent"},{"id":"parent-copy","content":"unique parent"},{"id":"new-child","content":"third body","parent_id":"parent-copy","see_also":["parent"]}]"#;
+            let snapshot = r#"[{"id":"parent","content":"unique parent","title":"parent"},{"id":"child","content":"unique child","parent_id":"parent"},{"id":"parent-copy","content":"unique parent"},{"id":"new-child","content":"third body","parent_id":"parent-copy","see_also":["parent","parent-copy"]},{"id":"parent","content":"unique parent"}]"#;
             let first = import_json_text(snapshot)?;
-            assert_eq!((first.imported, first.duplicates), (3, 1));
+            assert_eq!((first.imported, first.duplicates), (3, 2));
             let again = import_json_text(snapshot)?;
-            assert_eq!((again.imported, again.duplicates), (0, 4));
+            assert_eq!((again.imported, again.duplicates), (0, 5));
             let keys = auth::load_local_session()?;
             let entries: Vec<_> = open_store()?.all(false)?.iter()
                 .map(|stored| MemoryEngine::open(&keys, stored)).collect::<Result<_>>()?;
