@@ -1808,6 +1808,8 @@ pub fn import_json(path: &std::path::Path) -> Result<ImportReport> {
 
 /// Import exact-content-unique records; the same snapshot can be retried safely.
 pub fn import_json_text(text: &str) -> Result<ImportReport> {
+    ensure!(!off_mode(), "memory service is disabled; restore normal service before importing");
+    ensure_writable()?;
     let items: Vec<ImportItem> = serde_json::from_str(text)
         .map_err(|e| anyhow!("failed to parse import JSON: {e}"))?;
     let mut report = ImportReport { imported: 0, skipped: 0, duplicates: 0, reattached: 0, orphaned: 0 };
@@ -3447,12 +3449,14 @@ mod tests {
         assert!(service_paused());
         assert!(readonly_mode());
         assert!(ensure_writable().is_err());
+        assert!(import_json_text("[]").is_err());
         account_use("work")?;
         assert_eq!(workspace_mode(), "readonly", "device mode survives account switching");
         assert_eq!(read_client_config().ok_or_else(|| anyhow::anyhow!("missing client config"))?["custom"], "preserved");
         set_workspace_mode("off")?;
         assert_eq!(workspace_mode(), "off");
         assert!(off_mode());
+        assert!(import_json_text("[]").is_err());
         account_use("main")?;
         assert_eq!(workspace_mode(), "off");
         let before = std::fs::read(client_config_path())?;

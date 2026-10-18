@@ -148,6 +148,8 @@ pub(crate) fn run(addr: Option<&str>, user: Option<&str>, pass: Option<&str>, su
                 .trim().eq_ignore_ascii_case("y")
         } else { false };
     let snapshot = if copy {
+        ensure!(!respire::service::off_mode(), "memory service is disabled; restore normal service before migration");
+        respire::service::ensure_writable()?;
         let source_secret = if respire::prompt::interactive() {
             respire::prompt::ask_secret("original local super password (v1: login password; Enter = saved credentials): ")?
         } else { String::new() };
