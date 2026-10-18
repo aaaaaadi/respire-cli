@@ -295,6 +295,40 @@ def main():
             "inconsistent_factors_rejected": True, "public_original_profile_migration": True,
             "full_library_reencrypted": True, "original_source_preserved": True,
             "original_factors_preserved": True, "requires_original_source": True}
+        # Transfer to a different server identity and URK without plaintext exports.
+        cli("--runtime-internal", "--stop")
+        source_profile = json.loads(cli("--json", "account", "list").stdout)["details"]["accounts"]
+        source_name = next(row["name"] for row in source_profile if row["current"])
+        source_path = Path(env["RSRS_DATA_DIR"])
+        source_session = source_path / "session.json"
+        source_value = json.loads(source_session.read_bytes())
+        source_value["addr"] = "https://previous.invalid"
+        source_session.write_text(json.dumps(source_value), encoding="utf-8")
+        source_before = source_session.read_bytes(), legacy.digest(source_path / "rsrs.db")
+        cloud_urk = secrets.token_bytes(32)
+        cloud_salt, cloud_nonce = secrets.token_hex(16), secrets.token_bytes(12)
+        state["vault"] = {"version": 4, "kdf_salt": cloud_salt, "urk_nonce": cloud_nonce.hex(),
+            "wrapped_urk": legacy.PREFIX + AESGCM(legacy.v4_kek(code, cloud_salt, legacy.PREFIX)).encrypt(cloud_nonce, cloud_urk, None).hex()}
+        transfer = ("--json", "login", "--interactive", "--addr", addr, "--user", "synthetic",
+                    "--pass=synthetic-password", "--super", code, "--migrate-local")
+        first = json.loads(cli(*transfer).stdout)["summary"]
+        require(first["import"]["imported"] == 1 and first["import"]["duplicates"] == 0,
+                "server_transfer_count_failed")
+        target = Path(first["dir"])
+        require(target.resolve() != source_path.resolve(), "server_transfer_reused_source")
+        with sqlite3.connect((target / "rsrs.db").as_uri() + "?mode=ro", uri=True) as db:
+            copied = db.execute("SELECT ciphertext,nonce FROM memories WHERE deleted=0").fetchall()
+        require(len(copied) == 1 and legacy.decrypt_content(cloud_urk, *copied[0])
+                == legacy.decrypt_content(urk, original_rows[0][1], original_rows[0][2]),
+                "server_transfer_not_reencrypted")
+        cli("--json", "account", "use", source_name)
+        retry = json.loads(cli(*transfer).stdout)["summary"]
+        require(retry["import"]["imported"] == 0 and retry["import"]["duplicates"] == 1,
+                "server_transfer_retry_duplicated")
+        require((source_session.read_bytes(), legacy.digest(source_path / "rsrs.db")) == source_before,
+                "server_transfer_changed_source")
+        report["cases"]["different_server_transfer_retry"] = {"passed": True,
+            "source_preserved": True, "different_urk": True, "duplicates_skipped": True}
         report["passed"] = True
     finally:
         release.set()

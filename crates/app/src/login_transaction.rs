@@ -38,6 +38,14 @@ mod tests {
             std::fs::write(existing.join("session.json"), old)?;
             let (salt, wrapped, nonce) = crate::auth::wrap_with_v4(&code, &[42; 32])?;
             let vault = json!({"version":4,"kdf_salt":salt,"wrapped_urk":wrapped,"urk_nonce":nonce});
+            let case_dir = crate::service::account_dir("shiningray")?;
+            std::fs::create_dir_all(&case_dir)?;
+            std::fs::write(case_dir.join("session.json"), br#"{"user":"shiningray","addr":"https://old.invalid"}"#)?;
+            let cloud_dir = login_directory("https://cloud.invalid", "ShiningRay")?;
+            ensure!(cloud_dir != case_dir, "case collision reused source");
+            let second_server = login_directory("https://cloud.invalid", "shiningray")?;
+            ensure!(second_server != case_dir, "server change reused source");
+            ensure!(login_directory("https://old.invalid", "shiningray")? == case_dir, "original identity was not reused");
             for user in ["existing", "new-account"] {
                 let mut prepared = PreparedLogin::prepare_with_vault("https://fixture.invalid", &json!({"user":user,"token":"new-token"}), code.clone(), vault.clone(), None)?;
                 let directory = prepared.directory.clone();
@@ -134,6 +142,67 @@ pub fn recover_interrupted() -> Result<()> {
     }
     std::fs::remove_file(path)?;
     Ok(())
+}
+
+/// Read the selected source as one committed snapshot, without creating plaintext files.
+pub fn local_snapshot(source_secret: Option<&str>) -> Result<String> {
+    let session = crate::auth::read_session_json()?;
+    let user = session["user"].as_str().unwrap_or("local");
+    let alias = session["keyring_account"].as_str().unwrap_or(user);
+    let version = session["vault_version"].as_i64().unwrap_or(1);
+    let password = if version == 1 {
+        source_secret.map(str::to_owned)
+            .or_else(|| session["pass"].as_str().map(str::to_owned))
+            .or_else(|| crate::keystore::load_login_pass(alias)).unwrap_or_default()
+    } else { String::new() };
+    let keys = crate::auth::unlock_session_keys(&session, &password,
+        if version == 1 { None } else { source_secret }, alias)?;
+    let directory = crate::service::data_dir();
+    let path = crate::service::database_path(&directory)?;
+    ensure!(path.is_file(), "selected source has no local library; nothing was migrated");
+    let database = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut statement = database.prepare("SELECT id,ciphertext,nonce,COALESCE(parent_id,'') FROM memories WHERE COALESCE(deleted,0)=0 ORDER BY id")?;
+    let mut rows = statement.query([])?;
+    let mut entries = Vec::new();
+    while let Some(row) = rows.next()? {
+        let mut stored = crate::memory::model::StoredMemory::new_pending(row.get(0)?, String::new());
+        stored.ciphertext = row.get(1)?;
+        stored.nonce = row.get(2)?;
+        stored.local_parent_id = row.get(3)?;
+        entries.push(crate::memory::MemoryEngine::open(&keys, &stored)
+            .context("source record cannot be decrypted; original library was preserved")?);
+    }
+    Ok(serde_json::to_string(&entries)?)
+}
+
+/// A remote identity includes its server; filesystem case folding is not account identity.
+pub fn login_directory(addr: &str, user: &str) -> Result<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let base = addr.trim().trim_end_matches('/');
+    let matches = |directory: &Path| -> Result<bool> {
+        let Some(bytes) = read_original(directory)? else { return Ok(false); };
+        let session: Value = serde_json::from_slice(&bytes).context("account session is invalid")?;
+        let stored_addr = session["addr"].as_str().unwrap_or("").trim().trim_end_matches('/');
+        // Older recovery-only profiles carry v1/v3 factors before the first login.
+        let recovery_only = stored_addr.is_empty() && !crate::service::database_path(directory)?.is_file();
+        Ok(session["user"].as_str() == Some(user) && (stored_addr == base || recovery_only))
+    };
+    for directory in [crate::service::data_dir(), crate::service::main_data_dir()] {
+        if matches(&directory)? { return Ok(directory); }
+    }
+    let accounts = crate::service::accounts_root();
+    if accounts.is_dir() {
+        for item in std::fs::read_dir(&accounts)? {
+            let item = item?;
+            if item.file_type()?.is_dir() && matches(&item.path())? { return Ok(item.path()); }
+        }
+    }
+    let plain = crate::service::account_dir(user)?;
+    if !plain.exists() { return Ok(plain); }
+    let suffix = hex::encode(Sha256::digest(format!("{base}\n{user}").as_bytes()));
+    let isolated = crate::service::account_dir(&format!("{user}-{}", &suffix[..16]))?;
+    ensure!(!isolated.exists() || matches(&isolated)?, "isolated account destination is occupied; original libraries were preserved");
+    Ok(isolated)
 }
 
 pub struct PreparedLogin {
@@ -279,10 +348,9 @@ impl PreparedLogin {
         let wrapped = vault["wrapped_urk"].as_str().context("vault missing wrapped_urk")?;
         let nonce = vault["urk_nonce"].as_str().context("vault missing urk_nonce")?;
         let current = crate::service::data_dir();
-        let main = crate::service::main_data_dir();
-        let directory = if crate::service::session_user_of_dir(&current) == user { current }
-            else if crate::service::session_user_of_dir(&main) == user { main }
-            else { crate::service::account_dir(&user)? };
+        let directory = if legacy.is_some() && crate::service::session_user_of_dir(&current) == user {
+            current
+        } else { login_directory(base, &user)? };
         let original = read_original(&directory)?;
         let mut session: Value = match original.as_deref() {
             Some(bytes) => serde_json::from_slice(bytes).context("target account session is invalid; original files were preserved")?,

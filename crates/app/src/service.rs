@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::auth;
@@ -1796,25 +1796,24 @@ struct ImportItem {
 pub struct ImportReport {
     pub imported: usize,
     pub skipped: usize,
+    pub duplicates: usize,
     pub reattached: usize,
     pub orphaned: usize,
 }
 
-/// Import a copy: validate parent chains first, mint all new ids, then atomic write, then one auto-sync.
 pub fn import_json(path: &std::path::Path) -> Result<ImportReport> {
     let text = crate::input_error::read_file(path, "import file")?;
-    let items: Vec<ImportItem> =
-        serde_json::from_str(&text).map_err(|e| anyhow!("failed to parse import JSON: {e}"))?;
-    let mut report = ImportReport {
-        imported: 0,
-        skipped: 0,
-        reattached: 0,
-        orphaned: 0,
-    };
+    import_json_text(&text)
+}
+
+/// Import exact-content-unique records; the same snapshot can be retried safely.
+pub fn import_json_text(text: &str) -> Result<ImportReport> {
+    let items: Vec<ImportItem> = serde_json::from_str(text)
+        .map_err(|e| anyhow!("failed to parse import JSON: {e}"))?;
+    let mut report = ImportReport { imported: 0, skipped: 0, duplicates: 0, reattached: 0, orphaned: 0 };
     let mut entries = Vec::new();
     let mut old_ids = HashMap::new();
     for (index, item) in items.into_iter().enumerate() {
-        // Keep exported records that have an id; tolerate blank placeholders from old batch input.
         if item.id.is_empty() && item.content.trim().is_empty() {
             report.skipped += 1;
             continue;
@@ -1822,21 +1821,8 @@ pub fn import_json(path: &std::path::Path) -> Result<ImportReport> {
         if !item.id.is_empty() && old_ids.insert(item.id, entries.len()).is_some() {
             anyhow::bail!("duplicate id at record {}", index + 1);
         }
-        let kind = item
-            .kind
-            .unwrap_or_else(|| "context".to_owned())
-            .to_lowercase();
-        if !matches!(
-            kind.as_str(),
-            "context"
-                | "decision"
-                | "preference"
-                | "task"
-                | "emotion"
-                | "time"
-                | "skill"
-                | "knowledge"
-        ) {
+        let kind = item.kind.unwrap_or_else(|| "context".to_owned()).to_lowercase();
+        if !matches!(kind.as_str(), "context" | "decision" | "preference" | "task" | "emotion" | "time" | "skill" | "knowledge") {
             anyhow::bail!("invalid kind at record {}: {kind}", index + 1);
         }
         let importance = item.importance.unwrap_or_else(|| "trivial".to_owned());
@@ -1847,81 +1833,114 @@ pub fn import_json(path: &std::path::Path) -> Result<ImportReport> {
         if emotion != -1.0 && !(0.0..=1.0).contains(&emotion) {
             anyhow::bail!("invalid emotion at record {}", index + 1);
         }
-        let created_at = item
-            .created_at
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(now_stamp);
-        let updated_at = item
-            .updated_at
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| created_at.clone());
+        let created_at = item.created_at.filter(|s| !s.is_empty()).unwrap_or_else(now_stamp);
+        let updated_at = item.updated_at.filter(|s| !s.is_empty()).unwrap_or_else(|| created_at.clone());
         entries.push(MemoryEntry {
-            supersedes: item.supersedes,
-            superseded_by: item.superseded_by,
-            see_also: item.see_also,
-            id: uuid::Uuid::new_v4().to_string(),
-            kind: Kind::from_str(&kind),
-            tags: match item.tags {
-                ImportTags::List(tags) => tags,
-                ImportTags::Text(tags) => split_tags(&tags),
-            },
-            title: item.title,
-            content: item.content,
-            user: item.user.unwrap_or_else(current_user),
-            computer: item.computer,
-            project: item.project,
-            device: device_tag(),
-            modified_by: device_tag(),
-            created_at,
-            updated_at,
-            emotion,
-            parent_id: item.parent_id.unwrap_or_default(),
-            importance,
+            supersedes: item.supersedes, superseded_by: item.superseded_by, see_also: item.see_also,
+            id: uuid::Uuid::new_v4().to_string(), kind: Kind::from_str(&kind),
+            tags: match item.tags { ImportTags::List(tags) => tags, ImportTags::Text(tags) => split_tags(&tags) },
+            title: item.title, content: item.content, user: item.user.unwrap_or_else(current_user),
+            computer: item.computer, project: item.project, device: device_tag(), modified_by: device_tag(),
+            created_at, updated_at, emotion, parent_id: item.parent_id.unwrap_or_default(), importance,
         });
     }
-    // Check the whole parent chain before write; iterate so a deep tree cannot overflow the stack.
     let mut done = HashSet::new();
     for start in 0..entries.len() {
         let mut chain = HashSet::new();
         let mut cursor = Some(start);
         while let Some(index) = cursor {
-            if done.contains(&index) {
-                break;
-            }
-            if !chain.insert(index) {
-                anyhow::bail!("import parent chain contains a cycle");
-            }
+            if done.contains(&index) { break; }
+            if !chain.insert(index) { anyhow::bail!("import parent chain contains a cycle"); }
             cursor = old_ids.get(&entries[index].parent_id).copied();
         }
         done.extend(chain);
     }
-    let new_ids: Vec<_> = entries.iter().map(|entry| entry.id.clone()).collect();
-    let relation_ids: HashMap<String,String> = old_ids.iter().map(|(id,i)| (id.clone(),new_ids[*i].clone())).collect();
-    remap_relations(&mut entries,&relation_ids)?;
-    for entry in &mut entries {
-        if entry.parent_id.is_empty() {
-            continue;
-        }
-        if let Some(index) = old_ids.get(&entry.parent_id) {
-            entry.parent_id = new_ids[*index].clone();
-            report.reattached += 1;
-        } else {
-            // An export may contain a live child whose parent was deleted; do not bind to a same-id row in this library.
-            entry.parent_id.clear();
-            report.orphaned += 1;
-        }
-    }
-    if entries.is_empty() {
-        return Ok(report);
-    }
+    if entries.is_empty() { return Ok(report); }
     let app = App::open()?;
-    let stored = entries
-        .iter()
-        .map(|entry| MemoryEngine::seal(&app.keys, &app.embedder, entry, &entry.user))
-        .collect::<Result<Vec<_>>>()?;
-    app.store.import_batch(&stored)?;
-    report.imported = stored.len();
-    app.auto_sync();
+    app.store.write_transaction(|| {
+        let mut contents = HashMap::new();
+        let mut existing = app.store.all(false)?;
+        existing.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut canonical = HashMap::new();
+        for stored in existing {
+            let entry = MemoryEngine::open(&app.keys, &stored)?;
+            contents.entry(entry.content.clone()).or_insert(entry.id.clone());
+            canonical.insert(entry.id.clone(), (stored, entry));
+        }
+        let mut retained = Vec::new();
+        for (index, entry) in entries.iter_mut().enumerate() {
+            if let Some(id) = contents.get(&entry.content) {
+                entry.id = id.clone();
+                report.skipped += 1;
+                report.duplicates += 1;
+            } else {
+                contents.insert(entry.content.clone(), entry.id.clone());
+                retained.push(index);
+            }
+        }
+        let ids: HashMap<String, String> = old_ids.iter()
+            .map(|(id, index)| (id.clone(), entries[*index].id.clone())).collect();
+        let mut fresh: Vec<MemoryEntry> = retained.into_iter().map(|index| entries[index].clone()).collect();
+        remap_relations(&mut fresh, &ids)?;
+        for entry in &mut fresh {
+            if entry.parent_id.is_empty() { continue; }
+            match ids.get(&entry.parent_id) {
+                Some(id) if id != &entry.id => {
+                    entry.parent_id = id.clone();
+                    report.reattached += 1;
+                }
+                Some(_) => anyhow::bail!("content deduplication would create a self parent; original library was preserved"),
+                None => { entry.parent_id.clear(); report.orphaned += 1; }
+            }
+        }
+        let parents: HashMap<_, _> = fresh.iter().map(|entry| (entry.id.as_str(), entry.parent_id.as_str())).collect();
+        let mut complete = HashSet::new();
+        for start in &fresh {
+            let mut seen = HashSet::new();
+            let mut cursor = start.id.as_str();
+            while let Some(parent) = parents.get(cursor) {
+                if complete.contains(cursor) { break; }
+                if !seen.insert(cursor) { anyhow::bail!("content deduplication would create a parent cycle"); }
+                cursor = parent;
+            }
+            complete.extend(seen);
+        }
+        let mut linked = HashSet::new();
+        for entry in &fresh {
+            if let Some((_, previous)) = canonical.get_mut(&entry.supersedes) {
+                ensure!(previous.superseded_by.is_empty(), "deduplicated target already has a replacement; import was rolled back");
+                previous.superseded_by = entry.id.clone();
+                linked.insert(previous.id.clone());
+            }
+            for target in &entry.see_also {
+                if let Some((_, other)) = canonical.get_mut(target) {
+                    if !other.see_also.contains(&entry.id) {
+                        other.see_also.push(entry.id.clone());
+                        linked.insert(other.id.clone());
+                    }
+                }
+            }
+        }
+        for id in linked {
+            let (row, entry) = canonical.get(&id).context("missing deduplicated association target")?;
+            let stamp = app.store.edit_stamp(&id)?;
+            let updated = MemoryEngine::reseal_edges(&app.keys, row, &stamp, |payload| {
+                payload.superseded_by = entry.superseded_by.clone();
+                payload.see_also = entry.see_also.clone();
+                payload.modified_by = device_tag();
+            })?;
+            ensure!(app.store.put_inner(&updated, true)?, "deduplicated association target changed");
+        }
+        let stored = fresh.iter()
+            .map(|entry| MemoryEngine::seal(&app.keys, &app.embedder, entry, &entry.user))
+            .collect::<Result<Vec<_>>>()?;
+        for memory in &stored {
+            if !app.store.put_inner(memory, true)? { anyhow::bail!("import conflict: {}", memory.id); }
+        }
+        report.imported = stored.len();
+        Ok(())
+    })?;
+    if report.imported > 0 { app.auto_sync(); }
     Ok(report)
 }
 
@@ -2223,6 +2242,7 @@ pub fn import_share_payload(
     let report = ImportReport {
         imported: entries.len(),
         skipped,
+        duplicates: 0,
         reattached,
         orphaned,
     };
@@ -3626,19 +3646,52 @@ mod tests {
 
     #[test]
     fn status_light_and_titles() -> anyhow::Result<()> {
-        let _guard = crate::test_lock::guard();
-        let dir = tempfile::tempdir()?;
-        let saved = crate::env::var("RSRS_DATA_DIR").ok();
-        std::env::set_var("RSRS_DATA_DIR", dir.path());
+        let _isolate = crate::test_lock::Isolate::new()?;
         let info = status_light()?;
         assert_eq!(info.local_total, 0);
         assert_eq!(derive_title("【经验】first line\nsecond"), "first line");
         assert_eq!(derive_title(""), "(untitled)");
         assert!(diary_mode() == "concise" || diary_mode() == "verbose");
-        match saved {
-            Some(v) => std::env::set_var("RSRS_DATA_DIR", v),
-            None => std::env::remove_var("RSRS_DATA_DIR"),
+        let saved_super = std::env::var_os("RSRS_SUPER");
+        let code = crate::memory::crypto::generate_secret_key();
+        std::env::set_var("RSRS_SUPER", &code);
+        let result = (|| -> Result<()> {
+            let (salt, wrapped, nonce) = crate::auth::wrap_with_rsrs(&code, &[7; 32])?;
+            crate::auth::write_session_json(&serde_json::json!({
+                "user":"fixture","vault_version":4,"kdf_salt":salt,"wrapped_urk":wrapped,"urk_nonce":nonce
+            }))?;
+            let _deferred = respire_core_sdk::defer_indexing();
+            let snapshot = r#"[{"id":"parent","content":"unique parent","title":"parent"},{"id":"child","content":"unique child","parent_id":"parent"},{"id":"parent-copy","content":"unique parent"},{"id":"new-child","content":"third body","parent_id":"parent-copy","see_also":["parent"]}]"#;
+            let first = import_json_text(snapshot)?;
+            assert_eq!((first.imported, first.duplicates), (3, 1));
+            let again = import_json_text(snapshot)?;
+            assert_eq!((again.imported, again.duplicates), (0, 4));
+            let keys = auth::load_local_session()?;
+            let entries: Vec<_> = open_store()?.all(false)?.iter()
+                .map(|stored| MemoryEngine::open(&keys, stored)).collect::<Result<_>>()?;
+            let parent = entries.iter().find(|entry| entry.content == "unique parent").ok_or_else(|| anyhow!("parent missing"))?;
+            let child = entries.iter().find(|entry| entry.content == "third body").ok_or_else(|| anyhow!("child missing"))?;
+            assert_eq!(child.parent_id, parent.id);
+            assert_eq!(child.see_also, vec![parent.id.clone()]);
+            assert!(import_json_text(r#"[{"id":"a","content":"a","parent_id":"b"},{"id":"b","content":"b","parent_id":"a"}]"#).is_err());
+            assert_eq!(open_store()?.all(false)?.len(), 3);
+            let snapshot = crate::login_transaction::local_snapshot(Some(&code))?;
+            assert_eq!(serde_json::from_str::<Vec<MemoryEntry>>(&snapshot)?.len(), 3);
+            let extra = r#"[{"id":"existing","content":"unique parent"},{"id":"new","content":"fourth body","supersedes":"existing","see_also":["existing"]}]"#;
+            assert_eq!((import_json_text(extra)?.imported, import_json_text(extra)?.duplicates), (1, 2));
+            let store = open_store()?;
+            let all = store.all(false)?;
+            let entries = all.iter().map(|stored| MemoryEngine::open(&keys, stored)).collect::<Result<Vec<_>>>()?;
+            let parent = entries.iter().find(|entry| entry.content == "unique parent").ok_or_else(|| anyhow!("parent missing"))?;
+            let replacement = entries.iter().find(|entry| entry.content == "fourth body").ok_or_else(|| anyhow!("replacement missing"))?;
+            assert_eq!(parent.superseded_by, replacement.id);
+            assert!(parent.see_also.contains(&replacement.id));
+            Ok(())
+        })();
+        match saved_super {
+            Some(value) => std::env::set_var("RSRS_SUPER", value),
+            None => std::env::remove_var("RSRS_SUPER"),
         }
-        Ok(())
+        result
     }
 }

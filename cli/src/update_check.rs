@@ -28,7 +28,7 @@ const THROTTLE_SECS: i64 = 24 * 3600;
 /// Default registry.
 const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org";
 /// npm package name for this repo (OIDC publish in the release workflow).
-const PACKAGE: &str = "@rsrsai/cli";
+const PACKAGE: &str = "rsrs-cli";
 
 pub fn cache_path() -> PathBuf {
     data_dir().join("update_check.json")
@@ -173,7 +173,7 @@ impl UpdateStatus {
     /// User-facing hint line (only worth showing when outdated).
     pub fn message(&self) -> String {
         format!(
-            "PROMOTE rsrs CLI has a new version: {} -> {} (local {}) - update: npm i -g @rsrsai/cli@latest",
+            "PROMOTE rsrs CLI has a new version: {} -> {} (local {}) - update: npm i -g rsrs-cli@latest",
             self.current, self.latest, self.current
         )
     }
@@ -286,7 +286,7 @@ mod tests {
         };
         let m = s.message();
         assert!(m.contains("0.2.42") && m.contains("0.2.44"), "{m}");
-        assert!(m.contains("npm i -g @rsrsai/cli@latest"), "{m}");
+        assert!(m.contains("npm i -g rsrs-cli@latest"), "{m}");
     }
 
     #[test]

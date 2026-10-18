@@ -217,7 +217,7 @@ Install it into this machine's Respire library. Follow the steps; do not rewrite
 
 ## 1. Ready the CLI
 
-If this machine has no rsrs yet: `npm i -g @rsrsai/cli` (or `cargo build --release -p respire` from source).
+If this machine has no rsrs yet: `npm i -g rsrs-cli` (or `cargo build --release -p respire` from source).
 Skip if you already have it; `rsrs status` checks. If the library was never initialized, start local-only with `rsrs keygen --pass <password>`.
 
 ## 2. Save the payload

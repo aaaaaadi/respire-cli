@@ -266,7 +266,7 @@ pub fn run() -> Result<()> {
             // Give secret prompts sole ownership of the normal terminal, then redraw the TUI.
             restore(&mut terminal)?;
             disable_raw_mode()?;
-            let login = crate::login::run(None, None, None, None, true, false, None, false);
+            let login = crate::login::run(None, None, None, None, true, false, None, false, false);
             enable_raw_mode()?;
             terminal = match setup() {
                 Ok(terminal) => terminal,
@@ -1392,9 +1392,9 @@ fn tools_on_path() -> Vec<Manager> {
 
 fn channel_spec() -> String {
     if env!("CARGO_PKG_VERSION").contains("-dev") {
-        "@rsrsai/cli@dev".to_owned()
+        "rsrs-cli@dev".to_owned()
     } else {
-        "@rsrsai/cli@latest".to_owned()
+        "rsrs-cli@latest".to_owned()
     }
 }
 

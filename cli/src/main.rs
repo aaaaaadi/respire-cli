@@ -1229,6 +1229,9 @@ enum Command {
         /// Display the authorization URL without opening a browser
         #[arg(long)]
         no_open: bool,
+        /// Copy selected local memories into this server account without plaintext export files
+        #[arg(long)]
+        migrate_local: bool,
     },
     /// Book material: a root subtree -> volume/chapter full text (for an AI to draft)
     BookMaterial { root: String },
@@ -4344,7 +4347,7 @@ fn run_update_check(force: bool, clear: bool) -> Result<()> {
                 )],
             );
             if s.outdated {
-                result.actions.push("npm i -g @rsrsai/cli@latest".into());
+                result.actions.push("npm i -g rsrs-cli@latest".into());
             }
             emit_result(result)
         }
@@ -4376,7 +4379,7 @@ fn run_doctor(check_remote: bool, check_update: bool, fix: bool) -> Result<()> {
     match respire::migration::pending_legacy_profiles() {
         Ok(profiles) if !profiles.is_empty() => {
             add(&mut items, "migration", true,
-                format!("{} legacy account(s) not migrated; use rsrs migrate or TUI Accounts > Migrate; no automatic migration", profiles.len()));
+                format!("{} legacy account(s) not migrated: {}; use rsrs migrate or TUI Accounts > Migrate; no automatic migration", profiles.len(), profiles.iter().filter_map(|profile| profile["source"].as_str()).collect::<Vec<_>>().join(", ")));
             model_warnings.push("migration");
         }
         Ok(_) => {}
@@ -4643,7 +4646,7 @@ fn run_doctor(check_remote: bool, check_update: bool, fix: bool) -> Result<()> {
                 "CLI version",
                 false,
                 format!(
-                    "{} -> {} newer available ({}) - npm i -g @rsrsai/cli@latest",
+                    "{} -> {} newer available ({}) - npm i -g rsrs-cli@latest",
                     s.current,
                     s.latest,
                     if s.cached { "cache" } else { "just checked" }
@@ -5986,8 +5989,8 @@ fn run(args: Cli) -> Result<()> {
             *key_stdin,
         );
     }
-    if let Some(Command::Login { addr, user, pass, super_pass, interactive, oauth, dashboard, no_open }) = args.command.as_ref() {
-        return login::run(addr.as_deref(), user.as_deref(), pass.as_deref(), super_pass.as_deref(), *interactive, *oauth, dashboard.as_deref(), *no_open);
+    if let Some(Command::Login { addr, user, pass, super_pass, interactive, oauth, dashboard, no_open, migrate_local }) = args.command.as_ref() {
+        return login::run(addr.as_deref(), user.as_deref(), pass.as_deref(), super_pass.as_deref(), *interactive, *oauth, dashboard.as_deref(), *no_open, *migrate_local);
     }
     if rpc::worker_active() {
         return run_local(args);
@@ -7204,7 +7207,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
         }
         Command::Import { file } => {
             let report = respire::service::import_json(std::path::Path::new(&file))?;
-            let status = if report.orphaned > 0 || report.skipped > 0 {
+            let status = if report.orphaned > 0 || report.skipped > report.duplicates {
                 OutputStatus::Warn
             } else {
                 OutputStatus::Ok
@@ -7215,9 +7218,10 @@ fn run_local_inner(args: Cli) -> Result<()> {
                 serde_json::to_value(&report)?,
                 vec![
                     OutputItem::new("written", OutputStatus::Ok, report.imported.to_string()),
+                    OutputItem::new("duplicates", OutputStatus::Ok, report.duplicates.to_string()),
                     OutputItem::new(
                         "skipped",
-                        if report.skipped > 0 {
+                        if report.skipped > report.duplicates {
                             OutputStatus::Warn
                         } else {
                             OutputStatus::Ok
