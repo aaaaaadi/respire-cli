@@ -17,7 +17,7 @@ parser.add_argument('--resident-stress',action='store_true',help='Exercise concu
 parser.add_argument('--seed-binary',help='Create both libraries with this published older binary, then upgrade its running runtime')
 args=parser.parse_args()
 faulthandler.enable()
-faulthandler.dump_traceback_later(60, repeat=True)
+# Asynchronous stack dumps can race live frames (CPython #116008); fixture calls retain hard deadlines.
 BASE=pathlib.Path(args.output_dir).resolve()
 BASE.mkdir(parents=True,exist_ok=True)
 import cryptography, importlib.metadata, psutil

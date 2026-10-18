@@ -642,6 +642,20 @@ fn authorization_preserves_and_commits_profiles() -> Result<(), Box<dyn std::err
         assert_eq!(retry["summary"]["import"]["duplicates"], 2);
         assert_eq!(remote_blobs.lock().map_err(|error| error.to_string())?.len(), 2);
         assert_eq!(std::fs::read(original.join("session.json"))?, source_session);
+        let retained_session = std::fs::read(target.join("session.json"))?;
+        let retained_config = std::fs::read(root.join("client.json"))?;
+        let mismatch_salt = crypto::random_hex(16);
+        let (mismatch_nonce, mismatch_wrap) = crypto::wrap_key(
+            &[44_u8; 32], &crypto::derive_kek_v4(&super_password, &mismatch_salt)?)?;
+        *cloud.lock().map_err(|error| error.to_string())? =
+            json!({"version":4,"kdf_salt":mismatch_salt,"wrapped_urk":mismatch_wrap,"urk_nonce":mismatch_nonce});
+        let rejected = execute(&["--json", "login", "--oauth", "--addr", &addr, "--dashboard", &addr,
+            "--no-open", "--super", &super_password])?;
+        assert_eq!(rejected.status.code(), Some(1), "same-identity key mismatch was accepted");
+        assert!(String::from_utf8_lossy(&rejected.stdout).contains("different key material"));
+        assert_eq!(std::fs::read(target.join("session.json"))?, retained_session);
+        assert_eq!(std::fs::read(root.join("client.json"))?, retained_config);
+        *cloud.lock().map_err(|error| error.to_string())? = cloud_snapshot;
         assert!(execute(&["--json", "logout", "--full"])?.status.success());
         assert!(!target.join("session.json").exists());
         let recovered = execute(&["--json", "login", "--oauth", "--addr", &addr, "--dashboard", &addr,
