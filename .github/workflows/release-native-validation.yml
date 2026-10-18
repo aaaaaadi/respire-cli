@@ -97,10 +97,11 @@ jobs:
           else
             "$py" -m pip install --only-binary=:all: psutil==7.1.0
           fi
-          # Only the real historical baseline uses FP16; the candidate uses quantized.
+          # Historical sources use FP16; newer stable sources also need the prepared CPU container.
           mkdir -p native-legacy-model/onnx
           cp "$RUNNER_TEMP/release-probe/models/bge-m3/tokenizer.json" native-legacy-model/tokenizer.json
           cp "$RUNNER_TEMP/release-probe/models/bge-m3/onnx/model_quantized.onnx" native-legacy-model/onnx/model_quantized.onnx
+          cp "$RUNNER_TEMP/release-probe/models/bge-m3/onnx/model_quantized.cpu-v1.ort" native-legacy-model/onnx/model_quantized.cpu-v1.ort
           curl --fail --location --retry 1 --connect-timeout 20 --max-time 1200 \
             'https://huggingface.co/Xenova/bge-m3/resolve/4de13258303883538bd53b696b452bf8099f0858/onnx/model_fp16.onnx' \
             --output native-legacy-model/onnx/model_fp16.onnx
