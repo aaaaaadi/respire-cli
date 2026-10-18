@@ -4,6 +4,7 @@ use anyhow::{anyhow, ensure, Context, Result};
 use serde_json::{json, Value};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
+use sha2::Digest;
 
 #[derive(Serialize, Deserialize)]
 struct Recovery {
@@ -175,6 +176,26 @@ pub fn local_snapshot(source_secret: Option<&str>) -> Result<String> {
     Ok(serde_json::to_string(&entries)?)
 }
 
+// A sessionless library can identify itself only by decrypting with the authorized data key.
+fn library_accepts_keys(directory: &Path, keys: &crate::memory::SessionKeys) -> Result<bool> {
+    let path = crate::service::database_path(directory)?;
+    if !path.is_file() { return Ok(false); }
+    let database = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let has_memories: bool = database.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories')", [], |row| row.get(0))?;
+    if !has_memories { return Ok(false); }
+    let mut statement = database.prepare("SELECT ciphertext,nonce FROM memories WHERE ciphertext <> '' AND COALESCE(deleted,0)=0")?;
+    let mut rows = statement.query([])?;
+    let mut count = 0;
+    while let Some(row) = rows.next()? {
+        let mut stored = crate::memory::model::StoredMemory::new_pending(String::new(), String::new());
+        stored.ciphertext = row.get(0)?;
+        stored.nonce = row.get(1)?;
+        if crate::memory::MemoryEngine::open(keys, &stored).is_err() { return Ok(false); }
+        count += 1;
+    }
+    Ok(count > 0)
+}
+
 /// A remote identity includes its server; filesystem case folding is not account identity.
 pub fn login_directory(addr: &str, user: &str) -> Result<PathBuf> {
     use sha2::{Digest, Sha256};
@@ -201,7 +222,8 @@ pub fn login_directory(addr: &str, user: &str) -> Result<PathBuf> {
     if !plain.exists() { return Ok(plain); }
     let suffix = hex::encode(Sha256::digest(format!("{base}\n{user}").as_bytes()));
     let isolated = crate::service::account_dir(&format!("{user}-{}", &suffix[..16]))?;
-    ensure!(!isolated.exists() || matches(&isolated)?, "isolated account destination is occupied; original libraries were preserved");
+    ensure!(!isolated.exists() || matches(&isolated)? || read_original(&isolated)?.is_none(),
+        "isolated account destination is occupied; original libraries were preserved");
     Ok(isolated)
 }
 
@@ -348,8 +370,8 @@ impl PreparedLogin {
         let wrapped = vault["wrapped_urk"].as_str().context("vault missing wrapped_urk")?;
         let nonce = vault["urk_nonce"].as_str().context("vault missing urk_nonce")?;
         let current = crate::service::data_dir();
-        let directory = if legacy.is_some() && crate::service::session_user_of_dir(&current) == user {
-            current
+        let mut directory = if legacy.is_some() && crate::service::session_user_of_dir(&current) == user {
+            current.clone()
         } else { login_directory(base, &user)? };
         let original = read_original(&directory)?;
         let mut session: Value = match original.as_deref() {
@@ -374,6 +396,17 @@ impl PreparedLogin {
                 salt, wrapped, nonce),
             _ => crate::memory::SessionKeys::unlock_v4(&super_password, salt, wrapped, nonce),
         }.context("original decryption factors do not unlock this account; the original account was preserved")?;
+        if original.is_none() && legacy.is_none() {
+            let plain = crate::service::account_dir(&user)?;
+            let suffix = hex::encode(sha2::Sha256::digest(format!("{base}\n{user}").as_bytes()));
+            let isolated = crate::service::account_dir(&format!("{user}-{}", &suffix[..16]))?;
+            for candidate in [current, crate::service::main_data_dir(), plain, isolated] {
+                if read_original(&candidate)?.is_none() && library_accepts_keys(&candidate, &verified)? {
+                    directory = candidate;
+                    break;
+                }
+            }
+        }
         ensure!(session["user"].as_str().is_none_or(|owner| owner.is_empty() || owner == user), "destination belongs to another account");
         if let Some((original, urk)) = legacy.as_ref() {
             ensure!(session == *original && verified.urk == *urk, "legacy session changed or migration would replace its data key");
@@ -389,18 +422,8 @@ impl PreparedLogin {
                     if legacy.is_none() && !same_wrap {
                         // Full logout removes the wrap, and a super-password change can
                         // rewrap the same URK. Prove compatibility against local data.
-                        let mut statement = database.prepare("SELECT ciphertext,nonce FROM memories WHERE ciphertext <> '' AND COALESCE(deleted,0)=0")?;
-                        let mut rows = statement.query([])?;
-                        let mut verified_rows = 0;
-                        while let Some(row) = rows.next()? {
-                            let mut stored = crate::memory::model::StoredMemory::new_pending(String::new(), String::new());
-                            stored.ciphertext = row.get(0)?;
-                            stored.nonce = row.get(1)?;
-                            crate::memory::MemoryEngine::open(&verified, &stored)
-                                .context("local library uses different key material; original data was preserved")?;
-                            verified_rows += 1;
-                        }
-                        ensure!(verified_rows > 0, "local library key compatibility could not be verified; original data was preserved");
+                        ensure!(library_accepts_keys(&directory, &verified)?,
+                            "local library uses different key material or compatibility could not be verified; original data was preserved");
                     }
                 }
             }

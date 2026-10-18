@@ -642,6 +642,17 @@ fn authorization_preserves_and_commits_profiles() -> Result<(), Box<dyn std::err
         assert_eq!(retry["summary"]["import"]["duplicates"], 2);
         assert_eq!(remote_blobs.lock().map_err(|error| error.to_string())?.len(), 2);
         assert_eq!(std::fs::read(original.join("session.json"))?, source_session);
+        assert!(execute(&["--json", "logout", "--full"])?.status.success());
+        assert!(!target.join("session.json").exists());
+        let recovered = execute(&["--json", "login", "--oauth", "--addr", &addr, "--dashboard", &addr,
+            "--no-open", "--super", &super_password])?;
+        assert!(recovered.status.success(), "{}", String::from_utf8_lossy(&recovered.stdout));
+        let recovered: Value = serde_json::from_slice(&recovered.stdout)?;
+        assert_eq!(recovered["summary"]["dir"].as_str(), target.to_str(), "full logout selected a fresh library");
+        for row in &rows {
+            let read = execute(&["--json", "show", &row.id])?;
+            assert!(read.status.success(), "full logout lost local record: {}", String::from_utf8_lossy(&read.stdout));
+        }
         for row in &rows { assert!(execute(&["--json", "purge", &row.id])?.status.success()); }
         remote_blobs.lock().map_err(|error| error.to_string())?.clear();
         assert!(execute(&["--runtime-internal", "--stop"])?.status.success());

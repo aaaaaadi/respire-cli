@@ -137,9 +137,8 @@ pub(crate) fn run(addr: Option<&str>, user: Option<&str>, pass: Option<&str>, su
         }
     };
     let source = respire::service::data_dir();
-    let destination = respire_app::login_transaction::login_directory(&addr,
-        authorization["user"].as_str().context("authorization did not return a user")?)?;
-    let different = source != destination;
+    let prepared = respire_app::login_transaction::PreparedLogin::prepare_with_vault(&addr, &authorization, super_password, vault, None)?;
+    let different = source != prepared.directory;
     let source_has_data = respire::service::database_path(&source)?.is_file();
     ensure!(!migrate_local || different, "source and destination are the same account; no migration is needed");
     let copy = if migrate_local { true }
@@ -156,7 +155,6 @@ pub(crate) fn run(addr: Option<&str>, user: Option<&str>, pass: Option<&str>, su
         Some(respire_app::login_transaction::local_snapshot(
             (!source_secret.is_empty()).then_some(source_secret.as_str()))?)
     } else { None };
-    let prepared = respire_app::login_transaction::PreparedLogin::prepare_with_vault(&addr, &authorization, super_password, vault, None)?;
     commit_verified(&addr, &authorization, prepared, "login", snapshot.as_deref())
 }
 
