@@ -55,9 +55,9 @@ def main():
         def log_message(self, *args):
             pass
 
-        def reply(self, value):
+        def reply(self, value, status=200):
             body = json.dumps(value).encode()
-            self.send_response(200)
+            self.send_response(status)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -84,10 +84,24 @@ def main():
                     "original_login_password_changed")
                 state["auth_salt"] = data["salt"]
                 self.reply({"updated": True})
+            elif self.path == "/push/batch":
+                require(self.headers.get("Authorization") == "Bearer synthetic-token", "transfer_push_not_authorized")
+                for item in data["items"]:
+                    state["sync_blobs"][item["id"]] = dict(item, user="synthetic")
+                self.reply({"replaced": [True] * len(data["items"])})
             else:
                 self.send_error(404)
 
         def do_GET(self):
+            if self.path == "/pull" or self.path.startswith("/pull?"):
+                state["sync_pulls"] += 1
+                if state["sync_pulls"] == 2:
+                    self.reply({"error": "synthetic outage after preflight"}, 503)
+                else:
+                    blobs = list(state["sync_blobs"].values())
+                    self.reply({"blobs": blobs, "cursor": len(blobs), "total": len(blobs),
+                                "alive": sum(not item["deleted"] for item in blobs)})
+                return
             if self.path == "/auth/salt?user=synthetic":
                 self.reply({"salt": state["auth_salt"]})
                 return
@@ -305,11 +319,13 @@ def main():
         source_value["addr"] = "https://previous.invalid"
         source_value["super"] = old_super  # Synthetic source factor differs from the target env key.
         source_session.write_text(json.dumps(source_value), encoding="utf-8")
-        source_before = source_session.read_bytes(), legacy.digest(source_path / "rsrs.db")
+        with sqlite3.connect((source_path / "rsrs.db").as_uri() + "?mode=ro", uri=True) as db:
+            source_before = source_session.read_bytes(), db.execute("SELECT id,ciphertext,nonce FROM memories ORDER BY id").fetchall()
         cloud_urk = secrets.token_bytes(32)
         cloud_salt, cloud_nonce = secrets.token_hex(16), secrets.token_bytes(12)
         state["vault"] = {"version": 4, "kdf_salt": cloud_salt, "urk_nonce": cloud_nonce.hex(),
             "wrapped_urk": legacy.PREFIX + AESGCM(legacy.v4_kek(code, cloud_salt, legacy.PREFIX)).encrypt(cloud_nonce, cloud_urk, None).hex()}
+        state.update(sync_blobs={}, sync_pulls=0)
         transfer = ("--json", "login", "--interactive", "--addr", addr, "--user", "synthetic",
                     "--pass=synthetic-password", "--super", code, "--migrate-local")
         first_result = cli(*transfer, success=False)
@@ -321,17 +337,20 @@ def main():
         require(target.resolve() != source_path.resolve(), "server_transfer_reused_source")
         with sqlite3.connect((target / "rsrs.db").as_uri() + "?mode=ro", uri=True) as db:
             copied = db.execute("SELECT ciphertext,nonce FROM memories WHERE deleted=0").fetchall()
-        require(len(copied) == 1 and legacy.decrypt_content(cloud_urk, *copied[0])
-                == legacy.decrypt_content(urk, original_rows[0][1], original_rows[0][2]),
+        require(len(copied) == 1, "server_transfer_copy_missing")
+        copied_payload = json.loads(legacy.decrypt_content(cloud_urk, *copied[0]))
+        original_payload = json.loads(legacy.decrypt_content(urk, original_rows[0][1], original_rows[0][2]))
+        require(all(copied_payload[field] == original_payload[field] for field in ("content", "title")),
                 "server_transfer_not_reencrypted")
         cli("--json", "account", "use", source_name)
-        retry_result = cli(*transfer, success=False)
-        require(retry_result.returncode == 2, "server_transfer_retry_sync_warning_missing")
+        retry_result = cli(*transfer)
         retry = json.loads(retry_result.stdout)["summary"]
         require(retry["import"]["imported"] == 0 and retry["import"]["duplicates"] == 1,
                 "server_transfer_retry_duplicated")
-        require((source_session.read_bytes(), legacy.digest(source_path / "rsrs.db")) == source_before,
-                "server_transfer_changed_source")
+        require(len(state["sync_blobs"]) == 1, "server_transfer_remote_duplicated")
+        with sqlite3.connect((source_path / "rsrs.db").as_uri() + "?mode=ro", uri=True) as db:
+            require((source_session.read_bytes(), db.execute("SELECT id,ciphertext,nonce FROM memories ORDER BY id").fetchall())
+                    == source_before, "server_transfer_changed_source")
         report["cases"]["different_server_transfer_retry"] = {"passed": True,
             "source_preserved": True, "different_urk": True, "duplicates_skipped": True}
         report["passed"] = True

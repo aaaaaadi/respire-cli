@@ -144,7 +144,7 @@ pub(crate) fn run(addr: Option<&str>, user: Option<&str>, pass: Option<&str>, su
     ensure!(!migrate_local || different, "source and destination are the same account; no migration is needed");
     let copy = if migrate_local { true }
         else if interactive && different && source_has_data && respire::prompt::interactive() {
-            respire::prompt::ask("Copy selected local memories to this server account? [y/N]: ")?
+            respire::prompt::ask("Merge selected local memories into this server account (skip identical bodies; keep existing records)? [y/N]: ")?
                 .trim().eq_ignore_ascii_case("y")
         } else { false };
     let snapshot = if copy {
@@ -168,7 +168,13 @@ fn commit_verified(addr: &str, authorization: &Value, prepared: respire_app::log
         if let Some(snapshot) = snapshot {
             let mut entries: Vec<respire::memory::model::MemoryEntry> = serde_json::from_str(snapshot)?;
             for entry in &mut entries { entry.user = prepared.borrow().user.clone(); }
+            ensure!(!respire::service::off_mode(), "target memory service is disabled; source library was preserved");
+            respire::service::ensure_writable()?;
             let _deferred = respire::core_sdk::defer_indexing();
+            let target = respire::service::App::open()?;
+            let before = target.sync().context("target synchronization failed before copying; source library was preserved")?;
+            ensure!(before.converged, "target library has not converged; resolve sync before migrating; source library was preserved");
+            drop(target);
             *imported.borrow_mut() = Some(respire::service::import_json_text(&serde_json::to_string(&entries)?)?);
         }
         Ok(())

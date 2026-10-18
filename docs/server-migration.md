@@ -12,7 +12,7 @@ For a custom server, also pass `--dashboard https://your-dashboard.example`. Log
 
 In TUI Accounts > Login, enter the target server and confirm copying the selected local memories. Answering no only logs in. A matching remote identity uses its existing library; a different server or differently cased username uses a separate profile. Identity checks and key verification remain mandatory.
 
-Migration copies a committed local snapshot, decrypts it in memory and reencrypts it for the target. No plaintext export file is created. The source is retained. Existing target bodies are kept; exact duplicate bodies are skipped, and new parent/association references are remapped. Different content remains distinct. Changed source records after the snapshot are not part of that transfer.
+Migration first synchronizes the target library so cloud-only records participate in deduplication. If this preflight fails or the target has not converged, copying stops and the original selection is restored. It then copies a committed source snapshot, decrypts it in memory and reencrypts it for the target. No plaintext export file is created. The source is retained. Existing target bodies are kept; exact duplicate bodies are skipped, and new parent/association references are remapped. Different content remains distinct. Changed source records after the snapshot are not part of that transfer.
 
 The login result includes import counts and a sync result. Exit code 2 with a sync warning after successful login means the local copy remains available; inspect the reported error and retry `rsrs sync` when connectivity returns. It does not mean the source was removed. A failed profile commit restores the previous selection. Repeating a transfer skips bodies already copied.
 
