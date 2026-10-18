@@ -72,12 +72,16 @@ fn browser_authorization(addr: &str, user: Option<&str>, dashboard: Option<&str>
     Err(anyhow!("browser authorization timed out; original account was preserved"))
 }
 
-pub(crate) fn run(addr: Option<&str>, user: Option<&str>, pass: Option<&str>, super_password: Option<&str>, interactive: bool, oauth: bool, dashboard: Option<&str>, no_open: bool) -> Result<()> {
+pub(crate) fn run(addr: Option<&str>, user: Option<&str>, pass: Option<&str>, super_password: Option<&str>, interactive: bool, oauth: bool, dashboard: Option<&str>, no_open: bool, migrate_local: bool) -> Result<()> {
     crate::runtime_policy::require_host("account authorization and profile switching")?;
     ensure!(!crate::rpc::worker_active(), "login must run in the host terminal, not runtime RPC");
     crate::rpc::recover_interrupted_login()?;
     let last = respire::auth::read_session_json().ok().and_then(|session| session["addr"].as_str().map(ToOwned::to_owned));
-    let addr = login_origin(addr, last.as_deref())?;
+    let selected_addr = if interactive && addr.is_none() && respire::prompt::interactive() {
+        let selected = respire::prompt::ask("server HTTPS origin (Enter = current/public): ")?;
+        (!selected.trim().is_empty()).then(|| selected.trim().to_owned())
+    } else { None };
+    let addr = login_origin(addr.or(selected_addr.as_deref()), last.as_deref())?;
     let password_mode = if interactive && !oauth && pass.is_none() && respire::prompt::interactive() {
         let choice = respire::prompt::ask("login method: 1 OAuth (default), 2 password/TOTP: ")?;
         ensure!(matches!(choice.trim(), "" | "1" | "2"), "select login method 1 or 2");
@@ -102,11 +106,7 @@ pub(crate) fn run(addr: Option<&str>, user: Option<&str>, pass: Option<&str>, su
     let super_password = if vault["version"] == 1 {
         ensure!(super_password.is_none(), "v1 requires the original login password and Account Secret, not --super");
         let user = authorization["user"].as_str().context("authorization did not return a user")?;
-        let current = respire::service::data_dir();
-        let main = respire::service::main_data_dir();
-        let directory = if respire::service::session_user_of_dir(&current) == user { current }
-            else if respire::service::session_user_of_dir(&main) == user { main }
-            else { respire::service::account_dir(user)? };
+        let directory = respire_app::login_transaction::login_directory(&addr, user)?;
         let local: Value = match std::fs::read(directory.join("session.json")) {
             Ok(bytes) => serde_json::from_slice(&bytes).context("target account session is invalid")?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
@@ -136,13 +136,49 @@ pub(crate) fn run(addr: Option<&str>, user: Option<&str>, pass: Option<&str>, su
             _ => anyhow::bail!("authorization succeeded; enter the super password in an interactive terminal or supply --super; original account was preserved"),
         }
     };
+    let source = respire::service::data_dir();
+    let destination = respire_app::login_transaction::login_directory(&addr,
+        authorization["user"].as_str().context("authorization did not return a user")?)?;
+    let different = source != destination;
+    let source_has_data = respire::service::database_path(&source)?.is_file();
+    ensure!(!migrate_local || different, "source and destination are the same account; no migration is needed");
+    let copy = if migrate_local { true }
+        else if interactive && different && source_has_data && respire::prompt::interactive() {
+            respire::prompt::ask("Merge selected local memories into this server account (skip identical bodies; keep existing records)? [y/N]: ")?
+                .trim().eq_ignore_ascii_case("y")
+        } else { false };
+    let snapshot = if copy {
+        ensure!(!respire::service::off_mode(), "memory service is disabled; restore normal service before migration");
+        respire::service::ensure_writable()?;
+        let source_secret = if respire::prompt::interactive() {
+            respire::prompt::ask_secret("original local super password (v1: login password; Enter = saved credentials): ")?
+        } else { String::new() };
+        Some(respire_app::login_transaction::local_snapshot(
+            (!source_secret.is_empty()).then_some(source_secret.as_str()))?)
+    } else { None };
     let prepared = respire_app::login_transaction::PreparedLogin::prepare_with_vault(&addr, &authorization, super_password, vault, None)?;
-    commit_verified(&addr, &authorization, prepared, "login")
+    commit_verified(&addr, &authorization, prepared, "login", snapshot.as_deref())
 }
 
-fn commit_verified(addr: &str, authorization: &Value, prepared: respire_app::login_transaction::PreparedLogin, command: &str) -> Result<()> {
+fn commit_verified(addr: &str, authorization: &Value, prepared: respire_app::login_transaction::PreparedLogin, command: &str, snapshot: Option<&str>) -> Result<()> {
     let prepared = RefCell::new(prepared);
-    crate::rpc::change_profile_with_verification(|| prepared.borrow_mut().commit(), || prepared.borrow_mut().rollback(), || {
+    let imported = RefCell::new(None);
+    crate::rpc::change_profile_with_verification(|| {
+        prepared.borrow_mut().commit()?;
+        if let Some(snapshot) = snapshot {
+            let mut entries: Vec<respire::memory::model::MemoryEntry> = serde_json::from_str(snapshot)?;
+            for entry in &mut entries { entry.user = prepared.borrow().user.clone(); }
+            ensure!(!respire::service::off_mode(), "target memory service is disabled; source library was preserved");
+            respire::service::ensure_writable()?;
+            let _deferred = respire::core_sdk::defer_indexing();
+            let target = respire::service::App::open()?;
+            let before = target.sync().context("target synchronization failed before copying; source library was preserved")?;
+            ensure!(before.converged, "target library has not converged; resolve sync before migrating; source library was preserved");
+            drop(target);
+            *imported.borrow_mut() = Some(respire::service::import_json_text(&serde_json::to_string(&entries)?)?);
+        }
+        Ok(())
+    }, || prepared.borrow_mut().rollback(), || {
         let actual = crate::rpc::query_existing_json(vec!["account".to_owned(), "list".to_owned()])?;
         ensure!(actual["status"] == "ok", "runtime account verification failed");
         let accounts = actual["details"]["accounts"].as_array().context("runtime account list missing accounts")?;
@@ -156,10 +192,19 @@ fn commit_verified(addr: &str, authorization: &Value, prepared: respire_app::log
         expected.complete()?;
         Ok(())
     })?;
+    let sync = if snapshot.is_some() {
+        Some(match crate::rpc::query_existing_json(vec!["sync".to_owned()]) {
+            Ok(result) => result,
+            Err(error) => json!({"status":"pending","errors":[format!("{error:#}")]}),
+        })
+    } else { None };
+    let status = if sync.as_ref().is_some_and(|result| result["status"] != "ok") {
+        crate::output::Status::Warn
+    } else { crate::output::Status::Ok };
     let committed = prepared.borrow();
     crate::emit_result(crate::output::ResultEnvelope::new(
-        command, crate::output::Status::Ok,
-        json!({"ok":true,"user":committed.user,"addr":addr,"dir":committed.directory.to_string_lossy(),"super_issued":committed.migration_super_password()}), Vec::new(),
+        command, status,
+        json!({"ok":true,"user":committed.user,"addr":addr,"dir":committed.directory.to_string_lossy(),"super_issued":committed.migration_super_password(),"import":*imported.borrow(),"sync":sync}), Vec::new(),
     ))
 }
 
@@ -180,7 +225,7 @@ pub(crate) fn migrate_vault(addr: Option<&str>, user: Option<&str>, pass: Option
     if let Some(code) = prepared.migration_super_password() {
         eprintln!("Keep this recovery code before migration: {code}");
     }
-    commit_verified(&addr, &authorization, prepared, "migrate")
+    commit_verified(&addr, &authorization, prepared, "migrate", None)
 }
 
 #[cfg(test)]

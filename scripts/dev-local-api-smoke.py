@@ -327,22 +327,24 @@ class Suite:
         exported = self.root / 'files' / 'export.json'
         self.invoke('export_memories', {'path': str(exported)}, lambda v: v.get('exported', 0) >= 2 and exported.is_file())
         self.invoke('purge', {'id': child_id}, lambda v: v.get('purged') is True)
-        self.invoke('import_memories', {'path': str(exported)}, lambda v: v.get('imported') == 2
+        self.invoke('import_memories', {'path': str(exported)}, lambda v: v.get('imported') == 1 and v.get('duplicates') == 1
                     and v.get('reattached') == 1 and v.get('orphaned') == 0)
+        self.invoke('import_memories', {'path': str(exported)}, lambda v: v.get('imported') == 0
+                    and v.get('duplicates') == 2, label='repeat-import-is-idempotent')
         imported = self.invoke('list', {'limit': 50}, lambda v: isinstance(v, list), label='import-copy-inventory')
         copied = [entry for entry in objects(imported) if entry.get('title') == 'Local HTTP updated' and 'id' in entry]
         require(len(copied) == 1 and copied[0]['id'] != child_id, 'import-did-not-mint-copy-id')
         copied_child = self.invoke('show', {'id': copied[0]['id']}, lambda v: v.get('entry', {}).get('title') == 'Local HTTP updated'
                     and v['entry'].get('content') == 'Fixture child: a separate record to validate editing, causal attachment and archive restore.',
                     label='import-copy-content-readback')['entry']
-        require(bool(copied_child.get('parent_id')) and copied_child['parent_id'] != root_id, 'import-copy-parent-not-remapped')
+        require(copied_child.get('parent_id') == root_id, 'import-copy-parent-not-deduplicated')
         self.invoke('show', {'id': copied_child['parent_id']}, lambda v: v.get('entry', {}).get('title') == 'Local HTTP root',
                     label='import-copy-parent-readback')
         backup = self.root / 'files' / 'backup.db'
         self.invoke('backup_db', {'path': str(backup)}, lambda v: v.get('backed_up') == str(backup) and backup.is_file())
         self.invoke('scope_material', {'root': root_id}, lambda v: isinstance(v.get('material'), str) and 'Local HTTP root' in v['material'])
         self.invoke('book_material', {'root': root_id}, lambda v: isinstance(v.get('chapters'), list) and v.get('root', {}).get('id') == root_id)
-        portrait_count = self.invoke('status', {}, lambda v: v.get('local_alive', 0) >= 3,
+        portrait_count = self.invoke('status', {}, lambda v: v.get('local_alive', 0) >= 2,
                     label='portrait-source-count')['local_alive']
         # service::App::portrait_material returns grouped arrays, not entries.
         self.invoke('portrait_material', {'limit': 20}, lambda v: v.get('total_entries') == portrait_count

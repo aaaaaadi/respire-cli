@@ -225,6 +225,7 @@ fn runtime_serves_status_and_stops() -> Result<(), Box<dyn std::error::Error>> {
 /// failures before commit and the host/runtime account verification after commit.
 fn authorization_preserves_and_commits_profiles() -> Result<(), Box<dyn std::error::Error>> {
     use respire_app::memory::{crypto, SessionKeys};
+    use respire_app::transport::{local::LocalStore, MemoryTransport};
     use serde_json::{json, Value};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -250,6 +251,7 @@ fn authorization_preserves_and_commits_profiles() -> Result<(), Box<dyn std::err
     ));
     let mode = Arc::new(Mutex::new("authorized".to_owned()));
     let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+    let remote_blobs = Arc::new(Mutex::new(Vec::<Value>::new()));
     let server =
         Arc::new(tiny_http::Server::http("127.0.0.1:0").map_err(|error| error.to_string())?);
     let addr = format!("http://{}", server.server_addr());
@@ -267,7 +269,9 @@ fn authorization_preserves_and_commits_profiles() -> Result<(), Box<dyn std::err
     let current_auth_salt = crypto::derive_auth_salt("authorized")?;
     let authentication_salt = Arc::new(Mutex::new(initial_auth_salt));
     let worker_authentication_salt = authentication_salt.clone();
+    let worker_blobs = remote_blobs.clone();
     let worker = std::thread::spawn(move || -> Result<(), String> {
+        let mut sync_pulls = 0;
         while worker_running.load(Ordering::SeqCst) {
             let Some(mut request) = worker_server
                 .recv_timeout(Duration::from_millis(50))
@@ -305,7 +309,7 @@ fn authorization_preserves_and_commits_profiles() -> Result<(), Box<dyn std::err
                 "/oauth/device/code" => {
                     json!({"device_code":"synthetic-device-code","user_code":"ABCDEF123456","expires_in":60,"interval":1,"verification_uri_complete":format!("{worker_addr}/#/authorize?code=ABCDEF123456")})
                 }
-                "/oauth/token" if mode != "authorized" => {
+                "/oauth/token" if mode != "authorized" && mode != "sync_unavailable" => {
                     status = 400;
                     json!({"error":mode})
                 }
@@ -336,6 +340,34 @@ fn authorization_preserves_and_commits_profiles() -> Result<(), Box<dyn std::err
                             .map_err(|error| error.to_string())?
                             .clone()
                     }
+                }
+                "/sync/capabilities" => {
+                    status = if mode == "sync_unavailable" { 503 } else { 404 };
+                    json!({"error":"legacy sync fixture"})
+                }
+                path if path == "/pull" || path.starts_with("/pull?") => {
+                    sync_pulls += 1;
+                    if sync_pulls == 2 {
+                        status = 503;
+                        json!({"error":"synthetic outage after preflight"})
+                    } else {
+                        let blobs = worker_blobs.lock().map_err(|error| error.to_string())?.clone();
+                        let alive = blobs.iter().filter(|blob| blob["deleted"] != true).count();
+                        json!({"cursor":blobs.len(),"total":blobs.len(),"alive":alive,"blobs":blobs})
+                    }
+                }
+                "/push/batch" => {
+                    let value: Value = serde_json::from_reader(request.as_reader()).map_err(|error| error.to_string())?;
+                    let items = value["items"].as_array().ok_or("missing push items")?;
+                    let mut blobs = worker_blobs.lock().map_err(|error| error.to_string())?;
+                    for item in items {
+                        let mut blob = item.clone();
+                        blob["user"] = json!("authorized");
+                        if let Some(index) = blobs.iter().position(|old| old["id"] == blob["id"]) {
+                            blobs[index] = blob;
+                        } else { blobs.push(blob); }
+                    }
+                    json!({"replaced":vec![true;items.len()]})
                 }
                 _ => return Err(format!("unexpected authorization request: {path}")),
             };
@@ -543,6 +575,77 @@ fn authorization_preserves_and_commits_profiles() -> Result<(), Box<dyn std::err
         if !stopped.status.success() {
             return Err("could not stop the isolated OAuth runtime".into());
         }
+
+        // Seed an encrypted cloud-only record, absent from this target's local store.
+        assert!(execute(&["--json", "remember", "Synthetic cloud peer body", "--title", "Cloud peer",
+            "--importance", "important", "--force"])?.status.success());
+        let peer_store = LocalStore::open(&target.join("rsrs.db"))?;
+        let peers = peer_store.all(false)?;
+        let peer = peers.first().ok_or("cloud fixture row missing")?;
+        remote_blobs.lock().map_err(|error| error.to_string())?.push(serde_json::to_value(peer)?);
+        drop(peer_store);
+        assert!(execute(&["--runtime-internal", "--stop"])?.status.success());
+        for name in ["rsrs.db", "rsrs.db-wal", "rsrs.db-shm"] {
+            let path = target.join(name);
+            if path.is_file() { std::fs::remove_file(path)?; }
+        }
+
+        // A different server's source uses another URK, even with the same recovery code.
+        let source_urk = [43_u8; 32];
+        let source_salt = crypto::random_hex(16);
+        let (source_nonce, source_wrap) = crypto::wrap_key(
+            &source_urk, &crypto::derive_kek_v4(&super_password, &source_salt)?)?;
+        let source_session = serde_json::to_vec(&json!({"user":"original","addr":"https://previous.invalid",
+            "vault_version":4,"kdf_salt":source_salt,"wrapped_urk":source_wrap,"urk_nonce":source_nonce}))?;
+        std::fs::write(original.join("session.json"), &source_session)?;
+        let selected = execute(&["--json", "account", "use", "original"])?;
+        assert!(selected.status.success(), "{}", String::from_utf8_lossy(&selected.stdout));
+        let created = execute(&["--json", "remember", "Synthetic cross-server transfer body",
+            "--title", "Transfer fixture", "--importance", "important", "--force"])?;
+        assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stdout));
+        assert!(execute(&["--json", "remember", "Synthetic cloud peer body", "--title", "Source peer",
+            "--importance", "important", "--force"])?.status.success());
+        let transfer = ["--json", "login", "--oauth", "--addr", &addr, "--dashboard", &addr,
+            "--no-open", "--super", &super_password, "--migrate-local"];
+        let source_config = std::fs::read(root.join("client.json"))?;
+        *mode.lock().map_err(|error| error.to_string())? = "sync_unavailable".to_owned();
+        let rejected = execute(&transfer)?;
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&rejected.stdout).contains("before copying"));
+        assert_eq!(std::fs::read(root.join("client.json"))?, source_config);
+        assert_eq!(std::fs::read(original.join("session.json"))?, source_session);
+        *mode.lock().map_err(|error| error.to_string())? = "authorized".to_owned();
+        let copied = execute(&transfer)?;
+        assert_eq!(copied.status.code(), Some(2), "{} {}", String::from_utf8_lossy(&copied.stdout), String::from_utf8_lossy(&copied.stderr));
+        let copied: Value = serde_json::from_slice(&copied.stdout)?;
+        assert_eq!(copied["status"], "warn");
+        assert_eq!(copied["summary"]["import"]["imported"], 1, "{copied}");
+        assert_eq!(copied["summary"]["import"]["duplicates"], 1, "cloud-only duplicate was not pulled before import");
+        assert_eq!(copied["summary"]["sync"]["status"], "fail");
+        let db = LocalStore::open(&target.join("rsrs.db"))?;
+        let rows = db.all(false)?;
+        assert_eq!(rows.len(), 2);
+        let cloud_snapshot = cloud.lock().map_err(|error| error.to_string())?.clone();
+        let keys = SessionKeys::unlock_v4(&super_password,
+            cloud_snapshot["kdf_salt"].as_str().ok_or("missing cloud salt")?,
+            cloud_snapshot["wrapped_urk"].as_str().ok_or("missing cloud wrap")?,
+            cloud_snapshot["urk_nonce"].as_str().ok_or("missing cloud nonce")?)?;
+        let entries = rows.iter().map(|row| respire_app::memory::MemoryEngine::open(&keys, row)).collect::<Result<Vec<_>, _>>()?;
+        assert!(entries.iter().any(|entry| entry.content == "Synthetic cross-server transfer body"));
+        assert!(entries.iter().any(|entry| entry.id == peer.id && entry.content == "Synthetic cloud peer body"));
+        drop(db);
+        assert!(execute(&["--json", "account", "use", "original"])?.status.success());
+        let retry = execute(&transfer)?;
+        assert!(retry.status.success(), "{}", String::from_utf8_lossy(&retry.stdout));
+        let retry: Value = serde_json::from_slice(&retry.stdout)?;
+        assert_eq!(retry["summary"]["import"]["imported"], 0, "{retry}");
+        assert_eq!(retry["summary"]["import"]["duplicates"], 2);
+        assert_eq!(remote_blobs.lock().map_err(|error| error.to_string())?.len(), 2);
+        assert_eq!(std::fs::read(original.join("session.json"))?, source_session);
+        for row in &rows { assert!(execute(&["--json", "purge", &row.id])?.status.success()); }
+        remote_blobs.lock().map_err(|error| error.to_string())?.clear();
+        assert!(execute(&["--runtime-internal", "--stop"])?.status.success());
+        std::fs::write(original.join("session.json"), session_bytes)?;
 
         let legacy_super = "synthetic-legacy-passphrase";
         let salt = crypto::random_hex(16);

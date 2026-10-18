@@ -125,6 +125,17 @@ fn legacy_profiles(home: &Path) -> Result<Vec<Profile>> {
             if !source.join("onememory.db").is_file() && !source.join("session.json").is_file() {
                 continue;
             }
+            // Reject symlinks before reading identity or any credential material.
+            meaningful(&source)?;
+            // Current vaults remain current even when an older filename or home is retained.
+            let session_path = source.join("session.json");
+            if session_path.is_file() {
+                let value: Value = serde_json::from_slice(&std::fs::read(&session_path)?)?;
+                if value["crypto_namespace"].as_str() == Some(crate::memory::crypto::RSRS_PREFIX)
+                    || value["wrapped_urk"].as_str().is_some_and(|wrapped| wrapped.starts_with(crate::memory::crypto::RSRS_PREFIX)) {
+                    continue;
+                }
+            }
             if label == "rsrs" {
                 let session = source.join("session.json");
                 let legacy_vault = if session.is_file() {
@@ -134,8 +145,6 @@ fn legacy_profiles(home: &Path) -> Result<Vec<Profile>> {
                 } else { false };
                 if !source.join("onememory.db").is_file() && !legacy_vault { continue; }
             }
-            // Reject symlinks before reading identity or any credential material.
-            meaningful(&source)?;
             let source_id = identity(&source)?;
             result.push(Profile {
                 identity: source_id.clone(), source,
@@ -1195,6 +1204,14 @@ mod tests {
         migrate_home(home.path())?;
         assert_eq!(std::fs::read(target.join("session.json"))?, session_before);
         assert!(old.join("accounts/work/session.json").is_file());
+        let fresh_home = tempfile::tempdir()?;
+        for label in [".rsrs", ".respire"] {
+            let current = fresh_home.path().join(label);
+            std::fs::create_dir_all(&current)?;
+            std::fs::write(current.join("onememory.db"), b"")?;
+            write_json(&current.join("session.json"), &json!({"wrapped_urk":format!("{}fixture",crate::memory::crypto::RSRS_PREFIX),"vault_version":4}))?;
+        }
+        assert!(legacy_profiles(fresh_home.path())?.is_empty(), "current vaults were reported as legacy");
         Ok(())
     }
 
