@@ -34,6 +34,17 @@ struct Progress {
     cancelled: bool,
 }
 
+/// Batch indexing defaults to cores-1 threads (min 1). Interactive inference
+/// keeps the pinned single thread; an explicit RSRS_INTRA_THREADS always wins.
+pub fn apply_index_threads() {
+    if std::env::var_os("RSRS_INTRA_THREADS").is_some() {
+        return;
+    }
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+    let threads = cores.saturating_sub(1).max(1);
+    std::env::set_var("RSRS_INTRA_THREADS", threads.to_string());
+}
+
 pub struct Operation;
 
 #[derive(Debug)]
