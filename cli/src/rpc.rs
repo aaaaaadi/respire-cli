@@ -860,7 +860,8 @@ fn query_json_with_start(args: Vec<String>, auto_start: bool) -> Result<serde_js
         return execute_json(full).map_err(|err| anyhow::anyhow!("{err}"));
     }
     let response = call_method("cli.exec", full, auto_start)?;
-    if let Some(envelope) = response.envelope {
+    if let Some(mut envelope) = response.envelope {
+        envelope.ensure_failure_diagnostics();
         return Ok(serde_json::to_value(envelope).context("runtime envelope could not be encoded")?);
     }
     let err = response
@@ -1100,7 +1101,8 @@ pub fn runtime_entry(flags: RuntimeFlags) -> Result<()> {
 }
 
 fn render_response(response: RpcResponse, json: bool) -> Result<()> {
-    if let Some(envelope) = response.envelope {
+    if let Some(mut envelope) = response.envelope {
+        envelope.ensure_failure_diagnostics();
         crate::progress::finish();
         if json || envelope.summary["skipped"] != true || envelope.summary["mode"] != "off" {
             println!("{}", envelope.render(json)?);
