@@ -1021,6 +1021,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Verify the local ciphertext-digest witness chain (not an external trust anchor)
+    Witness {
+        #[arg(long)]
+        verify: bool,
+    },
     /// Open the hosted user dashboard without starting the local runtime
     Web {
         /// Report https://dash.rsrs.rs without opening a browser
@@ -1149,6 +1154,11 @@ enum Command {
     Export { file: String },
     /// Back up the local store file (whole SQLite copy, ciphertext and index)
     Backup { file: String },
+    /// Create or inspect verified local snapshots; never rolls back cloud state
+    Snapshot {
+        #[command(subcommand)]
+        cmd: SnapshotCmd,
+    },
     /// Show account keys: Account Secret / five-keys (manual cross-device join; leak = loss of the store)
     Secret {
         /// Show the full Secret and five-keys (default is masked)
@@ -1398,6 +1408,30 @@ enum GrantCommand {
 }
 
 /// query-log subcommand: model self-grade report.
+#[derive(Subcommand, Debug)]
+enum SnapshotCmd {
+    /// Create a consistent private database snapshot, excluding access grants
+    Create {
+        #[arg(long, default_value = "")]
+        note: String,
+    },
+    /// List snapshots after validating file digests and SQLite integrity
+    List,
+    /// Restore one local snapshot after a mandatory pre-backup; cloud state is unchanged
+    Restore {
+        id: String,
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Recover an interrupted local snapshot transaction (host only)
+    Recover { #[arg(long)] confirm: bool },
+    /// Resume sync only after reviewing local/remote differences at this exact local revision
+    ResumeSync {
+        #[arg(long)]
+        reviewed_revision: String,
+    },
+}
+
 #[derive(Subcommand)]
 enum QueryLogCmd {
     /// Report a self-grade: true hit --good (chosen) / misleading --bad (rejected).
@@ -1411,6 +1445,12 @@ enum QueryLogCmd {
         /// Mark as misleading (post-training rejected)
         #[arg(long)]
         bad: bool,
+        /// Explicit request identity from recall.summary.query_log_id (required with feedback enabled).
+        #[arg(long)]
+        query_log_id: Option<String>,
+        /// Origin of this explicit verdict; never inferred from a successful command.
+        #[arg(long,default_value="model",value_parser=["human","model","task_outcome"])]
+        source: String,
     },
 }
 
@@ -2529,7 +2569,7 @@ fn run_query_log(
     }
     let store = build_local()?;
     // mark: model self-grade - the main post-training signal
-    if let Some(QueryLogCmd::Mark { ids, good, bad }) = cmd {
+    if let Some(QueryLogCmd::Mark { ids, good, bad, query_log_id, source }) = cmd {
         if *good == *bad {
             anyhow::bail!("pick exactly one of --good or --bad");
         }
@@ -2540,7 +2580,13 @@ fn run_query_log(
             .map(ToOwned::to_owned)
             .collect();
         anyhow::ensure!(!id_list.is_empty(), "ids is empty");
-        let unmatched = store.mark_verdict(&id_list, *good)?;
+        let (unmatched,revision)=if let Some(request_id)=query_log_id {
+            (Vec::new(),Some(store.mark_query_feedback(request_id,&id_list,*good,source)?))
+        }else{
+            anyhow::ensure!(source=="model","legacy grading without --query-log-id supports only --source model; use an explicit query request for human/task_outcome attribution");
+            anyhow::ensure!(!respire::feedback::enabled()?,"enabled feedback requires --query-log-id from the recall summary and complete memory IDs");
+            (store.mark_verdict(&id_list,*good)?,None)
+        };
         let status = if unmatched.is_empty() {
             OutputStatus::Ok
         } else {
@@ -2549,7 +2595,7 @@ fn run_query_log(
         let mut result = ResultEnvelope::new(
             "query-log",
             status,
-            serde_json::json!({"marked":id_list.len()-unmatched.len(),"good":*good}),
+            serde_json::json!({"marked":id_list.len()-unmatched.len(),"good":*good,"query_log_id":query_log_id,"source":source,"revision":revision}),
             vec![
                 OutputItem::new(
                     "marked",
@@ -2788,7 +2834,7 @@ fn run_bench_run(
             }
         }
         let started = std::time::Instant::now();
-        let (ranked, _, fallback, _) = recall_select::recall(&session, &embedder, &candidates, &q)?;
+        let (ranked, _, fallback, _) = recall_select::recall(&session, &embedder, &candidates, &q, &store)?;
         latency.push(started.elapsed().as_micros());
         selector_fallbacks += usize::from(fallback.is_some());
         let ids: Vec<String> = ranked.iter().map(|r| r.entry.id.clone()).collect();
@@ -5653,7 +5699,8 @@ fn is_write_command(c: &Command) -> bool {
             // Fivekeys/SuperReset/KeysExport change session and credentials; Session/Logout change session;
             // Space creates/deletes profiles and issues sessions.
             | Command::Grant { .. }
-            | Command::Taxonomy { .. }
+            | Command::Taxonomy { list: false, .. }
+            | Command::Taxonomy { ensure: Some(_), .. }
             | Command::Keygen { .. }
             | Command::Model { .. }
             | Command::Login { .. }
@@ -5666,6 +5713,7 @@ fn is_write_command(c: &Command) -> bool {
             | Command::Reembed { .. }
             | Command::Retitle { .. }
             | Command::RetitleMany { .. }
+            | Command::Snapshot { cmd: SnapshotCmd::Restore { .. } | SnapshotCmd::ResumeSync { .. } | SnapshotCmd::Recover { .. } }
             | Command::SyncReset
             | Command::Doctor { fix: true, .. }
             | Command::SyncResolve { .. }
@@ -6025,6 +6073,87 @@ fn run(args: Cli) -> Result<()> {
     if matches!(args.command, Some(Command::Capabilities)) {
         return run_capabilities();
     }
+    if let Some(Command::Snapshot {
+        cmd: SnapshotCmd::Restore { id, confirm },
+    }) = args.command.as_ref()
+    {
+        runtime_policy::require_host("snapshot restore")?;
+        anyhow::ensure!(
+            !rpc::worker_active(),
+            "snapshot restore must run in the host CLI, not a runtime request"
+        );
+        anyhow::ensure!(
+            *confirm,
+            "snapshot restore requires --confirm; it replaces local state and quarantines sync"
+        );
+        respire::service::ensure_writable()?;
+        anyhow::ensure!(
+            !respire::service::off_mode(),
+            "snapshot restore is unavailable while memory is paused"
+        );
+        let root = respire::service::data_dir();
+        let account = respire::service::session_user_of_dir(&root);
+        let keys = build_session()?;
+        let receipt = std::cell::RefCell::new(None::<respire_app::snapshot::RestoreReceipt>);
+        let cleanup_issue=std::cell::RefCell::new(None::<String>);
+        rpc::change_profile_with_verification(
+            || {
+                let ownership =
+                    respire::lock::LibraryLock::acquire(&root, std::time::Duration::from_secs(15))?;
+                *receipt.borrow_mut() = Some(respire_app::snapshot::restore_locked(
+                    &root, &account, &keys, id, &ownership,
+                )?);
+                Ok(())
+            },
+            || {
+                if let Some(restored) = receipt.borrow().as_ref() {
+                    let ownership = respire::lock::LibraryLock::acquire(
+                        &root,
+                        std::time::Duration::from_secs(15),
+                    )?;
+                    respire_app::snapshot::rollback_locked(&root,restored,&ownership)?;
+                }
+                Ok(())
+            },
+            || {
+                let held=receipt.borrow();
+                let receipt=held.as_ref().ok_or_else(||anyhow!("snapshot restore receipt missing"))?;
+                rpc::verify_snapshot_store(&root,&receipt.restored)?;
+                respire_app::snapshot::commit_restore(&root,receipt)?;
+                // A durable commit is never rolled back for cleanup failure.
+                // Both the release and any recovery remain under takeover.
+                *cleanup_issue.borrow_mut()=respire_app::snapshot::release_restore(&root,receipt).err().map(|error|error.to_string());
+                Ok(())
+            },
+        )?;
+        let receipt=receipt.into_inner().ok_or_else(||anyhow!("snapshot restore receipt missing"))?;
+        let cleanup=cleanup_issue.into_inner();
+        let mut result = ResultEnvelope::new(
+            "snapshot",
+            if cleanup.is_some(){OutputStatus::Warn}else{OutputStatus::Ok},
+            serde_json::json!({"action":"restored","sync_quarantined":true,"cloud_rollback":false,"runtime_verified":true,"service_released":respire_app::snapshot::ensure_no_incomplete_restore(&root).is_ok()}),
+            Vec::new(),
+        );
+        result.details = serde_json::to_value(&receipt)?;
+        if let Some(error)=cleanup {result.errors.push(format!("restored runtime verified; local rollback cleanup pending: {error}"));}
+        return emit_result(result);
+    }
+    if let Some(Command::Snapshot { cmd: SnapshotCmd::Recover { confirm } }) = args.command.as_ref() {
+        runtime_policy::require_host("snapshot recovery")?;
+        anyhow::ensure!(!rpc::worker_active(),"snapshot recovery must run in the host CLI");
+        anyhow::ensure!(*confirm,"snapshot recover requires --confirm");
+        respire::service::ensure_writable()?;
+        let root=respire::service::data_dir();let account=respire::service::session_user_of_dir(&root);
+        rpc::change_profile_with_verification(|| {
+            let ownership=respire::lock::LibraryLock::acquire(&root,std::time::Duration::from_secs(15))?;
+            respire_app::snapshot::recover_locked(&root,&account,&ownership)
+        },||Ok(()),||{
+            if !respire::service::off_mode(){rpc::verify_open_store(&root)?;}
+            Ok(())
+        })?;
+        return emit_result(ResultEnvelope::new("snapshot",OutputStatus::Ok,serde_json::json!({"action":"recovered","runtime_verified":true}),Vec::new()));
+    }
+    respire_app::snapshot::ensure_no_incomplete_restore(&respire::service::data_dir())?;
     let _model_task = respire::model_progress::TaskScope::new(args.model_task_id.clone());
     set_json_mode(
         args.json || respire::env::var("RSRS_JSON").is_ok_and(|v| v == "1" || v == "true"),
@@ -6278,6 +6407,9 @@ fn run_local_inner(args: Cli) -> Result<()> {
             std::time::Duration::from_secs(120),
         )?)
     };
+    // A direct caller can wait here while a restore installs maintenance. The
+    // pre-dispatch check cannot authorize a mutation after that ownership wait.
+    respire_app::snapshot::ensure_no_incomplete_restore(&respire::service::data_dir())?;
     progress::phase("执行本地操作", "Executing local operation");
     // -- Read-only gate (added 2026-09-20; same-day audit moved it) --
     // When this space's agent.json has readonly=true, every write command is refused.
@@ -6292,6 +6424,12 @@ fn run_local_inner(args: Cli) -> Result<()> {
         // memory_off=true refuses both read and write, leaving only admin/identity/inject infrastructure -
         // the owner restores with agent-config --set memory_off=false (unlike team read-only, which is
         // server-enforced: off is a local switch, no need to block self-unlock).
+        if matches!(
+            cmd,
+            Command::Sync | Command::SyncResolve { .. } | Command::SyncReset
+        ) {
+            respire_app::snapshot::ensure_sync_allowed(&respire::service::data_dir())?;
+        }
         if respire::service::off_mode() {
             if !is_off_allowed(cmd) {
                 anyhow::bail!(
@@ -6620,6 +6758,13 @@ fn run_local_inner(args: Cli) -> Result<()> {
         }) => return run_doctor(*remote, *check_update, *fix),
         Some(Command::UpdateCheck { force, clear }) => return run_update_check(*force, *clear),
         Some(Command::Audit { json }) => return run_audit(*json),
+        Some(Command::Witness { verify: _ }) => {
+            let report=build_local()?.witness_verify()?;
+            let mut result=ResultEnvelope::new("witness",if report.intact{OutputStatus::Ok}else{OutputStatus::Fail},serde_json::to_value(&report)?,Vec::new());
+            if !report.intact {result.errors.push(format!("witness verification failed at sequence {}: {}",report.broken_at.map_or_else(||"unknown".to_owned(),|seq|seq.to_string()),report.reason.as_deref().unwrap_or("invalid chain")));}
+            result.details=serde_json::to_value(report)?;
+            return emit_result(result);
+        },
         Some(Command::KeysExport { out }) => return run_keys_export(out.as_deref()),
         Some(Command::SuperReset { super_pass }) => {
             let new_super = respire::auth::super_reset(None, super_pass.as_deref())?;
@@ -6815,6 +6960,44 @@ fn run_local_inner(args: Cli) -> Result<()> {
         }
         Some(Command::Export { file }) => return run_export(file),
         Some(Command::Backup { file }) => return run_backup(file),
+        Some(Command::Snapshot { cmd }) => {
+            let root = respire::service::data_dir();
+            let details = match cmd {
+                SnapshotCmd::Create { note } => {
+                    serde_json::to_value(respire_app::snapshot::create(
+                        &root,
+                        &respire::service::session_user_of_dir(&root),
+                        note,
+                        &build_session()?,
+                    )?)?
+                }
+                SnapshotCmd::List => serde_json::to_value(respire_app::snapshot::list_report(&root)?)?,
+                SnapshotCmd::ResumeSync { reviewed_revision } => {
+                    respire::service::ensure_writable()?;
+                    respire_app::snapshot::resume_sync(&root, reviewed_revision)?;
+                    serde_json::json!({"sync_quarantined":false,"reviewed_revision":reviewed_revision})
+                }
+                SnapshotCmd::Restore { .. } | SnapshotCmd::Recover { .. } => {
+                    anyhow::bail!("snapshot restore/recovery must run in the host CLI")
+                }
+            };
+            let mut result = ResultEnvelope::new(
+                "snapshot",
+                OutputStatus::Ok,
+                serde_json::json!({"action":match cmd {SnapshotCmd::Create{..}=>"created",SnapshotCmd::List=>"list",SnapshotCmd::ResumeSync{..}=>"sync_resumed",SnapshotCmd::Restore{..}=>"restored",SnapshotCmd::Recover{..}=>"recovered"}}),
+                Vec::new(),
+            );
+            if matches!(cmd,SnapshotCmd::Create{..}) && details["witness_intact"]==false {
+                result.status=OutputStatus::Warn;
+                result.errors.push("snapshot file created, but its witness chain is invalid; preserved for explicit recovery/repair".into());
+            }
+            if matches!(cmd,SnapshotCmd::List) && details["problems"].as_array().is_some_and(|items|!items.is_empty()) {
+                result.status=OutputStatus::Warn;
+                result.errors.push("some snapshots failed verification; inspect details.problems; healthy snapshots remain usable".into());
+            }
+            result.details = details;
+            return emit_result(result);
+        }
         Some(Command::Secret { reveal }) => return run_secret(*reveal),
         Some(Command::Fivekeys {
             addr,
@@ -7054,8 +7237,10 @@ fn run_local_inner(args: Cli) -> Result<()> {
                 let _resident = lease.enter();
                 if pending > 0 { rpc::kick_index(); }
                 let q = MemoryQuery::new(&content).limit(5);
-                let candidates =
-                    MemoryEngine::remember_candidates(&session, embedder!(), &candidates_all, &q)?;
+                let candidates:respire::core_sdk::RememberCandidates=respire::core_sdk::execute("remember_candidates",serde_json::json!({
+                    "model":embedder!().model_name(),"snapshots":respire::memory::engine::snapshots(&session,&candidates_all),
+                    "query":q,"query_settings":respire::feedback::query_settings(&store,&q,&candidates_all)?
+                }))?;
                 let merge_cand = candidates.merge;
                 let parent_cand = candidates.parent;
 
@@ -7408,9 +7593,9 @@ fn run_local_inner(args: Cli) -> Result<()> {
             // 3. small-to-big: hit body + ancestor bodies (budget is built-in; RSRS_ANCESTOR_BUDGET=0 turns it off)
             let (ranked, recall_mode, selection_fallback, routing) = match mode {
                 Some(mode) => {
-                    recall_select::recall_with_mode(&session, embedder!(), &candidates, &q, &mode)?
+                    recall_select::recall_with_mode(&session, embedder!(), &candidates, &q, &store, &mode)?
                 }
-                None => recall_select::recall(&session, embedder!(), &candidates, &q)?,
+                None => recall_select::recall(&session, embedder!(), &candidates, &q, &store)?,
             };
             let hit_ids: Vec<String> = ranked.iter().map(|r| r.entry.id.clone()).collect();
             let associations: respire::memory::model::RelatedResult = if no_related {
@@ -7419,12 +7604,14 @@ fn run_local_inner(args: Cli) -> Result<()> {
                 "model":embedder!().model_name(), "snapshots":respire::memory::engine::snapshots(&session,&candidates),
                 "query":q,"ids":hit_ids,"pairs":store.recall_pairs(&hit_ids)?
             }))? };
+            let query_log_id=if respire::service::workspace_mode()=="normal" {Some(uuid::Uuid::new_v4().to_string())}else{None};
             // Query log: each recall writes a candidate record (including empty - negatives are post-training material too).
             // Note: this is the candidate set, not a hit - a hit is the model query-log mark self-grade
             {
                 let candidates: Vec<String> = ranked.iter().map(|r| r.entry.id.clone()).collect();
                 let scores: Vec<f32> = ranked.iter().map(|r| r.score).collect();
                 let stats = rpc::RecallStats {
+                    request_id:query_log_id.clone().unwrap_or_else(||uuid::Uuid::new_v4().to_string()),
                     query: query.clone(),
                     project: project.clone().unwrap_or_default(),
                     candidates,
@@ -7456,7 +7643,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
                 emit_result(ResultEnvelope::new(
                     "recall",
                     OutputStatus::Skip,
-                    serde_json::json!({"query":query,"count":0,"recall_mode":recall_mode,
+                    serde_json::json!({"query":query,"query_log_id":query_log_id,"count":0,"recall_mode":recall_mode,
                         "selection_fallback":selection_fallback,"embedding_model":store.retrieval_model()?,"routing":routing,
                         "index_pending":index_pending,"indexed_candidates":candidates.len().saturating_sub(index_pending),"lexical_candidates":index_pending}),
                     vec![OutputItem::new("results", OutputStatus::Skip, "0")],
@@ -7487,7 +7674,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
             let mut result = ResultEnvelope::new(
                 "recall",
                 OutputStatus::Ok,
-                serde_json::json!({"query":query,"count":ranked.len(),"limit":limit,"project":project,
+                serde_json::json!({"query":query,"query_log_id":query_log_id,"count":ranked.len(),"limit":limit,"project":project,
                     "recall_mode":recall_mode,"selection_fallback":selection_fallback,"embedding_model":store.retrieval_model()?,"related":associations.related.len(),"routing":routing,
                     "index_pending":index_pending,"indexed_candidates":candidates.len().saturating_sub(index_pending),"lexical_candidates":index_pending}),
                 items,
@@ -8882,6 +9069,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
         | Command::Config { .. }
         | Command::Export { .. }
         | Command::Backup { .. }
+        | Command::Snapshot { .. }
         | Command::Secret { .. }
         | Command::Fivekeys { .. }
         | Command::Register { .. }
@@ -8892,6 +9080,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
         | Command::PortraitMaterial { .. }
         | Command::Doctor { .. }
         | Command::Audit { .. }
+        | Command::Witness { .. }
         | Command::UpdateCheck { .. }
         | Command::Model { .. }
         | Command::Share { .. }
@@ -8964,6 +9153,9 @@ mod capture_tests {
         let revision = super::Cli::try_parse_from(["rsrs", "memory-revision", "--json"])?;
         assert!(matches!(revision.command, Some(super::Command::MemoryRevision)));
         assert!(!super::is_write_command(&super::Command::MemoryRevision));
+        assert!(!super::is_write_command(&super::Command::Taxonomy {list:true,ensure:None}));
+        assert!(super::is_write_command(&super::Command::Taxonomy {list:false,ensure:None}));
+        assert!(super::is_write_command(&super::Command::Taxonomy {list:true,ensure:Some("synthetic".into())}));
         assert!(!super::is_write_command_fine(&super::Command::MemoryRevision));
         assert!(super::is_off_allowed(&super::Command::MemoryRevision));
         assert!(super::Cli::try_parse_from(["rsrs", "v"]).is_ok());
