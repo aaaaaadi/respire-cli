@@ -736,11 +736,22 @@ fn now_seconds() -> Result<u64> {
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs())
 }
+/// Best-effort fixed stages help diagnose a stalled explicit restart without
+/// exporting arguments, account data or raw OS errors. Never weaken a fence if
+/// its diagnostic file cannot be updated.
+pub(crate) fn restart_stage(name: &str) {
+    if let Ok(Some(config)) = read_registration(&respire::service::main_data_dir()) {
+        let _ = event(&config, name);
+    }
+}
+
 fn event(config: &Registration, name: &str) -> Result<()> {
     // Fixed event names only. Never serialize command arguments, errors,
     // environment values, account identifiers or recovery material.
     anyhow::ensure!(
-        ["starting", "paused", "crash_limit", "exit_ok", "exit_error"].contains(&name),
+        ["starting", "paused", "crash_limit", "exit_ok", "exit_error",
+            "restart_probe", "restart_managed", "restart_identity", "restart_stop",
+            "restart_start", "restart_ready"].contains(&name),
         "unknown runtime event"
     );
     let path = control_path(&config.installation).with_file_name("events.jsonl");

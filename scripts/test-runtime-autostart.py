@@ -53,9 +53,26 @@ def main():
                    RSRS_BIN_DIR=str(base / "bin"), RSRS_RPC_PORT=str(port),
                    RSRS_CORE_TEST_MODE="1", RSRS_NO_AUTOSYNC="1", RSRS_UPDATE_CHECK="0")
 
+        restart_stages={"restart_probe","restart_managed","restart_identity","restart_stop","restart_start","restart_ready"}
+        def read_restart_stages():
+            events=root/"runtime/autostart/events.jsonl"
+            try:
+                if not events.is_file() or events.is_symlink() or events.stat().st_size>65536:
+                    return []
+                return [value["event"] for line in events.read_text().splitlines()
+                        if isinstance(value:=json.loads(line),dict) and value.get("event") in restart_stages]
+            except (OSError,ValueError):
+                return [] # Diagnostics must not replace the original timeout.
+
         def command(*argv):
-            return subprocess.run([binary, "--json", *argv], env=env,
-                                  capture_output=True, text=True, timeout=45)
+            try:
+                return subprocess.run([binary, "--json", *argv], env=env,
+                                      capture_output=True, text=True, timeout=45)
+            except subprocess.TimeoutExpired:
+                # Fixed stage names only: never dump captured stderr, arguments,
+                # registration, raw errors or private account content.
+                print("isolated restart stage diagnostic",json.dumps({"stages":read_restart_stages()[-12:]}),flush=True)
+                raise
 
         status = command("runtime", "autostart", "status")
         assert status.returncode == 0, status.stderr
@@ -497,6 +514,8 @@ $s=[Activator]::CreateInstance([Type]::GetTypeFromProgID('Schedule.Service'));$s
                             assert reply["ok"] is False and reply["code"] == "runtime_maintenance", reply
                     assert database.read_bytes() == before and database.stat().st_mtime_ns == modified
                     run("runtime", "restart")
+                    if phase == "Starting":
+                        assert read_restart_stages()[-3:] == ["restart_probe","restart_managed","restart_ready"], "live managed recovery did not follow the verified coordinator"
                     recovered = run("runtime", "status")
                     assert recovered["runtime"]["running"] and recovered["runtime"]["store_ready"]
                     assert not marker.exists() and not json.loads(registration.read_text())["maintenance"]

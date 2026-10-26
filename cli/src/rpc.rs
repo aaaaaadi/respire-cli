@@ -909,6 +909,7 @@ pub(crate) fn restart_runtime(timeout: Duration) -> Result<Value> {
     let _takeover = crate::runtime_policy::takeover_lock()?;
     let mut maintenance = crate::autostart::restart_maintenance_locked()?;
     crate::progress::phase("检查 runtime 进程", "Checking runtime process");
+    crate::autostart::restart_stage("restart_probe");
     let health = match probe_runtime() {
         Ok(health) => health,
         Err(error) if matches!(error.downcast_ref::<crate::runtime_error::RuntimeError>(),
@@ -920,11 +921,13 @@ pub(crate) fn restart_runtime(timeout: Duration) -> Result<Value> {
         // the authenticated, exact registered executable/profile and stop its
         // service owner before replacement. Do not route this healthy owner
         // through legacy unresponsive-process discovery (including WMI).
+        crate::autostart::restart_stage("restart_managed");
         let stopped_pid = health.as_ref().map(|value| value.pid);
         ensure_daemon_locked()?;
         let ready = crate::net_rpc::health()?;
         if !respire::service::off_mode() { verify_open_store(&respire::service::data_dir())?; }
         maintenance.finish()?;
+        crate::autostart::restart_stage("restart_ready");
         return Ok(json!({"state":"ready", "stopped_pid":stopped_pid, "pid":ready.pid,
             "forced":false, "data_dir":ready.data_dir, "version":ready.bin}));
     }
@@ -936,11 +939,13 @@ pub(crate) fn restart_runtime(timeout: Duration) -> Result<Value> {
         anyhow::ensure!(pid != std::process::id() && crate::net_rpc::pid_is_respire(pid),
             "cannot verify runtime process {pid}; restart refused");
         anyhow::ensure!(listener.is_none() || listener == Some(pid), "runtime port owner changed");
+        crate::autostart::restart_stage("restart_identity");
         let identity = crate::net_rpc::runtime_process_identity(pid)?;
         if health.is_none() {
             anyhow::ensure!(endpoint_pid() == Some(pid), "unresponsive process does not match this runtime endpoint");
         }
         crate::progress::phase("请求优雅退出；等待进程释放", "Requesting graceful shutdown; waiting for process exit");
+        crate::autostart::restart_stage("restart_stop");
         let deadline = Instant::now() + timeout;
         if crate::net_rpc::port_is_open() {
             match crate::net_rpc::request_stop_with_timeout(timeout.min(Duration::from_secs(2))) {
@@ -974,10 +979,12 @@ pub(crate) fn restart_runtime(timeout: Duration) -> Result<Value> {
         anyhow::ensure!(!crate::net_rpc::port_is_open(), "cannot identify the process occupying the runtime port");
     }
     crate::progress::phase("启动 runtime；等待就绪", "Starting runtime; waiting for readiness");
+    crate::autostart::restart_stage("restart_start");
     ensure_daemon_locked()?;
     let ready = crate::net_rpc::health()?;
     if !respire::service::off_mode() { verify_open_store(&respire::service::data_dir())?; }
     maintenance.finish()?;
+    crate::autostart::restart_stage("restart_ready");
     Ok(json!({"state":"ready", "stopped_pid":pid, "pid":ready.pid,
         "forced":forced, "data_dir":ready.data_dir, "version":ready.bin}))
 }
