@@ -135,6 +135,43 @@ def main():
                     assert not profile.is_symlink() and profile.stat().st_size <= 64 * 1024 * 1024
                     shutil.copyfile(profile, destination / f"autostart-managed-{uuid.uuid4().hex}.profraw")
 
+            def diagnose_crash_restart():
+                # Only this hosted fixture's fixed-field lifecycle state and
+                # numeric scheduler policy/result. Never export XML or errors.
+                directory=root/"runtime/autostart"
+                counts={}
+                for event_file in [directory/"events.jsonl",directory/"events.previous.jsonl"]:
+                    if event_file.is_file() and event_file.stat().st_size <= 65536:
+                        for line in event_file.read_text().splitlines():
+                            event=json.loads(line).get("event")
+                            if event in {"starting","paused","crash_limit","exit_ok","exit_error"}:
+                                counts[event]=counts.get(event,0)+1
+                print("isolated crash lifecycle diagnostic",json.dumps({"events":counts,"maintenance":(directory/"maintenance.json").exists()}))
+                if os.name != "nt":
+                    return
+                import base64
+                import re
+                identity=json.loads((directory/"registration.json").read_text())["id"]
+                assert re.fullmatch("[0-9a-f]{24}",identity)
+                script="""$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);
+$s=[Activator]::CreateInstance([Type]::GetTypeFromProgID('Schedule.Service'));$s.Connect();$t=$s.GetFolder('\\').GetTask('Respire-runtime-IDENTITY');$settings=$t.Definition.Settings;
+[Console]::Out.WriteLine('state='+[int]$t.State);[Console]::Out.WriteLine('last_result='+[long]$t.LastTaskResult);
+[Console]::Out.WriteLine('restart_count='+[int]$settings.RestartCount);$seconds=-1;try{$seconds=[int][Xml.XmlConvert]::ToTimeSpan($settings.RestartInterval).TotalSeconds}catch{};[Console]::Out.WriteLine('restart_seconds='+$seconds);
+[Console]::Out.WriteLine('multiple_instances='+[int]$settings.MultipleInstances);[Console]::Out.WriteLine('enabled='+[int][bool]$t.Enabled);
+[Console]::Out.WriteLine('instances='+[int]$t.GetInstances(0).Count);
+""".replace("IDENTITY",identity)
+                executable=Path(env["SystemRoot"])/"System32/WindowsPowerShell/v1.0/powershell.exe"
+                try:
+                    result=subprocess.run([str(executable),"-NoProfile","-NonInteractive","-EncodedCommand",base64.b64encode(script.encode("utf-16le")).decode("ascii")],env=env,capture_output=True,text=True,timeout=20)
+                    fields={}
+                    for line in result.stdout.splitlines():
+                        match=re.fullmatch("(state|last_result|restart_count|restart_seconds|multiple_instances|enabled|instances)=(-?[0-9]{1,20})",line)
+                        if match:
+                            fields[match[1]]=int(match[2])
+                    print("isolated scheduler crash diagnostic",json.dumps({"query_exit":result.returncode,"fields":fields}))
+                except (OSError,subprocess.TimeoutExpired):
+                    print("isolated scheduler crash diagnostic",json.dumps({"available":False}))
+
             def diagnose_registration():
                 import hashlib
                 import platform
@@ -280,6 +317,8 @@ def main():
                         except (OSError,ValueError):
                             pass
                         time.sleep(0.25)
+                    if recovered_health is None:
+                        diagnose_crash_restart()
                     assert recovered_health is not None, "OS supervisor did not restart its failed native owner"
                     assert recovered_health["managed_id"] == owned_health["managed_id"] and recovered_health["bin"] == health["bin"]
                     assert Path(recovered_health["installation_root"]).resolve() == root.resolve()
