@@ -248,6 +248,16 @@ fn control_hresult(text: &str) -> &str {
         .unwrap_or("unreported")
 }
 
+fn control_xml_location(text: &str) -> &str {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("rsrs-control-xml-location:"))
+        .filter(|value| value.split_once(',').is_some_and(|(line, column)| {
+            [line, column].into_iter().all(|part| !part.is_empty() && part.len() <= 8 && part.bytes().all(|byte| byte.is_ascii_digit()))
+        }))
+        .last()
+        .unwrap_or("unreported")
+}
+
 fn encoded_powershell(script: &str) -> String {
     use base64::Engine as _;
     let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
@@ -257,7 +267,7 @@ fn encoded_powershell(script: &str) -> String {
 fn checked(name: &str, args: Vec<String>) -> Result<String> {
     let result = control(name, &args)?;
     if result.code != 0 && name == "powershell" {
-        bail!("Windows current-user operation failed (exit {}, fixed stage {}, HRESULT {}); inspect the owned registration",result.code,last_control_stage(result.stdout.as_bytes()),control_hresult(&result.stdout));
+        bail!("Windows current-user operation failed (exit {}, fixed stage {}, HRESULT {}, XML location {}); inspect the owned registration",result.code,last_control_stage(result.stdout.as_bytes()),control_hresult(&result.stdout),control_xml_location(&result.stdout));
     }
     anyhow::ensure!(
         result.code == 0,
@@ -285,7 +295,7 @@ fn powershell(script: String) -> Result<String> {
     .into_iter()
     .find_map(|(needle, label)| script.contains(needle).then_some(label))
     .unwrap_or("query process");
-    let wrapped=format!("$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);[Console]::Out.WriteLine('rsrs-control-stage:script');try{{{script}}}catch{{$failure=$_.Exception;while($null -ne $failure.InnerException){{$failure=$failure.InnerException}};[Console]::Out.WriteLine('rsrs-control-hresult:'+$failure.HResult.ToString('X8'));exit 1}};exit 0");
+    let wrapped=format!("$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);[Console]::Out.WriteLine('rsrs-control-stage:script');try{{{script}}}catch{{$failure=$_.Exception;while($null -ne $failure.InnerException){{$failure=$failure.InnerException}};[Console]::Out.WriteLine('rsrs-control-hresult:'+$failure.HResult.ToString('X8'));$location=[regex]::Match($failure.Message,'\\(([0-9]{{1,8}}),([0-9]{{1,8}})\\)');if($location.Success){{[Console]::Out.WriteLine('rsrs-control-xml-location:'+$location.Groups[1].Value+','+$location.Groups[2].Value)}};exit 1}};exit 0");
     let text = checked(
         "powershell",
         vec![
@@ -1195,6 +1205,10 @@ mod tests {
         anyhow::ensure!(windows_task_path(r"\\?\GLOBALROOT\Device").is_err());
         anyhow::ensure!(control_hresult("rsrs-control-hresult:80070005") == "80070005");
         anyhow::ensure!(control_hresult("rsrs-control-hresult:secret-material") == "unreported");
+        anyhow::ensure!(control_xml_location("rsrs-control-xml-location:1,39") == "1,39");
+        for unsafe_value in ["1,secret", "123456789,2", "1,2,3", ",2"] {
+            anyhow::ensure!(control_xml_location(&format!("rsrs-control-xml-location:{unsafe_value}")) == "unreported");
+        }
         #[cfg(target_os = "linux")]
         {
             validate_executable(Platform::Linux, Path::new("/tmp/data spaces % $/rsrs"))?;
@@ -1209,6 +1223,34 @@ mod tests {
         }
         Ok(())
     }
+    #[cfg(windows)]
+    #[test]
+    fn scheduler_validates_unicode_xml_variants_without_registering_a_task() -> Result<()> {
+        use base64::Engine as _;
+        let temporary = tempfile::tempdir()?;
+        let mut config = super::super::tests::fixture(Platform::Windows);
+        config.installation = temporary.path().canonicalize()?;
+        config.executable = std::env::current_exe()?.canonicalize()?;
+        config.owner = owner()?;
+        config.id = super::super::identity(&config.installation, &config.owner);
+        let xml = super::super::render(&config)?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(xml.as_bytes());
+        // TASK_VALIDATE_ONLY=1 checks the identical payload without registering,
+        // updating, enabling or running a task. Compare only the declaration.
+        let script = format!(r#"{guard};if($null -ne $t){{throw 'Validation fixture task already exists'}};
+$xml=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}'));
+$utf8=$xml.Replace('<?xml version="1.0"?>','<?xml version="1.0" encoding="UTF-8"?>');
+try{{[void]$folder.RegisterTask({task},$utf8,1,{owner},$null,3,$null);[Console]::Out.WriteLine('utf8:valid')}}catch{{$failure=$_.Exception;while($null -ne $failure.InnerException){{$failure=$failure.InnerException}};[Console]::Out.WriteLine('utf8:hresult:'+$failure.HResult.ToString('X8'))}};
+[void]$folder.RegisterTask({task},$xml,1,{owner},$null,3,$null);[Console]::Out.WriteLine('neutral:valid');
+{guard};if($null -ne $t){{throw 'Validation-only unexpectedly created a task'}};
+"#,guard=task_guard(&config)?,task=ps_literal(&name(&config))?,owner=ps_literal(&config.owner)?);
+        let result = powershell(script)?;
+        anyhow::ensure!(result.lines().any(|line| line == "neutral:valid"), "encoding-neutral task XML did not validate");
+        // Fixed protocol fields only; never print XML, paths or arbitrary COM errors.
+        println!("Task Scheduler validation-only comparison: {result}");
+        Ok(())
+    }
+
     #[test]
     fn windows_quoting_and_task_guard_are_literal_and_current_user_only() -> Result<()> {
         anyhow::ensure!(windows_argument("C:\\user folder\\")? == "\"C:\\user folder\\\\\"");

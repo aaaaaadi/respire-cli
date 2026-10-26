@@ -83,7 +83,7 @@ jobs:
           set -euo pipefail
           if [[ "$SDK_TARGET" == *windows-msvc ]]; then export RUSTFLAGS='-C target-feature=-crt-static'; fi
           cargo test --locked -p respire_spawn --target "$SDK_TARGET" --target-dir target/autostart-validation
-          cargo test --locked -p respire --bin rsrs autostart:: --target "$SDK_TARGET" --target-dir target/autostart-validation -- --test-threads=1
+          cargo test --locked -p respire --bin rsrs autostart:: --target "$SDK_TARGET" --target-dir target/autostart-validation -- --test-threads=1 --show-output
           cargo build --locked -p respire --bin rsrs --target "$SDK_TARGET" --target-dir target/autostart-validation
       - name: Fetch immutable previous public native version without install scripts
         shell: bash

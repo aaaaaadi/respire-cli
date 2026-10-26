@@ -315,7 +315,7 @@ fn render(config: &Registration) -> Result<String> {
             config.id, xml(executable)?, config.id, xml(root)?, xml(root)?)),
         Platform::Windows => {
             let arguments=format!("runtime run --managed {} --installation-root {}",manager::windows_argument(&config.id)?,manager::windows_argument(root)?);
-            Ok(format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><RegistrationInfo><Description>Respire current-user runtime {}</Description></RegistrationInfo><Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{}</UserId></LogonTrigger></Triggers><Principals><Principal id=\"CurrentUser\"><UserId>{}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Enabled>true</Enabled><StartWhenAvailable>true</StartWhenAvailable><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure></Settings><Actions Context=\"CurrentUser\"><Exec><Command>{}</Command><Arguments>{}</Arguments><WorkingDirectory>{}</WorkingDirectory></Exec></Actions></Task>\n",config.id,xml(&config.owner)?,xml(&config.owner)?,xml(&manager::windows_task_path(executable)?)?,xml(&arguments)?,xml(&manager::windows_task_path(root)?)?))
+            Ok(format!("<?xml version=\"1.0\"?><Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><RegistrationInfo><Description>Respire current-user runtime {}</Description></RegistrationInfo><Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{}</UserId></LogonTrigger></Triggers><Principals><Principal id=\"CurrentUser\"><UserId>{}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Enabled>true</Enabled><StartWhenAvailable>true</StartWhenAvailable><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure></Settings><Actions Context=\"CurrentUser\"><Exec><Command>{}</Command><Arguments>{}</Arguments><WorkingDirectory>{}</WorkingDirectory></Exec></Actions></Task>\n",config.id,xml(&config.owner)?,xml(&config.owner)?,xml(&manager::windows_task_path(executable)?)?,xml(&arguments)?,xml(&manager::windows_task_path(root)?)?))
         },
     }
 }
@@ -356,6 +356,10 @@ mod tests {
 
     #[test]
     fn templates_supervise_foreground_user_runtime_without_elevation() -> Result<()> {
+        // RegisterTask receives a Unicode BSTR, not the UTF-8 file bytes.
+        // Keep its declaration encoding-neutral after ReadAllText.
+        let windows = render(&fixture(Platform::Windows))?;
+        anyhow::ensure!(windows.starts_with("<?xml version=\"1.0\"?>") && !windows.contains("encoding="));
         let linux = render(&fixture(Platform::Linux))?;
         anyhow::ensure!(
             linux.contains("Type=simple")
