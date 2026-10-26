@@ -311,10 +311,9 @@ $s=[Activator]::CreateInstance([Type]::GetTypeFromProgID('Schedule.Service'));$s
                     assert owned_health["pid"] == first_pid and Path(owned_health["installation_root"]).resolve() == root.resolve()
                     assert owned_health["managed_id"] == json.loads(config_path.read_text())["id"]
                     if os.name == "nt":
-                        # Inject the same failure HRESULT emitted by supervised
-                        # runtime errors. Python os.kill(SIGTERM) instead emits
-                        # positive 15, observed as LastTaskResult=15 with no
-                        # scheduler retry despite the loaded 3 x 60s policy.
+                        # Inject a nonzero child failure; the native foreground
+                        # supervisor must recover independently of Task Scheduler
+                        # handling Exec action exit status.
                         import ctypes
                         from ctypes import wintypes
                         kernel=ctypes.WinDLL("kernel32",use_last_error=True)
@@ -334,7 +333,7 @@ $s=[Activator]::CreateInstance([Type]::GetTypeFromProgID('Schedule.Service'));$s
                             image=ctypes.create_unicode_buffer(32768);size=wintypes.DWORD(len(image))
                             assert kernel.GetProcessId(process)==first_pid and kernel.QueryFullProcessImageNameW(process,0,image,ctypes.byref(size)), "fixture process identity unavailable"
                             assert Path(image.value).resolve()==Path(owned_health["exe"]).resolve(), "fixture process executable changed"
-                            assert kernel.TerminateProcess(process,0x80004005), "failed to inject owned fixture failure status"
+                            assert kernel.TerminateProcess(process,1), "failed to inject owned fixture failure status"
                         finally:
                             kernel.CloseHandle(process)
                     else:

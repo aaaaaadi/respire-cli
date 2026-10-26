@@ -6014,10 +6014,10 @@ fn main() {
         }
     };
     match handle.join() {
-        Ok(exit) => std::process::exit(autostart::process_exit_code(exit)),
+        Ok(exit) => std::process::exit(exit),
         Err(payload) => {
             eprintln!("command thread panicked: {}", panic_message(payload));
-            std::process::exit(autostart::process_exit_code(1));
+            std::process::exit(1);
         }
     }
 }

@@ -21,16 +21,6 @@ pub(crate) use lifecycle::{
     verify_managed_boot, with_explicit_recovery,
 };
 
-// Task Scheduler consumes the service action result as a Windows status.
-// Ordinary clients retain their existing CLI exit codes; clean/manual service
-// shutdown remains zero, while supervised errors carry a failure HRESULT.
-fn supervisor_exit_code(code: i32, windows: bool, managed: bool) -> i32 {
-    if windows && managed && code > 0 { 0x8000_4005_u32 as i32 } else { code }
-}
-pub(crate) fn process_exit_code(code: i32) -> i32 {
-    supervisor_exit_code(code, cfg!(windows), managed_id().is_some())
-}
-
 #[derive(Debug, Subcommand)]
 pub enum RuntimeCommand {
     /// Serve in the foreground; service managers supervise this process.
@@ -39,6 +29,8 @@ pub enum RuntimeCommand {
         managed: Option<String>,
         #[arg(long, hide = true)]
         installation_root: Option<PathBuf>,
+        #[arg(long, hide = true)]
+        supervised_child: bool,
     },
     /// Start the host through its configured lifecycle owner.
     Start,
@@ -352,16 +344,6 @@ mod tests {
             artifact_hashes: BTreeMap::new(),
             digest: None,
         }
-    }
-
-    #[test]
-    fn supervisor_failure_status_preserves_clean_stop_and_ordinary_cli_contracts() -> Result<()> {
-        anyhow::ensure!(supervisor_exit_code(0,true,true)==0);
-        anyhow::ensure!(supervisor_exit_code(1,true,true)==0x8000_4005_u32 as i32);
-        anyhow::ensure!(supervisor_exit_code(1,true,false)==1);
-        anyhow::ensure!(supervisor_exit_code(1,false,true)==1);
-        anyhow::ensure!(supervisor_exit_code(0xC000_0005_u32 as i32,true,true)==0xC000_0005_u32 as i32);
-        Ok(())
     }
 
     #[test]

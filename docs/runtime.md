@@ -48,6 +48,10 @@ rsrs runtime autostart remove --stop   # remove registration, retain libraries a
 `runtime run` serves in the foreground. The adapters supervise that process:
 Linux uses the existing systemd **user** session, macOS uses the current user's
 LaunchAgent, and Windows uses a Limited, interactive current-user logon task.
+The Windows task keeps a native foreground supervisor alive; it retries a failed
+foreground runtime child after 60 seconds, with at most three consecutive failed
+children before explicit start/restart is needed. A child that ran for two minutes
+resets that consecutive-failure budget. Maintenance or manual stop prevents retry.
 They do not install a system service, enable linger, elevate privileges, store a
 Windows password, or start before anyone signs in. Missing user service-manager
 support is an error, without an automatic system-wide fallback.

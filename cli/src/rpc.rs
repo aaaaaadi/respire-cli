@@ -1715,7 +1715,7 @@ fn stop_process(code: i32) -> ! {
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
         }
-        std::process::exit(crate::autostart::process_exit_code(code));
+        std::process::exit(code);
     }
 }
 

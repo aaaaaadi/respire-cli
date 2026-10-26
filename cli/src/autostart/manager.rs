@@ -884,8 +884,8 @@ pub(super) fn stop(config: &Registration) -> Result<()> {
         Platform::Windows => {
             if current.running {
                 powershell(format!(
-                    "{};if($null -ne $t){{$t.Stop(0)}}",
-                    task_guard(config)?
+                    "{};if($null -ne $t){{$t.Stop(0);$deadline=[DateTime]::UtcNow.AddSeconds(15);while($folder.GetTask({}).State -eq 4){{if([DateTime]::UtcNow -ge $deadline){{throw 'Owned task did not stop'}};[Threading.Thread]::Sleep(100)}}}}",
+                    task_guard(config)?,ps_literal(&name(config))?
                 ))?;
             }
         }

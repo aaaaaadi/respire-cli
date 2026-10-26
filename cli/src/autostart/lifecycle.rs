@@ -839,7 +839,8 @@ pub(crate) fn execute(command: &RuntimeCommand) -> Result<()> {
         RuntimeCommand::Run {
             managed,
             installation_root,
-        } => run_foreground(managed.as_deref(), installation_root.as_deref()),
+            supervised_child,
+        } => run_foreground(managed.as_deref(), installation_root.as_deref(), *supervised_child),
         RuntimeCommand::Stop => {
             crate::rpc::stop_if_running()?;
             emit("runtime.stop", json!({"state":"stopped"}))
@@ -966,7 +967,8 @@ fn disable(stop: bool, remove: bool) -> Result<()> {
     )
 }
 
-fn run_foreground(id: Option<&str>, root: Option<&Path>) -> Result<()> {
+fn run_foreground(id: Option<&str>, root: Option<&Path>, supervised_child: bool) -> Result<()> {
+    anyhow::ensure!(!supervised_child || (cfg!(windows) && id.is_some()), "supervised-child requires a Windows managed registration");
     if let Some(id) = id {
         let root = root.context("managed runtime needs its explicit installation root")?;
         let config = read_registration(root)?.context("managed runtime registration missing")?;
@@ -993,6 +995,10 @@ fn run_foreground(id: Option<&str>, root: Option<&Path>) -> Result<()> {
         }
         std::env::set_var("HOME", &config.user_home);
         std::env::set_var("USERPROFILE", &config.user_home);
+        #[cfg(windows)]
+        if !supervised_child {
+            return supervise_windows_runtime(&config);
+        }
         if let Some(value) = marker(&config.installation)? {
             if value.phase == Phase::Paused || !controller_alive(&value)? {
                 event(&config, "paused")?;
@@ -1049,9 +1055,69 @@ fn run_foreground(id: Option<&str>, root: Option<&Path>) -> Result<()> {
     result
 }
 
+#[cfg(any(windows, test))]
+fn retry_supervised_child(failures: &mut u8, uptime: Duration) -> bool {
+    if uptime >= Duration::from_secs(120) { *failures = 0; }
+    *failures = failures.saturating_add(1);
+    *failures < 3
+}
+
+#[cfg(windows)]
+fn supervisor_may_run(expected: &Registration) -> Result<bool> {
+    let current=read_registration(&expected.installation)?.context("supervised registration disappeared")?;
+    anyhow::ensure!(current.id==expected.id && current.owner==expected.owner && current.executable==expected.executable,"supervised registration identity changed");
+    if !current.enabled || current.manually_stopped { return Ok(false); }
+    if let Some(value)=marker(&expected.installation)? {
+        return Ok(value.phase != Phase::Paused && controller_alive(&value)?
+            && value.id==expected.id && value.expected_version==env!("CARGO_PKG_VERSION"));
+    }
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn supervise_windows_runtime(config: &Registration) -> Result<()> {
+    // Task Scheduler remains the current-user logon owner, but does not
+    // reliably retry terminated Exec actions. Keep its action in the foreground
+    // and supervise a foreground child; never open the library in this parent.
+    let mut failures=0;
+    loop {
+        if !supervisor_may_run(config)? { return Ok(()); }
+        let mut command=std::process::Command::new(&config.executable);
+        command.args(["runtime","run","--managed",&config.id,"--installation-root"])
+            .arg(&config.installation).arg("--supervised-child")
+            .env_remove("RSRS_RUNTIME_BOOT_TOKEN")
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        let started=Instant::now();
+        let result=respire_spawn::spawn_host_control(&mut command).and_then(|mut child|child.wait());
+        if result.as_ref().is_ok_and(|status|status.success()) { return Ok(()); }
+        event(config,"exit_error")?;
+        if !supervisor_may_run(config)? { return Ok(()); }
+        if !retry_supervised_child(&mut failures,started.elapsed()) {
+            event(config,"crash_limit")?;
+            return Ok(());
+        }
+        let deadline=Instant::now()+Duration::from_secs(60);
+        while Instant::now()<deadline {
+            if !supervisor_may_run(config)? { return Ok(()); }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn foreground_supervisor_retries_are_bounded_and_reset_only_after_stability() -> Result<()> {
+        let mut failures=0;
+        assert!(retry_supervised_child(&mut failures,Duration::from_secs(1)));
+        assert!(retry_supervised_child(&mut failures,Duration::from_secs(1)));
+        assert!(!retry_supervised_child(&mut failures,Duration::from_secs(1)));
+        assert!(retry_supervised_child(&mut failures,Duration::from_secs(120)));
+        assert_eq!(failures,1);
+        Ok(())
+    }
+
     #[test]
     fn registration_captures_nonsecret_opt_outs_and_legacy_names_canonically() -> Result<()> {
         let _lock = crate::TEST_ENV_LOCK.lock().map_err(|_| anyhow::anyhow!("test environment lock poisoned"))?;
