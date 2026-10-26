@@ -73,6 +73,12 @@ lifecycle marker, while a snapshot/login interruption still requires its own
 indicated recovery command. The control marker is not proof that a snapshot or
 login transaction completed.
 
+Startup settings are captured when registering. To change the saved port/native
+location or environment, first `remove --stop` using the old registered settings,
+then explicitly enable again with the new settings. A mismatched caller port is
+refused before stopping a service, so an unreachable old endpoint cannot silently
+turn into a forced shutdown. Status reports `configured_rpc_port`.
+
 Only non-secret allowlisted runtime settings are saved. Credentials and recovery
 material are never stored in a service command line or registration. Managed
 launches have a persistent limit of three attempts per 120 seconds, plus the OS

@@ -128,6 +128,8 @@ fn control(name: &str, arguments: &[String]) -> Result<Output> {
             command.env(key, value);
         }
     }
+    #[cfg(unix)]
+    command.env("LC_ALL", "C");
     command.env(
         "PATH",
         if cfg!(windows) {
@@ -197,12 +199,12 @@ fn ps_literal(value: &str) -> Result<String> {
 fn powershell(script: String) -> Result<String> {
     let operation = [
         ("WindowsIdentity", "query current user"),
-        ("Unregister-ScheduledTask", "remove owned task"),
-        ("Register-ScheduledTask", "register owned task"),
-        ("Start-ScheduledTask", "start owned task"),
-        ("Stop-ScheduledTask", "stop owned task"),
-        ("Disable-ScheduledTask", "disable owned task"),
-        ("Get-ScheduledTask", "inspect owned task"),
+        (".DeleteTask(", "remove owned task"),
+        (".RegisterTask(", "register owned task"),
+        (".Run($null)", "start owned task"),
+        (".Stop(0)", "stop owned task"),
+        ("$t.Enabled=$false", "disable owned task"),
+        (".GetTask(", "inspect owned task"),
     ]
     .into_iter()
     .find_map(|(needle, label)| script.contains(needle).then_some(label))
@@ -350,6 +352,15 @@ fn verify_systemd_loaded(
     );
     Ok(())
 }
+fn launchd_value(raw: &str) -> Result<String> {
+    let raw = raw.trim();
+    if raw.starts_with('"') {
+        return serde_json::from_str(raw).context("unrecognized quoted launchd value");
+    }
+    plain_value(raw)?;
+    Ok(raw.to_owned())
+}
+
 fn launchd_enabled(disabled: &str, name: &str) -> Result<bool> {
     anyhow::ensure!(
         disabled.contains("disabled services = {") && disabled.trim_end().ends_with('}'),
@@ -361,8 +372,8 @@ fn launchd_enabled(disabled: &str, name: &str) -> Result<bool> {
         .filter_map(|line| line.trim().strip_prefix(&key));
     let enabled = match matched.next() {
         None => true,
-        Some("true") => false,
-        Some("false") => true,
+        Some("true" | "disabled") => false,
+        Some("false" | "enabled") => true,
         Some(_) => bail!("unknown launchd disabled override value"),
     };
     anyhow::ensure!(matched.next().is_none(), "duplicate launchd override entry");
@@ -444,13 +455,23 @@ fn task_guard(config: &Registration) -> Result<String> {
     Ok(format!(
         r#"
 function Sid($value){{try{{if($value -match '^S-\d-'){{return ([Security.Principal.SecurityIdentifier]::new($value)).Value}};return ([Security.Principal.NTAccount]::new($value)).Translate([Security.Principal.SecurityIdentifier]).Value}}catch{{return $null}}}}
-$t=Get-ScheduledTask -TaskName {task} -TaskPath '\' -ErrorAction SilentlyContinue;
+$scheduler=New-Object -ComObject 'Schedule.Service';$scheduler.Connect();$folder=$scheduler.GetFolder('\');$t=$null;
+try{{$t=$folder.GetTask({task})}}catch{{$failure=$_.Exception;while($null -ne $failure.InnerException){{$failure=$failure.InnerException}};if($failure.HResult -ne -2147024894){{throw}}}}
 if($null -ne $t){{
- $a=@($t.Actions);$g=@($t.Triggers);
- if((Sid $t.Principal.UserId) -cne {owner} -or $t.Principal.LogonType -ne 'Interactive' -or $t.Principal.RunLevel -ne 'Limited' -or $a.Count -ne 1 -or $g.Count -ne 1 -or $g[0].CimClass.CimClassName -ne 'MSFT_TaskLogonTrigger' -or (Sid $g[0].UserId) -cne {owner}){{throw 'Unknown task principal/trigger; refusing lifecycle action'}};
- if(-not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($a[0].Execute),[IO.Path]::GetFullPath({exe})) -or $a[0].Arguments -cne {args} -or -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($a[0].WorkingDirectory),[IO.Path]::GetFullPath({root}))){{throw 'Unknown task action; refusing lifecycle action'}};
- if($t.Description -cne {description}){{throw 'Unknown task marker; refusing lifecycle action'}};
+ if($t.Xml.Length -gt 65536){{throw 'Task XML exceeds ownership validation limit'}};
+ $settings=[Xml.XmlReaderSettings]::new();$settings.DtdProcessing=[Xml.DtdProcessing]::Prohibit;$settings.XmlResolver=$null;
+ $reader=[Xml.XmlReader]::Create([IO.StringReader]::new($t.Xml),$settings);
+ $doc=[Xml.XmlDocument]::new();$doc.XmlResolver=$null;try{{$doc.Load($reader)}}finally{{$reader.Dispose()}};
+ $ns=[Xml.XmlNamespaceManager]::new($doc.NameTable);$ns.AddNamespace('t','http://schemas.microsoft.com/windows/2004/02/mit/task');
+ function Text($node,$xpath){{$value=$node.SelectSingleNode($xpath,$ns);if($null -eq $value){{return ''}};return $value.InnerText}}
+ $a=@($doc.SelectNodes('/t:Task/t:Actions/*',$ns));$g=@($doc.SelectNodes('/t:Task/t:Triggers/*',$ns));$p=@($doc.SelectNodes('/t:Task/t:Principals/*',$ns));
+ if($p.Count -ne 1 -or $a.Count -ne 1 -or $g.Count -ne 1 -or $a[0].LocalName -ne 'Exec' -or $g[0].LocalName -ne 'LogonTrigger'){{throw 'Unknown task principal/action/trigger count; refusing lifecycle action'}};
+ if((Sid (Text $p[0] 't:UserId')) -cne {owner} -or (Text $p[0] 't:LogonType') -cne 'InteractiveToken' -or (Text $p[0] 't:RunLevel') -cne 'LeastPrivilege' -or (Sid (Text $g[0] 't:UserId')) -cne {owner}){{throw 'Unknown task principal/trigger; refusing lifecycle action'}};
+ $arguments=Text $a[0] 't:Arguments';
+ if(-not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath((Text $a[0] 't:Command')),[IO.Path]::GetFullPath({exe})) -or $arguments -cne {args} -or -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath((Text $a[0] 't:WorkingDirectory')),[IO.Path]::GetFullPath({root}))){{throw 'Unknown task action; refusing lifecycle action'}};
+ if((Text $doc '/t:Task/t:RegistrationInfo/t:Description') -cne {description}){{throw 'Unknown task marker; refusing lifecycle action'}};
 }}
+
 "#,
         description = ps_literal(&format!("Respire current-user runtime {}", config.id))?
     ))
@@ -538,19 +559,29 @@ pub(super) fn inspect(config: &Registration) -> Result<State> {
                     enabled,
                 });
             }
-            let property = |key: &str| {
+            let property = |key: &str| -> Result<Option<String>> {
                 output
                     .stdout
                     .lines()
                     .find_map(|line| line.trim().strip_prefix(&format!("{key} = ")))
-                    .map(|v| v.trim_matches('"'))
+                    .map(launchd_value)
+                    .transpose()
             };
             anyhow::ensure!(
-                property("path").is_some_and(|v| Path::new(v) == item(config)),
+                property("path")?.is_some_and(|value| Path::new(&value).canonicalize().is_ok_and(
+                    |actual| item(config)
+                        .canonicalize()
+                        .is_ok_and(|expected| actual == expected)
+                )),
                 "unknown loaded LaunchAgent path; refusing lifecycle action"
             );
             anyhow::ensure!(
-                property("program").is_some_and(|v| Path::new(v) == config.executable),
+                property("program")?.is_some_and(|value| Path::new(&value)
+                    .canonicalize()
+                    .is_ok_and(|actual| config
+                        .executable
+                        .canonicalize()
+                        .is_ok_and(|expected| actual == expected))),
                 "unknown loaded LaunchAgent program; refusing lifecycle action"
             );
             let args = output
@@ -559,7 +590,7 @@ pub(super) fn inspect(config: &Registration) -> Result<State> {
                 .nth(1)
                 .and_then(|s| s.split("\n\t}").next())
                 .context("loaded LaunchAgent arguments unavailable")?;
-            let actual: Vec<_> = args.lines().map(|v| v.trim().trim_matches('"')).collect();
+            let actual: Vec<String> = args.lines().map(launchd_value).collect::<Result<_>>()?;
             let expected = [
                 config.executable.to_str().context("non-UTF8 executable")?,
                 "runtime",
@@ -573,18 +604,22 @@ pub(super) fn inspect(config: &Registration) -> Result<State> {
                     .context("non-UTF8 installation")?,
             ];
             anyhow::ensure!(
-                actual == expected,
+                actual.len() == expected.len()
+                    && actual
+                        .iter()
+                        .zip(expected)
+                        .all(|(actual, expected)| actual == expected),
                 "loaded LaunchAgent arguments changed; refusing lifecycle action"
             );
             Ok(State {
                 registered: true,
                 loaded: true,
-                running: property("state") == Some("running"),
+                running: property("state")?.as_deref() == Some("running"),
                 enabled,
             })
         }
         Platform::Windows => {
-            let text=powershell(format!("{};[pscustomobject]@{{registered=($null -ne $t);loaded=($null -ne $t);running=($null -ne $t -and $t.State -eq 'Running');enabled=($null -ne $t -and $t.Settings.Enabled)}}|ConvertTo-Json -Compress",task_guard(config)?))?;
+            let text=powershell(format!("{};[pscustomobject]@{{registered=($null -ne $t);loaded=($null -ne $t);running=($null -ne $t -and $t.State -eq 4);enabled=($null -ne $t -and $t.Enabled)}}|ConvertTo-Json -Compress",task_guard(config)?))?;
             let v: serde_json::Value =
                 serde_json::from_str(text.trim_start_matches('\u{feff}').trim())?;
             let boolean = |key| v[key].as_bool().context("invalid scheduled task status");
@@ -633,7 +668,7 @@ pub(super) fn install(config: &mut Registration) -> Result<()> {
             checked("launchctl", vec!["enable".into(), label(config)])?;
         }
         Platform::Windows => {
-            powershell(format!("{};$xml=[IO.File]::ReadAllText({});Register-ScheduledTask -TaskName {} -TaskPath '\' -Xml $xml {}|Out-Null",task_guard(config)?,ps_literal(item(config).to_str().context("non-UTF8 task path")?)?,ps_literal(&name(config))?,if before.registered{"-Force"}else{""}))?;
+            powershell(format!("{};$xml=[IO.File]::ReadAllText({});$folder.RegisterTask({},$xml,{},$null,$null,3,$null)|Out-Null",task_guard(config)?,ps_literal(item(config).to_str().context("non-UTF8 task path")?)?,ps_literal(&name(config))?,if before.registered{6}else{2}))?;
         }
     }
     Ok(())
@@ -679,9 +714,8 @@ pub(super) fn start(config: &Registration) -> Result<()> {
         }
         Platform::Windows => {
             powershell(format!(
-                "{};Start-ScheduledTask -TaskName {} -TaskPath '\'",
-                task_guard(config)?,
-                ps_literal(&name(config))?
+                "{};if($null -eq $t){{throw 'Owned task disappeared'}};$t.Run($null)|Out-Null",
+                task_guard(config)?
             ))?;
         }
     }
@@ -707,9 +741,8 @@ pub(super) fn stop(config: &Registration) -> Result<()> {
         Platform::Windows => {
             if current.running {
                 powershell(format!(
-                    "{};Stop-ScheduledTask -TaskName {} -TaskPath '\'",
-                    task_guard(config)?,
-                    ps_literal(&name(config))?
+                    "{};if($null -ne $t){{$t.Stop(0)}}",
+                    task_guard(config)?
                 ))?;
             }
         }
@@ -734,9 +767,8 @@ pub(super) fn disable(config: &Registration) -> Result<()> {
         Platform::Windows => {
             if current.registered {
                 powershell(format!(
-                    "{};Disable-ScheduledTask -TaskName {} -TaskPath '\'|Out-Null",
-                    task_guard(config)?,
-                    ps_literal(&name(config))?
+                    "{};if($null -ne $t){{$t.Enabled=$false}}",
+                    task_guard(config)?
                 ))?;
             }
         }
@@ -763,7 +795,7 @@ pub(super) fn remove(config: &Registration) -> Result<()> {
         Platform::Windows => {
             if current.registered {
                 powershell(format!(
-                    "{};Unregister-ScheduledTask -TaskName {} -TaskPath '\' -Confirm:$false",
+                    "{};if($null -ne $t){{$folder.DeleteTask({},0)}}",
                     task_guard(config)?,
                     ps_literal(&name(config))?
                 ))?;
@@ -891,6 +923,14 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn launchd_values_preserve_spaces_quotes_and_literal_backslashes() -> Result<()> {
+        let value = "/tmp/path spaces % $ \" \\\\";
+        anyhow::ensure!(launchd_value(value)? == value);
+        anyhow::ensure!(launchd_value(&serde_json::to_string(value)?)? == value);
+        anyhow::ensure!(launchd_value("\"unterminated").is_err());
+        Ok(())
+    }
+    #[test]
     fn launchd_status_uses_actual_disabled_override() -> Result<()> {
         anyhow::ensure!(launchd_enabled(
             "disabled services = {\n}",
@@ -909,6 +949,14 @@ mod tests {
             "ai.risense.test"
         )
         .is_err());
+        anyhow::ensure!(launchd_enabled(
+            "disabled services = {\n \"ai.risense.test\" => enabled\n}",
+            "ai.risense.test"
+        )?);
+        anyhow::ensure!(!launchd_enabled(
+            "disabled services = {\n \"ai.risense.test\" => disabled\n}",
+            "ai.risense.test"
+        )?);
         anyhow::ensure!(launchd_enabled("unrecognized", "ai.risense.test").is_err());
         Ok(())
     }
@@ -1022,8 +1070,8 @@ mod tests {
         let script = task_guard(&config)?;
         anyhow::ensure!(
             script.contains("Interactive")
-                && script.contains("Limited")
-                && script.contains(".Arguments -cne")
+                && script.contains("LeastPrivilege")
+                && script.contains("$arguments -cne")
         );
         anyhow::ensure!(
             !script.contains("RunLevel Highest") && !script.contains("ExecutionPolicy Bypass")

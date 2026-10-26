@@ -16,9 +16,9 @@ pub(crate) use lifecycle::current_boot_token as lifecycle_boot_token;
 pub(crate) use lifecycle::{
     authorize_detached_boot_locked, background_paused, begin_maintenance_locked,
     check_direct_access, check_managed_request, coordinate_materialization, credential_state,
-    ensure_managed_locked, execute, managed_enabled, managed_id, note_credential_access,
-    record_exit, restart_maintenance_locked, stop_managed_locked, verify_managed_boot,
-    with_explicit_recovery,
+    ensure_managed_locked, execute, managed_enabled, managed_id, may_reuse_runtime,
+    note_credential_access, record_exit, restart_maintenance_locked, stop_managed_locked,
+    verify_managed_boot, with_explicit_recovery,
 };
 
 #[derive(Debug, Subcommand)]
@@ -157,6 +157,14 @@ fn read_registration(root: &Path) -> Result<Option<Registration>> {
         config.installation == canonical && config.id == identity(&canonical, &config.owner),
         "autostart registration belongs to another installation"
     );
+    anyhow::ensure!(
+        config
+            .environment
+            .get("RSRS_RPC_PORT")
+            .and_then(|value| value.parse::<u16>().ok())
+            .is_some_and(|port| port != 0),
+        "invalid registered runtime port"
+    );
     for (key, value) in &config.environment {
         anyhow::ensure!(
             ENVIRONMENT.contains(&key.as_str()),
@@ -251,7 +259,7 @@ fn disabled_status() -> Result<Value> {
             json!({"schema_version":1,"enabled":config.enabled,"registered":true,
             "scope":"user-sign-in","default_enabled":false,"manager":config.platform.name(),
             "installation":config.installation,"id":config.id,"manually_stopped":config.manually_stopped,
-            "maintenance":config.maintenance}),
+            "maintenance":config.maintenance,"configured_rpc_port":config.environment.get("RSRS_RPC_PORT").and_then(|value|value.parse::<u16>().ok())}),
         ),
     }
 }
@@ -276,8 +284,10 @@ fn systemd_path(raw: &str) -> Result<String> {
         "systemd working directory must be absolute"
     );
     // Unlike ExecStart argv this directive is a scalar path. Keep literal
-    // spaces, quotes and backslashes; only escape systemd specifiers.
-    Ok(raw.replace('%', "%%"))
+    // spaces, quotes and backslashes; only escape systemd specifiers. A final
+    // '/.' preserves directory identity while preventing trailing whitespace or
+    // backslashes from being trimmed/interpreted as a unit-file continuation.
+    Ok(format!("{}/.", raw.replace('%', "%%")))
 }
 
 fn xml(raw: &str) -> Result<String> {
@@ -361,7 +371,7 @@ mod tests {
                 && !mac.contains("LaunchDaemon")
         );
         anyhow::ensure!(systemd_quote("/a%u/$x")? == "\"/a%%u/$$x\"");
-        anyhow::ensure!(systemd_path("/a b%u/\"c\"\\d")? == "/a b%%u/\"c\"\\d");
+        anyhow::ensure!(systemd_path("/a b%u/\"c\"\\d")? == "/a b%%u/\"c\"\\d/.");
         anyhow::ensure!(plain_value("bad\nvalue").is_err());
         for secret in [
             "RSRS_SUPER",

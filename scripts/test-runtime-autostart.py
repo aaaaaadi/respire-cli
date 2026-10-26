@@ -162,6 +162,15 @@ def main():
                 up = run("runtime", "status")
                 assert up["runtime"]["running"] is True and up["runtime"]["store_ready"] is True, up
                 first_pid = up["runtime"]["pid"]
+                config_path = root / "runtime/autostart/registration.json"
+                unchanged_config = config_path.read_bytes()
+                with socket.socket() as other_socket:
+                    other_socket.bind(("127.0.0.1",0))
+                    other_port = other_socket.getsockname()[1]
+                wrong_endpoint = subprocess.run([binary,"--json","runtime","stop"],
+                    env=dict(env,RSRS_RPC_PORT=str(other_port)),capture_output=True,text=True,timeout=45)
+                assert wrong_endpoint.returncode != 0 and config_path.read_bytes() == unchanged_config
+                assert run("runtime","status")["runtime"]["pid"] == first_pid, "wrong-port stop changed the owned process"
                 if os.name == "posix" and os.uname().sysname == "Linux":
                     assert Path(f"/proc/{first_pid}/cwd").resolve() == root.resolve(), "supervised process has the wrong actual working directory"
                 run("runtime", "stop")
@@ -171,6 +180,61 @@ def main():
                 run("runtime", "restart")
                 restarted = run("runtime", "status")
                 assert restarted["runtime"]["running"] and restarted["runtime"]["pid"] != first_pid, restarted
+                secondary = root / "accounts/secondary profile"
+                secondary.mkdir(parents=True)
+                run("config", "--data-dir", str(secondary))
+                switched = run("runtime", "status")
+                assert Path(switched["runtime"]["data_dir"]).resolve() == secondary.resolve(), switched
+                assert switched["runtime"]["pid"] != restarted["runtime"]["pid"]
+                run("config", "--data-dir", str(root))
+                restored = run("runtime", "status")
+                assert Path(restored["runtime"]["data_dir"]).resolve() == root.resolve(), restored
+                assert restored["runtime"]["pid"] != switched["runtime"]["pid"]
+                print("PASS: supervised synthetic profile switch and return, with verified new owner processes")
+
+                # Persisted interrupted-controller fixtures are exercised by the
+                # actual CLI and OS supervisor. This is process recovery from
+                # recorded states, not a physical power-loss experiment.
+                import uuid
+                registration = root / "runtime/autostart/registration.json"
+                marker = registration.with_name("maintenance.json")
+                for phase in ("Paused", "Starting", "Verified"):
+                    if phase != "Starting":
+                        run("runtime", "stop")
+                    config = json.loads(registration.read_text())
+                    stopped_flag = config["manually_stopped"]
+                    config["maintenance"] = True
+                    registration.write_text(json.dumps(config))
+                    value = {"schema":1,"id":config["id"],"token":str(uuid.uuid4()),"phase":phase,
+                        "expected_profile":str(root.resolve()),"expected_version":restarted["runtime"]["version"],
+                        "owner_pid":os.getpid(),"owner_birth":"synthetic-expired-controller"}
+                    with os.fdopen(os.open(marker,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),"w") as pending:
+                        json.dump(value,pending)
+                        pending.flush()
+                        os.fsync(pending.fileno())
+                    database = root / "rsrs.db"
+                    before = database.read_bytes()
+                    modified = database.stat().st_mtime_ns
+                    denied_start = command("runtime", "start")
+                    assert denied_start.returncode != 0 and marker.exists()
+                    assert json.loads(registration.read_text())["manually_stopped"] == stopped_flag
+                    denied_read = command("--direct", "memory-revision")
+                    assert denied_read.returncode != 0 and marker.exists()
+                    if phase == "Starting":
+                        for method in ("model.prepare", "index.prepare"):
+                            request = urllib.request.Request(f"http://127.0.0.1:{port}/api/rpc",
+                                data=json.dumps({"v":1,"id":str(uuid.uuid4()),"method":method,"args":[]}).encode(),
+                                headers={"Content-Type":"application/json"})
+                            with urllib.request.urlopen(request,timeout=5) as response:
+                                reply=json.load(response)
+                            assert reply["ok"] is False and reply["code"] == "runtime_maintenance", reply
+                    assert database.read_bytes() == before and database.stat().st_mtime_ns == modified
+                    run("runtime", "restart")
+                    recovered = run("runtime", "status")
+                    assert recovered["runtime"]["running"] and recovered["runtime"]["store_ready"]
+                    assert not marker.exists() and not json.loads(registration.read_text())["maintenance"]
+                    print(f"PASS: native persisted {phase} recovery; direct reads/preparation fenced; manual-stop intent retained until explicit restart")
+
                 # Managed off-mode uses process/profile readiness, not a store
                 # that this mode intentionally never opens.
                 run("runtime", "stop")

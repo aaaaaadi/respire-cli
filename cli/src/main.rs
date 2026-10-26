@@ -6257,6 +6257,7 @@ fn run_classify_config(
 }
 
 fn run_memory_revision() -> Result<()> {
+    autostart::check_direct_access()?;
     emit_result(ResultEnvelope::new(
         "memory-revision",
         OutputStatus::Ok,

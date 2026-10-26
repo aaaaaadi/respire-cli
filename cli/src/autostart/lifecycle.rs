@@ -81,6 +81,18 @@ fn save(config: &mut Registration) -> Result<()> {
     result
 }
 
+fn ensure_control_endpoint(config: &Registration) -> Result<()> {
+    let registered = config
+        .environment
+        .get("RSRS_RPC_PORT")
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .context("registered runtime port is missing or invalid")?;
+    anyhow::ensure!(registered==crate::net_rpc::rpc_port(),
+        "host port differs from registered runtime port {registered}; use the registered RSRS_RPC_PORT to stop/remove the old registration before enabling new settings");
+    Ok(())
+}
+
 fn owned(config: &Registration) -> Result<()> {
     anyhow::ensure!(
         config.owner == manager::owner()?,
@@ -198,6 +210,7 @@ impl Maintenance {
 
     fn begin(mut config: Registration, recover: bool) -> Result<Self> {
         owned(&config)?;
+        ensure_control_endpoint(&config)?;
         let registration = manager::inspect(&config)?;
         anyhow::ensure!(
             !registration.registered || config.artifact_hashes.contains_key("service"),
@@ -324,7 +337,16 @@ pub(crate) fn begin_maintenance_locked() -> Result<Maintenance> {
         return Ok(Maintenance::inactive());
     }
     match read_registration(&respire::service::main_data_dir())? {
-        Some(config) if config.enabled => Maintenance::begin(config, RECOVERY.with(|v| v.get())),
+        Some(config) if config.enabled => {
+            let guard = Maintenance::begin(config, RECOVERY.with(|v| v.get()))?;
+            reset_attempts(
+                guard
+                    .config
+                    .as_ref()
+                    .context("maintenance registration missing")?,
+            )?;
+            Ok(guard)
+        }
         _ => Ok(Maintenance::inactive()),
     }
 }
@@ -332,14 +354,18 @@ pub(crate) fn begin_maintenance_locked() -> Result<Maintenance> {
 /// Explicit host restart is the recovery operation for an interrupted transition.
 /// The caller holds the same installation takeover lock as profile changes.
 pub(crate) fn restart_maintenance_locked() -> Result<Maintenance> {
-    let Some(mut config) = read_registration(&respire::service::main_data_dir())? else {
+    let Some(config) = read_registration(&respire::service::main_data_dir())? else {
         return Ok(Maintenance::inactive());
     };
-    owned(&config)?;
+    let mut guard = Maintenance::begin(config, true)?;
+    let config = guard
+        .config
+        .as_mut()
+        .context("restart registration missing")?;
     config.manually_stopped = false;
-    save(&mut config)?;
-    reset_attempts(&config)?;
-    Maintenance::begin(config, true)
+    save(config)?;
+    reset_attempts(config)?;
+    Ok(guard)
 }
 
 /// Legacy detached mode may be used after an explicitly disabled registration.
@@ -388,6 +414,7 @@ pub(crate) fn coordinate_materialization() -> Result<Option<PathBuf>> {
     owned(&config)?;
     let was_running = crate::rpc::probe_runtime()?.is_some();
     let mut guard = Maintenance::begin(config, false)?;
+    reset_attempts(guard.config.as_ref().context("registration missing")?)?;
     raw_stop_owned(guard.config.as_ref().context("registration missing")?)?;
     let executable = crate::mcp::materialize_bin().map_err(anyhow::Error::msg)?;
     if was_running {
@@ -398,11 +425,16 @@ pub(crate) fn coordinate_materialization() -> Result<Option<PathBuf>> {
 }
 
 fn raw_stop_owned(config: &Registration) -> Result<()> {
+    ensure_control_endpoint(config)?;
     manager::inspect(config)?;
     if let Some(health) = crate::rpc::probe_runtime()? {
         anyhow::ensure!(
             crate::mcp::exe_matches_dest(&health.exe, &config.executable)
-                && health.data_dir == respire::service::data_dir().display().to_string(),
+                && !health.data_dir.is_empty()
+                && crate::mcp::same_path(
+                    Path::new(&health.data_dir),
+                    &respire::service::data_dir()
+                ),
             "runtime identity/profile does not match this installation; no lifecycle action taken"
         );
         crate::rpc::stop_occupant(health.pid)?;
@@ -417,7 +449,11 @@ fn wait_ready(config: &Registration) -> Result<()> {
             anyhow::ensure!(
                 health.bin == env!("CARGO_PKG_VERSION")
                     && crate::mcp::exe_matches_dest(&health.exe, &config.executable)
-                    && health.data_dir == respire::service::data_dir().display().to_string(),
+                    && !health.data_dir.is_empty()
+                    && crate::mcp::same_path(
+                        Path::new(&health.data_dir),
+                        &respire::service::data_dir()
+                    ),
                 "managed runtime version/executable/profile mismatch"
             );
             anyhow::ensure!(
@@ -465,6 +501,18 @@ fn start_candidate(guard: &mut Maintenance) -> Result<()> {
     )
 }
 
+pub(crate) fn may_reuse_runtime(health: &crate::net_rpc::Health) -> Result<bool> {
+    if background_paused() {
+        return Ok(false);
+    }
+    match read_registration(&respire::service::main_data_dir())? {
+        Some(config) if config.enabled => Ok(
+            !config.manually_stopped && health.managed_id.as_deref() == Some(config.id.as_str())
+        ),
+        _ => Ok(true),
+    }
+}
+
 pub(crate) fn ensure_managed_locked() -> Result<bool> {
     let Some(config) = read_registration(&respire::service::main_data_dir())? else {
         return Ok(false);
@@ -506,6 +554,37 @@ pub(crate) fn ensure_managed_locked() -> Result<bool> {
     Ok(true)
 }
 
+fn start_explicit_locked() -> Result<()> {
+    let root = respire::service::main_data_dir();
+    let Some(config) = read_registration(&root)?.filter(|config| config.enabled) else {
+        return crate::rpc::ensure_daemon_locked();
+    };
+    owned(&config)?;
+    manager::inspect(&config)?;
+    check_direct_access()?;
+    if !config.manually_stopped {
+        if let Some(health) = crate::rpc::probe_runtime()? {
+            if health.managed_id.as_deref() == Some(config.id.as_str())
+                && crate::rpc::runtime_matches_current(&health)?
+            {
+                reset_attempts(&config)?;
+                return Ok(());
+            }
+        }
+    }
+    // Fence OS-triggered launches before clearing the persistent stop flag.
+    let mut guard = Maintenance::begin(config, false)?;
+    let config = guard
+        .config
+        .as_mut()
+        .context("start registration missing")?;
+    config.manually_stopped = false;
+    save(config)?;
+    reset_attempts(config)?;
+    start_candidate(&mut guard)?;
+    guard.finish()
+}
+
 pub(crate) fn stop_managed_locked() -> Result<bool> {
     let Some(mut config) = read_registration(&respire::service::main_data_dir())? else {
         return Ok(false);
@@ -515,6 +594,7 @@ pub(crate) fn stop_managed_locked() -> Result<bool> {
     }
     owned(&config)?;
     manager::inspect(&config)?;
+    ensure_control_endpoint(&config)?;
     config.manually_stopped = true;
     save(&mut config)?;
     let mut guard = Maintenance::begin(config, false)?;
@@ -530,6 +610,11 @@ pub(crate) fn stop_managed_locked() -> Result<bool> {
 
 fn new_registration() -> Result<Registration> {
     let root = respire::service::main_data_dir();
+    let environment_root = if root.is_absolute() {
+        root.clone()
+    } else {
+        std::env::current_dir()?.join(&root)
+    };
     fs::create_dir_all(&root)?;
     let root = root.canonicalize()?;
     let owner = manager::owner()?;
@@ -546,7 +631,10 @@ fn new_registration() -> Result<Registration> {
     }
     environment.insert(
         "RSRS_DATA_DIR".into(),
-        root.to_str().context("non-UTF8 installation")?.into(),
+        environment_root
+            .to_str()
+            .context("non-UTF8 installation")?
+            .into(),
     );
     environment.insert(
         "RSRS_BIN_DIR".into(),
@@ -709,7 +797,9 @@ fn status() -> Result<Value> {
     }
     match crate::rpc::probe_runtime() {
         Ok(Some(health)) => {
-            if Path::new(&health.installation_root) != root {
+            if health.installation_root.is_empty()
+                || !crate::mcp::same_path(Path::new(&health.installation_root), &root)
+            {
                 value["runtime"] = json!({"running":null,"state":if health.installation_root.is_empty() {"legacy_identity_unavailable"} else {"another_installation"},"version":health.bin});
                 return Ok(value);
             }
@@ -760,13 +850,7 @@ pub(crate) fn execute(command: &RuntimeCommand) -> Result<()> {
         }
         RuntimeCommand::Start => {
             let _ownership = crate::runtime_policy::takeover_lock()?;
-            if let Some(mut config) = read_registration(&respire::service::main_data_dir())? {
-                owned(&config)?;
-                config.manually_stopped = false;
-                save(&mut config)?;
-                reset_attempts(&config)?;
-            }
-            crate::rpc::ensure_daemon_locked()?;
+            start_explicit_locked()?;
             emit("runtime.start", status()?)
         }
         RuntimeCommand::Autostart {
@@ -785,6 +869,16 @@ pub(crate) fn execute(command: &RuntimeCommand) -> Result<()> {
 fn enable(now: bool) -> Result<()> {
     let _ownership = crate::runtime_policy::takeover_lock()?;
     let mut config = match read_registration(&respire::service::main_data_dir())? {
+        Some(config) if !config.enabled && config.artifact_hashes.is_empty() => {
+            owned(&config)?;
+            anyhow::ensure!(
+                !manager::inspect(&config)?.registered,
+                "unknown remaining registration; refusing reconfiguration"
+            );
+            let mut fresh = new_registration()?;
+            fresh.digest = config.digest;
+            fresh
+        }
         Some(config) => config,
         None => new_registration()?,
     };
@@ -820,9 +914,17 @@ fn enable(now: bool) -> Result<()> {
 }
 
 fn disable(stop: bool, remove: bool) -> Result<()> {
+    let command = if remove {
+        "runtime.autostart.remove"
+    } else {
+        "runtime.autostart.disable"
+    };
+    if read_registration(&respire::service::main_data_dir())?.is_none() {
+        return emit(command, status()?);
+    }
     let _ownership = crate::runtime_policy::takeover_lock()?;
     let Some(mut config) = read_registration(&respire::service::main_data_dir())? else {
-        return emit("runtime.autostart.disable", status()?);
+        return emit(command, status()?);
     };
     owned(&config)?;
     let actual = manager::inspect(&config)?;
@@ -831,6 +933,7 @@ fn disable(stop: bool, remove: bool) -> Result<()> {
         "stop the owned runtime before removing its startup registration"
     );
     if stop {
+        ensure_control_endpoint(&config)?;
         config.manually_stopped = true;
         save(&mut config)?;
         let mut guard = Maintenance::begin(config, false)?;
@@ -1078,8 +1181,12 @@ mod tests {
         config.user_home = root.join("home");
         config.executable = root.join("bin/rsrs");
         config.id = identity(&root, &config.owner);
+        config.environment.insert(
+            "RSRS_RPC_PORT".into(),
+            crate::net_rpc::rpc_port().to_string(),
+        );
         config.enabled = true;
-        let (_scope, _) = manager::test_adapter::install(&config);
+        let (_scope, state) = manager::test_adapter::install(&config);
         manager::install(&mut config)?;
         save(&mut config)?;
         for phase in [Phase::Paused, Phase::Starting, Phase::Verified] {
@@ -1115,6 +1222,21 @@ mod tests {
                 .context("test registration missing")?
                 .manually_stopped
         );
+        let unchanged = fs::read(control_path(&root))?;
+        state.borrow_mut().dropin = true;
+        anyhow::ensure!(restart_maintenance_locked().is_err() && start_explicit_locked().is_err());
+        anyhow::ensure!(fs::read(control_path(&root))? == unchanged && marker(&root)?.is_none());
+        state.borrow_mut().dropin = false;
+        let original_port = std::env::var("RSRS_RPC_PORT")?;
+        let different = if original_port == "65534" {
+            "65533"
+        } else {
+            "65534"
+        };
+        std::env::set_var("RSRS_RPC_PORT", different);
+        anyhow::ensure!(restart_maintenance_locked().is_err() && start_explicit_locked().is_err());
+        anyhow::ensure!(fs::read(control_path(&root))? == unchanged && marker(&root)?.is_none());
+        std::env::set_var("RSRS_RPC_PORT", original_port);
         let mut restarted = restart_maintenance_locked()?;
         anyhow::ensure!(
             !read_registration(&root)?

@@ -990,7 +990,7 @@ pub fn verify_open_store(root:&std::path::Path)->Result<()> {
 fn verify_runtime_store(root:&std::path::Path,id:Option<&str>)->Result<()> {
     for _ in 0..START_POLLS {
         let health=crate::net_rpc::health()?;
-        anyhow::ensure!(std::path::Path::new(&health.data_dir)==root,"snapshot runtime profile changed during verification");
+        anyhow::ensure!(!health.data_dir.is_empty() && crate::mcp::same_path(std::path::Path::new(&health.data_dir),root),"snapshot runtime profile changed during verification");
         if health.store_ready && id.is_none_or(|id|health.snapshot_restore_id.as_deref()==Some(id)){return Ok(());}
         std::thread::sleep(START_WAIT);
     }
@@ -1313,6 +1313,9 @@ fn dispatch(request: RpcRequest, tx: &Sender<Job>) -> RpcResponse {
     }
     if request.method != "runtime.result" {
         if let Some(hit) = cached(&request.id) { return hit; }
+    }
+    if matches!(request.method.as_str(), "model.prepare" | "index.prepare") && crate::autostart::background_paused() {
+        return error_response(&request,"runtime_maintenance","runtime maintenance pauses model/index preparation");
     }
     let response = match request.method.as_str() {
         #[cfg(feature = "native-fault-tests")]
@@ -2342,7 +2345,8 @@ pub(crate) fn ensure_daemon() -> Result<()> {
 pub(crate) fn runtime_matches_current(health: &crate::net_rpc::Health) -> Result<bool> {
     let dest = crate::mcp::stable_bin_path();
     let src = std::env::current_exe().context("failed to locate the rsrs binary")?;
-    Ok(health.data_dir == respire::service::data_dir().display().to_string()
+    Ok(!health.data_dir.is_empty() && crate::mcp::same_path(std::path::Path::new(&health.data_dir), &respire::service::data_dir())
+        && crate::autostart::may_reuse_runtime(health)?
         && health.bin == env!("CARGO_PKG_VERSION")
         && crate::mcp::exe_matches_dest(&health.exe, &dest)
         && !health.inference_stalled()
@@ -2419,7 +2423,7 @@ fn wait_daemon_ready(child: &mut std::process::Child, executable: &std::path::Pa
                 health.pid == child.id()
                     && crate::mcp::exe_matches_dest(&health.exe, executable)
                     && health.bin == env!("CARGO_PKG_VERSION")
-                    && health.data_dir == respire::service::data_dir().display().to_string(),
+                    && !health.data_dir.is_empty() && crate::mcp::same_path(std::path::Path::new(&health.data_dir), &respire::service::data_dir()),
                 "runtime owner changed during startup"
             );
             return Ok(());
