@@ -52,6 +52,10 @@ The Windows task keeps a native foreground supervisor alive; it retries a failed
 foreground runtime child after 60 seconds, with at most three consecutive failed
 children before explicit start/restart is needed. A child that ran for two minutes
 resets that consecutive-failure budget. Maintenance or manual stop prevents retry.
+A non-inheritable, process-owned Windows job also removes the child tree if the
+supervisor itself exits unexpectedly; automatic parent recovery is not promised,
+and an explicit host restart may be needed. Normal CLI stop drains the runtime
+before stopping the supervisor or replacing its executable.
 They do not install a system service, enable linger, elevate privileges, store a
 Windows password, or start before anyone signs in. Missing user service-manager
 support is an error, without an automatic system-wide fallback.

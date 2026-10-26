@@ -1079,6 +1079,7 @@ fn supervise_windows_runtime(config: &Registration) -> Result<()> {
     // Task Scheduler remains the current-user logon owner, but does not
     // reliably retry terminated Exec actions. Keep its action in the foreground
     // and supervise a foreground child; never open the library in this parent.
+    respire_spawn::confine_supervisor_tree().context("cannot establish owned supervisor process tree")?;
     let mut failures=0;
     loop {
         if !supervisor_may_run(config)? { return Ok(()); }
@@ -1088,8 +1089,11 @@ fn supervise_windows_runtime(config: &Registration) -> Result<()> {
             .env_remove("RSRS_RUNTIME_BOOT_TOKEN")
             .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
         let started=Instant::now();
-        let result=respire_spawn::spawn_host_control(&mut command).and_then(|mut child|child.wait());
-        if result.as_ref().is_ok_and(|status|status.success()) { return Ok(()); }
+        let status=match respire_spawn::spawn_host_control(&mut command) {
+            Ok(mut child)=>Some(child.wait().context("cannot confirm owned runtime child exit")?),
+            Err(_)=>None,
+        };
+        if status.is_some_and(|status|status.success()) { return Ok(()); }
         event(config,"exit_error")?;
         if !supervisor_may_run(config)? { return Ok(()); }
         if !retry_supervised_child(&mut failures,started.elapsed()) {

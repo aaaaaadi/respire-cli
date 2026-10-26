@@ -141,6 +141,61 @@ def main():
                     assert not profile.is_symlink() and profile.stat().st_size <= 64 * 1024 * 1024
                     shutil.copyfile(profile, destination / f"autostart-managed-{uuid.uuid4().hex}.profraw")
 
+            from contextlib import contextmanager
+
+            @contextmanager
+            def owned_windows_pair(expected_root):
+                # Kernel-backed process handles bind the exact instances; a
+                # stale PID or a Task Scheduler engine must never be killed.
+                import ctypes
+                import base64
+                import re
+                from ctypes import wintypes
+                assert os.name == "nt"
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health",timeout=5) as response:
+                    current=json.load(response)
+                expected=json.loads((expected_root/"runtime/autostart/registration.json").read_text())
+                assert Path(current["installation_root"]).resolve()==expected_root.resolve() and current["managed_id"]==expected["id"]
+                kernel=ctypes.WinDLL("kernel32",use_last_error=True)
+                kernel.OpenProcess.argtypes=[wintypes.DWORD,wintypes.BOOL,wintypes.DWORD];kernel.OpenProcess.restype=wintypes.HANDLE
+                kernel.GetProcessId.argtypes=[wintypes.HANDLE];kernel.GetProcessId.restype=wintypes.DWORD
+                kernel.QueryFullProcessImageNameW.argtypes=[wintypes.HANDLE,wintypes.DWORD,wintypes.LPWSTR,ctypes.POINTER(wintypes.DWORD)];kernel.QueryFullProcessImageNameW.restype=wintypes.BOOL
+                kernel.GetProcessTimes.argtypes=[wintypes.HANDLE]+[ctypes.POINTER(wintypes.FILETIME)]*4;kernel.GetProcessTimes.restype=wintypes.BOOL
+                kernel.TerminateProcess.argtypes=[wintypes.HANDLE,wintypes.UINT];kernel.TerminateProcess.restype=wintypes.BOOL
+                kernel.WaitForSingleObject.argtypes=[wintypes.HANDLE,wintypes.DWORD];kernel.WaitForSingleObject.restype=wintypes.DWORD
+                kernel.CloseHandle.argtypes=[wintypes.HANDLE];kernel.CloseHandle.restype=wintypes.BOOL
+                handles=[]
+                def checked_process(pid):
+                    assert pid not in (0,os.getpid())
+                    handle=kernel.OpenProcess(0x101001,False,pid) # terminate + limited query + synchronize
+                    assert handle, "cannot open the owned native fixture process"
+                    handles.append(handle)
+                    image=ctypes.create_unicode_buffer(32768);size=wintypes.DWORD(len(image))
+                    assert kernel.GetProcessId(handle)==pid and kernel.QueryFullProcessImageNameW(handle,0,image,ctypes.byref(size))
+                    assert os.path.samefile(image.value,current["exe"]), "fixture process has a foreign executable"
+                    values=[wintypes.FILETIME() for _ in range(4)]
+                    assert kernel.GetProcessTimes(handle,*[ctypes.byref(value) for value in values])
+                    assert kernel.WaitForSingleObject(handle,0)==258, "fixture process already exited"
+                    return handle,(values[0].dwHighDateTime<<32)|values[0].dwLowDateTime
+                try:
+                    child,child_birth=checked_process(current["pid"])
+                    script=f"$ErrorActionPreference='Stop';$p=Get-CimInstance Win32_Process -Filter 'ProcessId={current['pid']}';[Console]::Out.WriteLine([uint32]$p.ParentProcessId)"
+                    ps=Path(env["SystemRoot"])/"System32/WindowsPowerShell/v1.0/powershell.exe"
+                    result=subprocess.run([str(ps),"-NoProfile","-NonInteractive","-EncodedCommand",base64.b64encode(script.encode("utf-16le")).decode("ascii")],env=env,capture_output=True,text=True,timeout=20)
+                    assert result.returncode==0 and re.fullmatch(r"[0-9]+",result.stdout.strip()), "native supervisor parent unavailable"
+                    parent_pid=int(result.stdout.strip())
+                    assert parent_pid != current["pid"]
+                    parent,parent_birth=checked_process(parent_pid)
+                    assert parent_birth <= child_birth, "supervisor PID was reused after the owned child started"
+                    yield {"kernel":kernel,"parent":parent,"child":child,"parent_pid":parent_pid,"child_pid":current["pid"],"parent_birth":parent_birth}
+                finally:
+                    for handle in handles:
+                        kernel.CloseHandle(handle)
+
+            def require_pair_exited(pair):
+                assert pair["kernel"].WaitForSingleObject(pair["child"],15000)==0, "owned runtime child survived its lifecycle owner"
+                assert pair["kernel"].WaitForSingleObject(pair["parent"],15000)==0, "owned supervisor remained alive after stop"
+
             def diagnose_crash_restart():
                 # Only this hosted fixture's fixed-field lifecycle state and
                 # numeric scheduler policy/result. Never export XML or errors.
@@ -238,7 +293,12 @@ $s=[Activator]::CreateInstance([Type]::GetTypeFromProgID('Schedule.Service'));$s
                         # never replace or restart the live supervised owner.
                         still=require_upgrade("runtime","status")
                         assert still["runtime"]["pid"] == upgraded["runtime"]["pid"] and hashlib.sha256(stable.read_bytes()).digest() == fingerprint
-                        require_upgrade("runtime","autostart","disable","--stop")
+                        if os.name == "nt":
+                            with owned_windows_pair(upgrade_root) as pair:
+                                require_upgrade("runtime","autostart","disable","--stop")
+                                require_pair_exited(pair)
+                        else:
+                            require_upgrade("runtime","autostart","disable","--stop")
                         # Restore only known public previous-version native
                         # files while stopped. Do not run old code against the
                         # now-upgraded database; the next start is the new CLI.
@@ -311,31 +371,11 @@ $s=[Activator]::CreateInstance([Type]::GetTypeFromProgID('Schedule.Service'));$s
                     assert owned_health["pid"] == first_pid and Path(owned_health["installation_root"]).resolve() == root.resolve()
                     assert owned_health["managed_id"] == json.loads(config_path.read_text())["id"]
                     if os.name == "nt":
-                        # Inject a nonzero child failure; the native foreground
-                        # supervisor must recover independently of Task Scheduler
-                        # handling Exec action exit status.
-                        import ctypes
-                        from ctypes import wintypes
-                        kernel=ctypes.WinDLL("kernel32",use_last_error=True)
-                        kernel.OpenProcess.argtypes=[wintypes.DWORD,wintypes.BOOL,wintypes.DWORD]
-                        kernel.OpenProcess.restype=wintypes.HANDLE
-                        kernel.GetProcessId.argtypes=[wintypes.HANDLE]
-                        kernel.GetProcessId.restype=wintypes.DWORD
-                        kernel.QueryFullProcessImageNameW.argtypes=[wintypes.HANDLE,wintypes.DWORD,wintypes.LPWSTR,ctypes.POINTER(wintypes.DWORD)]
-                        kernel.QueryFullProcessImageNameW.restype=wintypes.BOOL
-                        kernel.TerminateProcess.argtypes=[wintypes.HANDLE,wintypes.UINT]
-                        kernel.TerminateProcess.restype=wintypes.BOOL
-                        kernel.CloseHandle.argtypes=[wintypes.HANDLE]
-                        kernel.CloseHandle.restype=wintypes.BOOL
-                        process=kernel.OpenProcess(0x1001,False,first_pid) # terminate + limited identity query, no debug privilege
-                        assert process, "cannot open the owned fixture process"
-                        try:
-                            image=ctypes.create_unicode_buffer(32768);size=wintypes.DWORD(len(image))
-                            assert kernel.GetProcessId(process)==first_pid and kernel.QueryFullProcessImageNameW(process,0,image,ctypes.byref(size)), "fixture process identity unavailable"
-                            assert Path(image.value).resolve()==Path(owned_health["exe"]).resolve(), "fixture process executable changed"
-                            assert kernel.TerminateProcess(process,1), "failed to inject owned fixture failure status"
-                        finally:
-                            kernel.CloseHandle(process)
+                        with owned_windows_pair(root) as pair:
+                            assert pair["child_pid"]==first_pid
+                            supervisor_before=(pair["parent_pid"],pair["parent_birth"])
+                            assert pair["kernel"].TerminateProcess(pair["child"],1), "failed to inject owned child failure"
+                            assert pair["kernel"].WaitForSingleObject(pair["child"],15000)==0
                     else:
                         os.kill(first_pid,signal.SIGKILL)
                     restart_deadline=time.monotonic()+140
@@ -356,8 +396,25 @@ $s=[Activator]::CreateInstance([Type]::GetTypeFromProgID('Schedule.Service'));$s
                     assert recovered_health["managed_id"] == owned_health["managed_id"] and recovered_health["bin"] == health["bin"]
                     assert Path(recovered_health["installation_root"]).resolve() == root.resolve()
                     first_pid=recovered_health["pid"]
-                    print("PASS: actual abnormal process exit followed by OS-supervised store-ready restart, without a CLI start request")
-                run("runtime", "stop")
+                    print("PASS: actual abnormal process exit followed by supervised store-ready restart, without a CLI start request")
+                    if os.name == "nt":
+                        with owned_windows_pair(root) as pair:
+                            assert (pair["parent_pid"],pair["parent_birth"])==supervisor_before, "child recovery unexpectedly replaced its supervisor"
+                            assert pair["kernel"].TerminateProcess(pair["parent"],1), "failed to inject owned supervisor failure"
+                            require_pair_exited(pair)
+                        # This proves job-bound cleanup, not automatic parent
+                        # recovery. Explicit host restart establishes a new pair.
+                        run("runtime","restart")
+                        with owned_windows_pair(root) as pair:
+                            assert pair["parent_birth"]!=supervisor_before[1]
+                            first_pid=pair["child_pid"]
+                        print("PASS: actual supervisor kill removes its owned child; explicit restart verifies a new store-ready pair without an orphan")
+                if os.name == "nt":
+                    with owned_windows_pair(root) as pair:
+                        run("runtime", "stop")
+                        require_pair_exited(pair)
+                else:
+                    run("runtime", "stop")
                 time.sleep(1)
                 stopped = run("runtime", "status")
                 assert stopped["runtime"]["running"] is False, "manual stop was automatically resurrected"
@@ -366,7 +423,12 @@ $s=[Activator]::CreateInstance([Type]::GetTypeFromProgID('Schedule.Service'));$s
                 assert restarted["runtime"]["running"] and restarted["runtime"]["pid"] != first_pid, restarted
                 secondary = root / "accounts/secondary profile"
                 secondary.mkdir(parents=True)
-                run("config", "--data-dir", str(secondary))
+                if os.name == "nt":
+                    with owned_windows_pair(root) as pair:
+                        run("config", "--data-dir", str(secondary))
+                        require_pair_exited(pair)
+                else:
+                    run("config", "--data-dir", str(secondary))
                 switched = run("runtime", "status")
                 assert Path(switched["runtime"]["data_dir"]).resolve() == secondary.resolve(), switched
                 assert switched["runtime"]["pid"] != restarted["runtime"]["pid"]
