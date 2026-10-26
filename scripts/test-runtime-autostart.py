@@ -216,7 +216,7 @@ def main():
                     finally:
                         stopped=upgrade_call(binary,"runtime","stop")
                         removed=upgrade_call(binary,"runtime","autostart","remove","--stop")
-                        assert stopped.returncode == 0 and removed.returncode == 0, "previous-version fixture cleanup failed"
+                        assert stopped.returncode == 0 and removed.returncode == 0, f"previous-version fixture cleanup failed: stop={stopped.stdout} {stopped.stderr}; remove={removed.stdout} {removed.stderr}"
 
                 failure_root=base/"failed-installation"
                 blocked=base/"blocked-native-directory"
@@ -246,6 +246,37 @@ def main():
                 assert run("runtime","status")["runtime"]["pid"] == first_pid, "wrong-port stop changed the owned process"
                 if os.name == "posix" and os.uname().sysname == "Linux":
                     assert Path(f"/proc/{first_pid}/cwd").resolve() == root.resolve(), "supervised process has the wrong actual working directory"
+                # Deliberate SIGKILL/TerminateProcess does not flush LLVM
+                # counters; run this fault in the dedicated uninstrumented
+                # three-platform job, while coverage keeps graceful profiles.
+                if not os.environ.get("LLVM_PROFILE_FILE"):
+                    # Kill only the fixture's just-verified managed owner. Observe
+                    # HTTP readiness directly afterwards: invoking runtime start or
+                    # another auto-starting CLI command would hide a broken OS
+                    # restart policy. No user registration/data is involved.
+                    import signal
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health",timeout=5) as response:
+                        owned_health=json.load(response)
+                    assert owned_health["pid"] == first_pid and Path(owned_health["installation_root"]).resolve() == root.resolve()
+                    assert owned_health["managed_id"] == json.loads(config_path.read_text())["id"]
+                    os.kill(first_pid,signal.SIGTERM if os.name == "nt" else signal.SIGKILL)
+                    restart_deadline=time.monotonic()+140
+                    recovered_health=None
+                    while time.monotonic() < restart_deadline:
+                        try:
+                            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health",timeout=1) as response:
+                                candidate=json.load(response)
+                            if candidate["pid"] != first_pid and candidate.get("store_ready"):
+                                recovered_health=candidate
+                                break
+                        except (OSError,ValueError):
+                            pass
+                        time.sleep(0.25)
+                    assert recovered_health is not None, "OS supervisor did not restart its failed native owner"
+                    assert recovered_health["managed_id"] == owned_health["managed_id"] and recovered_health["bin"] == health["bin"]
+                    assert Path(recovered_health["installation_root"]).resolve() == root.resolve()
+                    first_pid=recovered_health["pid"]
+                    print("PASS: actual abnormal process exit followed by OS-supervised store-ready restart, without a CLI start request")
                 run("runtime", "stop")
                 time.sleep(1)
                 stopped = run("runtime", "status")

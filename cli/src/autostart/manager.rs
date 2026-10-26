@@ -555,6 +555,14 @@ fn arguments(config: &Registration) -> Result<String> {
     ))
 }
 
+fn task_runlevel_guard() -> &'static str {
+    // The scheduler omits default LeastPrivilege from serialized XML. Its
+    // typed effective COM value is authoritative; unknown/Highest stays denied.
+    r#"function RequireLimited($xmlValue,$effectiveValue){
+ if($null -eq $effectiveValue -or $effectiveValue -isnot [int] -or $effectiveValue -ne 0 -or @('','LeastPrivilege') -cnotcontains $xmlValue){throw 'Unknown task run level; refusing lifecycle action'}
+}"#
+}
+
 fn task_guard(config: &Registration) -> Result<String> {
     let task = ps_literal(&name(config))?;
     let owner = ps_literal(&config.owner)?;
@@ -570,6 +578,7 @@ fn task_guard(config: &Registration) -> Result<String> {
     let args = ps_literal(&arguments(config)?)?;
     Ok(format!(
         r#"
+{runlevel_guard}
 function Sid($value){{try{{if($value -match '^S-\d-'){{return ([Security.Principal.SecurityIdentifier]::new($value)).Value}};return ([Security.Principal.NTAccount]::new($value)).Translate([Security.Principal.SecurityIdentifier]).Value}}catch{{return $null}}}}
 $scheduler=[Activator]::CreateInstance([Type]::GetTypeFromProgID('Schedule.Service'));[Console]::Out.WriteLine('rsrs-control-stage:com-created');$scheduler.Connect();[Console]::Out.WriteLine('rsrs-control-stage:com-connected');$folder=$scheduler.GetFolder('\');$t=$null;
 try{{$t=$folder.GetTask({task})}}catch{{$failure=$_.Exception;while($null -ne $failure.InnerException){{$failure=$failure.InnerException}};if($failure.HResult -ne -2147024894){{throw}}}}
@@ -588,7 +597,7 @@ if($null -ne $t){{
  [Console]::Out.WriteLine('rsrs-control-stage:principal-sid');if((Sid (Text $p[0] 't:UserId')) -cne {owner}){{throw 'Unknown task principal; refusing lifecycle action'}};
  [Console]::Out.WriteLine('rsrs-control-stage:principal-logon');if((Text $p[0] 't:LogonType') -cne 'InteractiveToken'){{throw 'Unknown task logon type; refusing lifecycle action'}};
  [Console]::Out.WriteLine('rsrs-control-stage:principal-runlevel');if((Text $p[0] 't:RunLevel') -eq '' -and $t.Definition.Principal.RunLevel -eq 0){{[Console]::Out.WriteLine('rsrs-control-stage:principal-runlevel-omitted-limited')}};
- if((Text $p[0] 't:RunLevel') -cne 'LeastPrivilege'){{throw 'Unknown task run level; refusing lifecycle action'}};
+ RequireLimited (Text $p[0] 't:RunLevel') $t.Definition.Principal.RunLevel;
  [Console]::Out.WriteLine('rsrs-control-stage:trigger-sid');if((Sid (Text $g[0] 't:UserId')) -cne {owner}){{throw 'Unknown task trigger identity; refusing lifecycle action'}};
  $arguments=Text $a[0] 't:Arguments';
  [Console]::Out.WriteLine('rsrs-control-stage:action-executable');if(-not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath((Text $a[0] 't:Command')),[IO.Path]::GetFullPath({exe}))){{throw 'Unknown task executable; refusing lifecycle action'}};
@@ -600,7 +609,8 @@ if($null -ne $t){{
 [Console]::Out.WriteLine('rsrs-control-stage:task-validated');
 
 "#,
-        description = ps_literal(&format!("Respire current-user runtime {}", config.id))?
+        description = ps_literal(&format!("Respire current-user runtime {}", config.id))?,
+        runlevel_guard = task_runlevel_guard()
     ))
 }
 
@@ -1243,6 +1253,22 @@ mod tests {
         }
         Ok(())
     }
+    #[cfg(windows)]
+    #[test]
+    fn scheduler_default_runlevel_requires_effective_limited_and_rejects_unknown_values() -> Result<()> {
+        let script = format!(r#"{}
+$cases=@(
+ @{{xml='';value=0;allowed=$true}},@{{xml='LeastPrivilege';value=0;allowed=$true}},
+ @{{xml='HighestAvailable';value=0;allowed=$false}},@{{xml='';value=1;allowed=$false}},
+ @{{xml='LeastPrivilege';value=1;allowed=$false}},@{{xml='';value=$null;allowed=$false}},
+ @{{xml='';value='0';allowed=$false}},@{{xml='';value=$false;allowed=$false}},
+ @{{xml='unknown';value=0;allowed=$false}},@{{xml='LeastPrivilege';value=-1;allowed=$false}});
+foreach($case in $cases){{$accepted=$true;try{{RequireLimited $case.xml $case.value}}catch{{$accepted=$false}};if($accepted -ne $case.allowed){{throw 'Effective task run-level contract failed'}}}};
+[Console]::Out.WriteLine('limited-runlevel-contract:passed');"#,task_runlevel_guard());
+        anyhow::ensure!(powershell(script)?.trim() == "limited-runlevel-contract:passed");
+        Ok(())
+    }
+
     #[cfg(windows)]
     #[test]
     fn scheduler_validates_unicode_xml_variants_without_registering_a_task() -> Result<()> {
