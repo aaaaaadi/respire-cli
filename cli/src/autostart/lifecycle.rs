@@ -9,8 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -315,6 +314,7 @@ pub(crate) fn restart_maintenance_locked() -> Result<Maintenance> {
     owned(&config)?;
     config.manually_stopped = false;
     save(&mut config)?;
+    reset_attempts(&config)?;
     Maintenance::begin(config, true)
 }
 
@@ -554,6 +554,124 @@ fn new_registration() -> Result<Registration> {
     })
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Attempts {
+    schema: u32,
+    id: String,
+    starts: Vec<u64>,
+}
+
+fn attempts_path(root: &Path) -> PathBuf {
+    control_path(root).with_file_name("launch-attempts.json")
+}
+fn read_attempts(config: &Registration) -> Result<(Attempts, Option<String>)> {
+    let path = attempts_path(&config.installation);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((
+                Attempts {
+                    schema: 1,
+                    id: config.id.clone(),
+                    starts: Vec::new(),
+                },
+                None,
+            ))
+        }
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= 4096,
+        "invalid runtime launch budget"
+    );
+    let bytes = fs::read(path)?;
+    let value: Attempts = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(
+        value.schema == 1 && value.id == config.id && value.starts.len() <= 3,
+        "runtime launch budget belongs to an unknown registration"
+    );
+    Ok((value, Some(hash(&bytes))))
+}
+fn record_attempt(config: &Registration, now: u64) -> Result<bool> {
+    let (mut attempts, digest) = read_attempts(config)?;
+    attempts
+        .starts
+        .retain(|started| now.saturating_sub(*started) < 120);
+    if attempts.starts.len() >= 3 {
+        return Ok(false);
+    }
+    attempts.starts.push(now);
+    private_write(
+        &attempts_path(&config.installation),
+        &serde_json::to_vec(&attempts)?,
+        digest.as_deref(),
+    )?;
+    Ok(true)
+}
+fn reset_attempts(config: &Registration) -> Result<()> {
+    let (mut attempts, digest) = read_attempts(config)?;
+    attempts.starts.clear();
+    private_write(
+        &attempts_path(&config.installation),
+        &serde_json::to_vec(&attempts)?,
+        digest.as_deref(),
+    )?;
+    manager::reset_backoff(config)
+}
+fn now_seconds() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs())
+}
+fn event(config: &Registration, name: &str) -> Result<()> {
+    // Fixed event names only. Never serialize command arguments, errors,
+    // environment values, account identifiers or recovery material.
+    anyhow::ensure!(
+        ["starting", "paused", "crash_limit", "exit_ok", "exit_error"].contains(&name),
+        "unknown runtime event"
+    );
+    let path = control_path(&config.installation).with_file_name("events.jsonl");
+    let previous = match fs::symlink_metadata(&path) {
+        Ok(meta) => {
+            anyhow::ensure!(
+                meta.is_file() && !meta.file_type().is_symlink() && meta.len() <= 65536,
+                "invalid runtime event file"
+            );
+            Some(fs::read(&path)?)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let mut bytes = previous.clone().unwrap_or_default();
+    let mut line = serde_json::to_vec(
+        &json!({"schema":1,"id":config.id,"pid":std::process::id(),"version":env!("CARGO_PKG_VERSION"),"time":now_seconds()?,"event":name}),
+    )?;
+    line.push(b'\n');
+    if bytes.len() + line.len() > 65536 {
+        let backup = path.with_file_name("events.previous.jsonl");
+        let prior_backup = match fs::symlink_metadata(&backup) {
+            Ok(meta) => {
+                anyhow::ensure!(
+                    meta.is_file() && !meta.file_type().is_symlink() && meta.len() <= 65536,
+                    "invalid runtime event backup"
+                );
+                Some(fs::read(&backup)?)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        private_write(
+            &backup,
+            &bytes,
+            prior_backup.as_ref().map(|v| hash(v)).as_deref(),
+        )?;
+        bytes.clear();
+    }
+    bytes.extend(line);
+    private_write(&path, &bytes, previous.as_ref().map(|v| hash(v)).as_deref())
+}
+
 fn status() -> Result<Value> {
     let mut value = disabled_status()?;
     let root = respire::service::main_data_dir();
@@ -622,6 +740,7 @@ pub(crate) fn execute(command: &RuntimeCommand) -> Result<()> {
                 owned(&config)?;
                 config.manually_stopped = false;
                 save(&mut config)?;
+                reset_attempts(&config)?;
             }
             crate::rpc::ensure_daemon_locked()?;
             emit("runtime.start", status()?)
@@ -655,6 +774,7 @@ fn enable(now: bool) -> Result<()> {
         crate::mcp::materialize_bin().map_err(anyhow::Error::msg)?;
         let config = guard.config.as_mut().context("registration missing")?;
         manager::install(config)?;
+        reset_attempts(config)?;
         config.enabled = true;
         save(config)?;
         if now || was_running {
@@ -733,9 +853,15 @@ fn run_foreground(id: Option<&str>, root: Option<&Path>) -> Result<()> {
         std::env::set_var("USERPROFILE", &config.user_home);
         if let Some(value) = marker(&config.installation)? {
             if value.phase == Phase::Paused || !controller_alive(&value)? {
+                event(&config, "paused")?;
                 return Ok(());
             }
         }
+        if !record_attempt(&config, now_seconds()?)? {
+            event(&config, "crash_limit")?;
+            return Ok(());
+        }
+        event(&config, "starting")?;
         MANAGED_ID
             .set(id.to_owned())
             .map_err(|_| anyhow::anyhow!("managed runtime already initialized"))?;
@@ -760,12 +886,25 @@ fn run_foreground(id: Option<&str>, root: Option<&Path>) -> Result<()> {
             let _ = crate::net_rpc::request_stop_with_timeout(Duration::from_secs(5));
         });
     }
-    crate::rpc::runtime_entry(crate::rpc::RuntimeFlags {
+    let result = crate::rpc::runtime_entry(crate::rpc::RuntimeFlags {
         port: Some(crate::net_rpc::rpc_port()),
         host: "127.0.0.1".into(),
         status: false,
         stop: false,
-    })
+    });
+    if managed_id().is_some() {
+        let config = read_registration(&respire::service::main_data_dir())?
+            .context("managed runtime registration disappeared")?;
+        event(
+            &config,
+            if result.is_ok() {
+                "exit_ok"
+            } else {
+                "exit_error"
+            },
+        )?;
+    }
+    result
 }
 
 #[cfg(test)]
@@ -822,6 +961,149 @@ mod tests {
         fs::remove_file(path)?;
         anyhow::ensure!(!background_paused());
         check_direct_access()?;
+        Ok(())
+    }
+
+    #[test]
+    fn managed_launch_budget_is_bounded_persistent_and_registration_scoped() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = super::super::tests::fixture(Platform::current()?);
+        config.installation = dir.path().canonicalize()?;
+        anyhow::ensure!(record_attempt(&config, 100)?);
+        anyhow::ensure!(record_attempt(&config, 101)?);
+        anyhow::ensure!(record_attempt(&config, 102)?);
+        anyhow::ensure!(!record_attempt(&config, 103)?);
+        anyhow::ensure!(
+            !record_attempt(&config, 99)?,
+            "clock reversal must not reopen the budget"
+        );
+        anyhow::ensure!(record_attempt(&config, 222)?);
+        let (value, _) = read_attempts(&config)?;
+        anyhow::ensure!(value.starts == vec![222]);
+        config.id = "another-installation".into();
+        anyhow::ensure!(read_attempts(&config).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_events_are_bounded_fixed_fields_and_private() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = super::super::tests::fixture(Platform::current()?);
+        config.installation = dir.path().canonicalize()?;
+        event(&config, "starting")?;
+        anyhow::ensure!(event(&config, "secret-error-message").is_err());
+        let path = control_path(&config.installation).with_file_name("events.jsonl");
+        let bytes = fs::read(&path)?;
+        let value: Value = serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(value.as_object().context("event object missing")?.len() == 6);
+        anyhow::ensure!(value["event"] == "starting" && value["id"] == config.id);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            anyhow::ensure!(fs::metadata(&path)?.permissions().mode() & 0o777 == 0o600);
+        }
+        fs::write(&path, vec![b' '; 65500])?;
+        event(&config, "exit_ok")?;
+        anyhow::ensure!(fs::metadata(&path)?.len() < 1024);
+        anyhow::ensure!(fs::metadata(path.with_file_name("events.previous.jsonl"))?.len() == 65500);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicit_restart_recovers_every_phase_and_clears_manual_stop() -> Result<()> {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("test environment lock poisoned"))?;
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                ACTIVE.with(|slot| *slot.borrow_mut() = None);
+                for (key, value) in &self.0 {
+                    match value {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(
+            ["RSRS_DATA_DIR", "RSRS_BIN_DIR", "RSRS_RPC_PORT"]
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+        );
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        std::env::set_var("RSRS_DATA_DIR", &root);
+        std::env::set_var("RSRS_BIN_DIR", root.join("bin"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        std::env::set_var("RSRS_RPC_PORT", listener.local_addr()?.port().to_string());
+        drop(listener);
+        let mut config = super::super::tests::fixture(Platform::Linux);
+        config.installation = root.clone();
+        config.user_home = root.join("home");
+        config.executable = root.join("bin/rsrs");
+        config.id = identity(&root, &config.owner);
+        config.enabled = true;
+        let (_scope, _) = manager::test_adapter::install(&config);
+        manager::install(&mut config)?;
+        save(&mut config)?;
+        for phase in [Phase::Paused, Phase::Starting, Phase::Verified] {
+            let current = read_registration(&root)?.context("test registration missing")?;
+            let mut interrupted = Maintenance::begin(current, false)?;
+            interrupted.mark(phase)?;
+            let old_token = interrupted
+                .marker
+                .as_ref()
+                .context("test marker missing")?
+                .token
+                .clone();
+            drop(interrupted);
+            anyhow::ensure!(check_direct_access().is_err() && background_paused());
+            let current = read_registration(&root)?.context("test registration missing")?;
+            anyhow::ensure!(Maintenance::begin(current, false).is_err());
+            let mut recovered = restart_maintenance_locked()?;
+            anyhow::ensure!(
+                recovered
+                    .marker
+                    .as_ref()
+                    .context("test recovery marker missing")?
+                    .token
+                    != old_token
+            );
+            authorize_detached_boot_locked()?;
+            recovered.finish()?;
+            anyhow::ensure!(marker(&root)?.is_none() && !background_paused());
+        }
+        anyhow::ensure!(stop_managed_locked()?);
+        anyhow::ensure!(
+            read_registration(&root)?
+                .context("test registration missing")?
+                .manually_stopped
+        );
+        let mut restarted = restart_maintenance_locked()?;
+        anyhow::ensure!(
+            !read_registration(&root)?
+                .context("test registration missing")?
+                .manually_stopped
+        );
+        restarted.finish()?;
+        // Failure after marking verified must retain a fence, not silently let
+        // new background or direct work run against a partially committed plan.
+        let current = read_registration(&root)?.context("test registration missing")?;
+        let mut interrupted = Maintenance::begin(current, false)?;
+        interrupted.mark(Phase::Starting)?;
+        let path = control_path(&root);
+        let mut bytes = fs::read(&path)?;
+        bytes.push(b' ');
+        fs::write(path, bytes)?;
+        anyhow::ensure!(interrupted.finish().is_err());
+        drop(interrupted);
+        anyhow::ensure!(background_paused() && check_direct_access().is_err());
+        let mut recovered = restart_maintenance_locked()?;
+        recovered.finish()?;
+        anyhow::ensure!(!background_paused());
         Ok(())
     }
 

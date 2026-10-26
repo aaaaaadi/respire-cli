@@ -82,7 +82,20 @@ fn program(name: &str) -> Result<PathBuf> {
     bail!("current-user service manager program unavailable: {name}")
 }
 
+#[cfg(test)]
+type TestControl = Box<dyn FnMut(&str, &[String]) -> Result<Output>>;
+#[cfg(test)]
+thread_local! { static TEST_CONTROL: std::cell::RefCell<Option<TestControl>> = const { std::cell::RefCell::new(None) }; }
+
 fn control(name: &str, arguments: &[String]) -> Result<Output> {
+    #[cfg(test)]
+    if let Some(output) = TEST_CONTROL.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .map(|handler| handler(name, arguments))
+    }) {
+        return output;
+    }
     let mut command = Command::new(program(name)?);
     command
         .args(arguments)
@@ -590,6 +603,17 @@ pub(super) fn install(config: &mut Registration) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn reset_backoff(config: &Registration) -> Result<()> {
+    let state = inspect(config)?;
+    if state.registered && config.platform == Platform::Linux {
+        checked(
+            "systemctl",
+            vec!["--user".into(), "reset-failed".into(), name(config)],
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn start(config: &Registration) -> Result<()> {
     let current = inspect(config)?;
     anyhow::ensure!(
@@ -720,6 +744,68 @@ pub(super) fn remove(config: &Registration) -> Result<()> {
     Ok(())
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(super) mod test_adapter {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    #[derive(Default)]
+    pub struct Fake {
+        pub registered: bool,
+        pub enabled: bool,
+        pub running: bool,
+        pub dropin: bool,
+        pub fail: Option<String>,
+        pub changes: Vec<String>,
+    }
+    pub struct Scope;
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            TEST_CONTROL.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    pub fn install(config: &Registration) -> (Scope, Rc<RefCell<Fake>>) {
+        let state = Rc::new(RefCell::new(Fake::default()));
+        let shared = state.clone();
+        let config = config.clone();
+        TEST_CONTROL.with(|slot| *slot.borrow_mut() = Some(Box::new(move |name,args| {
+            let mut state = shared.borrow_mut();
+            let ok = |stdout:String| Ok(Output{code:0,stdout});
+            match name {
+                "id" => ok(config.owner.clone()),
+                "systemctl" => {
+                    anyhow::ensure!(args.first().map(String::as_str) == Some("--user"), "fake refuses non-user operation");
+                    let operation = args.get(1).context("manager operation missing")?;
+                    if state.fail.as_ref() == Some(operation) { return Ok(Output{code:1,stdout:String::new()}); }
+                    if operation == "show" { return ok(format!("LoadState={}\nActiveState={}\nMainPID=0\nFragmentPath={}\nUnitFileState={}\n", if state.registered {"loaded"}else{"not-found"},if state.running {"active"}else{"inactive"},item(&config).display(),if state.enabled {"enabled"}else{"disabled"})); }
+                    state.changes.push(operation.clone());
+                    match operation.as_str() {
+                        "link" => state.registered = true,
+                        "enable" => state.enabled = true,
+                        "disable" => state.enabled = false,
+                        "start" => state.running = true,
+                        "stop" => state.running = false,
+                        "daemon-reload" => {if !item(&config).exists() {state.registered=false;}},
+                        "reset-failed" => {},
+                        _ => bail!("unexpected fake operation"),
+                    }
+                    ok(String::new())
+                },
+                "busctl" => {
+                    if args.iter().any(|v|v == "GetUnit") { return ok(serde_json::json!({"data":["/org/freedesktop/systemd1/unit/test"]}).to_string()); }
+                    match args.last().map(String::as_str) {
+                        Some("DropInPaths") => ok(serde_json::json!({"data":if state.dropin {vec!["/tmp/unknown.conf"]}else{vec![]}}).to_string()),
+                        Some("ExecStart") => ok(serde_json::json!({"data":[[config.executable,[config.executable,"runtime","run","--managed",config.id,"--installation-root",config.installation],false,0,0,0,0,0,0,0]]}).to_string()),
+                        _ => bail!("unexpected fake property"),
+                    }
+                },
+                _ => bail!("unexpected fake program"),
+            }
+        })));
+        (Scope, state)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -786,6 +872,42 @@ mod tests {
         )
         .is_err());
         anyhow::ensure!(launchd_enabled("unrecognized", "ai.risense.test").is_err());
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn user_manager_lifecycle_refuses_loaded_overrides_and_preserves_data() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let mut config = super::super::tests::fixture(Platform::Linux);
+        config.installation = temporary.path().canonicalize()?;
+        config.user_home = config.installation.join("home");
+        config.executable = config.installation.join("bin/rsrs");
+        let (_scope, state) = test_adapter::install(&config);
+        anyhow::ensure!(!inspect(&config)?.registered);
+        install(&mut config)?;
+        anyhow::ensure!(inspect(&config)?.enabled);
+        start(&config)?;
+        anyhow::ensure!(inspect(&config)?.running);
+        let changes = state.borrow().changes.len();
+        state.borrow_mut().dropin = true;
+        anyhow::ensure!(stop(&config).is_err());
+        anyhow::ensure!(remove(&config).is_err());
+        anyhow::ensure!(state.borrow().changes.len() == changes && item(&config).exists());
+        state.borrow_mut().dropin = false;
+        anyhow::ensure!(
+            remove(&config).is_err(),
+            "running service must not be removed"
+        );
+        stop(&config)?;
+        disable(&config)?;
+        reset_backoff(&config)?;
+        anyhow::ensure!(!inspect(&config)?.enabled && !inspect(&config)?.running);
+        let preserved = config.installation.join("library.db");
+        std::fs::write(&preserved, b"synthetic data")?;
+        remove(&config)?;
+        anyhow::ensure!(!item(&config).exists() && std::fs::read(preserved)? == b"synthetic data");
+        config.artifact_hashes.clear();
+        anyhow::ensure!(!inspect(&config)?.registered);
         Ok(())
     }
     #[test]
