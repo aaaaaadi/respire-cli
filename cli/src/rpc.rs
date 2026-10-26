@@ -1300,6 +1300,9 @@ fn serve(flags: RuntimeFlags) -> Result<()> {
     RUNNING.store(0, Ordering::Release);
     std::thread::Builder::new()
         .name("respire-dispatch".into())
+        // Services do not inherit a terminal's RUST_MIN_STACK. Context-query
+        // parsing needs the same explicit stack as the command workers.
+        .stack_size(16 * 1024 * 1024)
         .spawn(move || dispatch_loop(rx, limit, idle, library))
         .context("failed to start the runtime dispatcher")?;
     // Keep the host entry alive on its actual listener. Drain/worker shutdown

@@ -87,6 +87,12 @@ def main():
                 assert health and health["store_ready"], "store never became ready"
                 assert health["pid"] == child.pid and health["managed_id"] is None
                 assert Path(health["installation_root"]).resolve() == root.resolve()
+                # No inherited RUST_MIN_STACK: the actual dispatch thread must
+                # support context-query parsing without terminating its host.
+                query=command("--client-only","config")
+                assert query.returncode == 0, f"foreground context RPC failed: {query.stdout} {query.stderr}"
+                assert json.loads(query.stdout)["summary"]["autosync"] is False
+                assert child.poll() is None, "context RPC terminated the foreground host"
                 stopped = command("runtime", "stop")
                 assert stopped.returncode == 0, stopped.stderr
                 assert child.wait(timeout=20) == 0
