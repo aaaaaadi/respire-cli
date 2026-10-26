@@ -1,0 +1,579 @@
+//! Current-user OS adapters. The only accepted registrations have our exact owner,
+//! installation-specific name, executable and arguments; never use elevation.
+use super::{hash, plain_value, private_write, render, Platform, Registration};
+use anyhow::{bail, Context, Result};
+use serde::Serialize;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Serialize)]
+pub(super) struct State {
+    pub registered: bool,
+    pub loaded: bool,
+    pub running: bool,
+    pub enabled: bool,
+}
+
+struct Output {
+    code: i32,
+    stdout: String,
+}
+
+fn program(name: &str) -> Result<PathBuf> {
+    if name == "powershell" {
+        let root = std::env::var_os("SystemRoot").context("Windows SystemRoot unavailable")?;
+        let path = PathBuf::from(root).join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        anyhow::ensure!(path.is_file(), "Windows PowerShell unavailable");
+        return Ok(path);
+    }
+    for base in ["/usr/bin", "/bin"] {
+        let path = Path::new(base).join(name);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    bail!("current-user service manager program unavailable: {name}")
+}
+
+fn control(name: &str, arguments: &[String]) -> Result<Output> {
+    let mut command = Command::new(program(name)?);
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env_clear();
+    for key in [
+        "HOME",
+        "USERPROFILE",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "LC_ALL",
+        "SystemRoot",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    command.env(
+        "PATH",
+        if cfg!(windows) {
+            std::env::var_os("SystemRoot")
+                .map(|root| PathBuf::from(root).join("System32"))
+                .unwrap_or_default()
+        } else {
+            PathBuf::from("/usr/bin:/bin")
+        },
+    );
+    let mut child = command
+        .spawn()
+        .context("could not invoke current-user service manager")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("service manager stdout missing")?;
+    let (tx, rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut data = Vec::new();
+        let result = stdout.take(65537).read_to_end(&mut data).map(|_| data);
+        let _ = tx.send(result);
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child
+                .kill()
+                .context("could not stop timed-out service manager client")?;
+            child.wait()?;
+            bail!(
+                "current-user service manager request timed out; inspect its state before retrying"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let bytes = rx
+        .recv_timeout(Duration::from_secs(1))
+        .context("service manager output did not close")??;
+    anyhow::ensure!(
+        bytes.len() <= 65536,
+        "service manager response exceeded limit"
+    );
+    Ok(Output {
+        code: status.code().unwrap_or(-1),
+        stdout: String::from_utf8(bytes).context("service manager returned invalid UTF-8")?,
+    })
+}
+
+fn checked(name: &str, args: Vec<String>) -> Result<String> {
+    let result = control(name, &args)?;
+    anyhow::ensure!(
+        result.code == 0,
+        "{name} current-user operation failed (exit {}); inspect the owned registration",
+        result.code
+    );
+    Ok(result.stdout)
+}
+
+fn ps_literal(value: &str) -> Result<String> {
+    plain_value(value)?;
+    Ok(format!("'{}'", value.replace('\'', "''")))
+}
+
+fn powershell(script: String) -> Result<String> {
+    checked("powershell",vec!["-NoLogo".into(),"-NoProfile".into(),"-NonInteractive".into(),"-Command".into(),format!("$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);{script}")])
+}
+
+pub(super) fn owner() -> Result<String> {
+    let value = if cfg!(windows) {
+        powershell("[Security.Principal.WindowsIdentity]::GetCurrent().User.Value".into())?
+    } else {
+        checked("id", vec!["-u".into()])?
+    };
+    let value = value.trim();
+    anyhow::ensure!(
+        !value.is_empty()
+            && if cfg!(windows) {
+                value.starts_with("S-")
+                    && value
+                        .chars()
+                        .all(|c| c == 'S' || c == '-' || c.is_ascii_digit())
+            } else {
+                value.chars().all(|c| c.is_ascii_digit())
+            },
+        "could not identify current-user service owner"
+    );
+    Ok(value.to_owned())
+}
+
+pub(super) fn item(config: &Registration) -> PathBuf {
+    match config.platform {
+        Platform::Linux => config
+            .user_home
+            .join(".config/systemd/user")
+            .join(format!("respire-runtime-{}.service", config.id)),
+        Platform::Macos => config
+            .user_home
+            .join("Library/LaunchAgents")
+            .join(format!("ai.risense.respire.runtime.{}.plist", config.id)),
+        Platform::Windows => super::control_path(&config.installation).with_file_name("task.xml"),
+    }
+}
+
+fn name(config: &Registration) -> String {
+    match config.platform {
+        Platform::Linux => format!("respire-runtime-{}.service", config.id),
+        Platform::Macos => format!("ai.risense.respire.runtime.{}", config.id),
+        Platform::Windows => format!("Respire-runtime-{}", config.id),
+    }
+}
+
+fn domain(config: &Registration) -> String {
+    format!("gui/{}", config.owner)
+}
+fn label(config: &Registration) -> String {
+    format!("{}/{}", domain(config), name(config))
+}
+
+fn file_guard(config: &Registration) -> Result<()> {
+    anyhow::ensure!(
+        config.owner == owner()?,
+        "autostart belongs to another OS user"
+    );
+    let path = item(config);
+    if let Some(expected) = config.artifact_hashes.get("service") {
+        let metadata = std::fs::symlink_metadata(&path)?;
+        anyhow::ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= 65536,
+            "autostart service file is not a bounded regular file"
+        );
+        anyhow::ensure!(
+            hash(&std::fs::read(&path)?) == *expected,
+            "autostart service file changed; refusing overwrite or removal"
+        );
+    } else {
+        anyhow::ensure!(
+            !path.try_exists()?,
+            "unknown autostart service file; refusing replacement"
+        );
+    }
+    Ok(())
+}
+
+// Windows argv quoting follows CommandLineToArgvW, including trailing slashes.
+pub(super) fn windows_argument(value: &str) -> Result<String> {
+    plain_value(value)?;
+    let mut result = String::from("\"");
+    let mut slashes = 0;
+    for c in value.chars() {
+        if c == '\\' {
+            slashes += 1;
+            continue;
+        }
+        result.push_str(&"\\".repeat(if c == '"' { slashes * 2 + 1 } else { slashes }));
+        result.push(c);
+        slashes = 0;
+    }
+    result.push_str(&"\\".repeat(slashes * 2));
+    result.push('"');
+    Ok(result)
+}
+
+fn arguments(config: &Registration) -> Result<String> {
+    Ok(format!(
+        "runtime run --managed {} --installation-root {}",
+        windows_argument(&config.id)?,
+        windows_argument(
+            config
+                .installation
+                .to_str()
+                .context("non-UTF8 installation")?
+        )?
+    ))
+}
+
+fn task_guard(config: &Registration) -> Result<String> {
+    let task = ps_literal(&name(config))?;
+    let owner = ps_literal(&config.owner)?;
+    let exe = ps_literal(config.executable.to_str().context("non-UTF8 executable")?)?;
+    let root = ps_literal(
+        config
+            .installation
+            .to_str()
+            .context("non-UTF8 installation")?,
+    )?;
+    let args = ps_literal(&arguments(config)?)?;
+    Ok(format!(
+        r#"
+function Sid($value){{try{{if($value -match '^S-\d-'){{return ([Security.Principal.SecurityIdentifier]::new($value)).Value}};return ([Security.Principal.NTAccount]::new($value)).Translate([Security.Principal.SecurityIdentifier]).Value}}catch{{return $null}}}}
+$t=Get-ScheduledTask -TaskName {task} -TaskPath '\' -ErrorAction SilentlyContinue;
+if($null -ne $t){{
+ $a=@($t.Actions);$g=@($t.Triggers);
+ if((Sid $t.Principal.UserId) -cne {owner} -or $t.Principal.LogonType -ne 'Interactive' -or $t.Principal.RunLevel -ne 'Limited' -or $a.Count -ne 1 -or $g.Count -ne 1 -or $g[0].CimClass.CimClassName -ne 'MSFT_TaskLogonTrigger' -or (Sid $g[0].UserId) -cne {owner}){{throw 'Unknown task principal/trigger; refusing lifecycle action'}};
+ if(-not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($a[0].Execute),[IO.Path]::GetFullPath({exe})) -or $a[0].Arguments -cne {args} -or -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($a[0].WorkingDirectory),[IO.Path]::GetFullPath({root}))){{throw 'Unknown task action; refusing lifecycle action'}};
+ if($t.Description -cne {description}){{throw 'Unknown task marker; refusing lifecycle action'}};
+}}
+"#,
+        description = ps_literal(&format!("Respire current-user runtime {}", config.id))?
+    ))
+}
+
+pub(super) fn inspect(config: &Registration) -> Result<State> {
+    file_guard(config)?;
+    match config.platform {
+        Platform::Linux => {
+            let output = control(
+                "systemctl",
+                &[
+                    "--user".into(),
+                    "show".into(),
+                    name(config),
+                    "--no-pager".into(),
+                    "--property=LoadState,ActiveState,MainPID,FragmentPath,UnitFileState".into(),
+                ],
+            )?;
+            anyhow::ensure!(
+                output.code == 0 || output.code == 4,
+                "systemd user session unavailable; no system/linger fallback is performed"
+            );
+            let fields: std::collections::BTreeMap<_, _> = output
+                .stdout
+                .lines()
+                .filter_map(|line| line.split_once('='))
+                .collect();
+            let registered = fields.get("LoadState").is_some_and(|v| *v != "not-found");
+            if registered {
+                let fragment = fields
+                    .get("FragmentPath")
+                    .context("systemd unit path missing")?;
+                anyhow::ensure!(
+                    Path::new(fragment) == item(config),
+                    "unknown systemd user unit path; refusing lifecycle action"
+                );
+            }
+            Ok(State {
+                registered,
+                loaded: registered,
+                running: fields.get("ActiveState") == Some(&"active"),
+                enabled: fields
+                    .get("UnitFileState")
+                    .is_some_and(|v| matches!(*v, "enabled" | "enabled-runtime")),
+            })
+        }
+        Platform::Macos => {
+            let output = control("launchctl", &["print".into(), label(config)])?;
+            if output.code != 0 {
+                checked("launchctl", vec!["print".into(), domain(config)])?;
+                anyhow::ensure!(
+                    [3, 113].contains(&output.code),
+                    "LaunchAgent query failed; refusing lifecycle action"
+                );
+                return Ok(State {
+                    registered: item(config).is_file(),
+                    loaded: false,
+                    running: false,
+                    enabled: config.enabled,
+                });
+            }
+            let property = |key: &str| {
+                output
+                    .stdout
+                    .lines()
+                    .find_map(|line| line.trim().strip_prefix(&format!("{key} = ")))
+                    .map(|v| v.trim_matches('"'))
+            };
+            anyhow::ensure!(
+                property("path").is_some_and(|v| Path::new(v) == item(config)),
+                "unknown loaded LaunchAgent path; refusing lifecycle action"
+            );
+            anyhow::ensure!(
+                property("program").is_some_and(|v| Path::new(v) == config.executable),
+                "unknown loaded LaunchAgent program; refusing lifecycle action"
+            );
+            let args = output
+                .stdout
+                .split("arguments = {\n")
+                .nth(1)
+                .and_then(|s| s.split("\n\t}").next())
+                .context("loaded LaunchAgent arguments unavailable")?;
+            let actual: Vec<_> = args.lines().map(|v| v.trim().trim_matches('"')).collect();
+            let expected = [
+                config.executable.to_str().context("non-UTF8 executable")?,
+                "runtime",
+                "run",
+                "--managed",
+                &config.id,
+                "--installation-root",
+                config
+                    .installation
+                    .to_str()
+                    .context("non-UTF8 installation")?,
+            ];
+            anyhow::ensure!(
+                actual == expected,
+                "loaded LaunchAgent arguments changed; refusing lifecycle action"
+            );
+            Ok(State {
+                registered: true,
+                loaded: true,
+                running: property("state") == Some("running"),
+                enabled: config.enabled,
+            })
+        }
+        Platform::Windows => {
+            let text=powershell(format!("{};[pscustomobject]@{{registered=($null -ne $t);loaded=($null -ne $t);running=($null -ne $t -and $t.State -eq 'Running');enabled=($null -ne $t -and $t.Settings.Enabled)}}|ConvertTo-Json -Compress",task_guard(config)?))?;
+            let v: serde_json::Value =
+                serde_json::from_str(text.trim_start_matches('\u{feff}').trim())?;
+            let boolean = |key| v[key].as_bool().context("invalid scheduled task status");
+            Ok(State {
+                registered: boolean("registered")?,
+                loaded: boolean("loaded")?,
+                running: boolean("running")?,
+                enabled: boolean("enabled")?,
+            })
+        }
+    }
+}
+
+pub(super) fn install(config: &mut Registration) -> Result<()> {
+    let before = inspect(config)?;
+    anyhow::ensure!(
+        !before.registered || config.artifact_hashes.contains_key("service"),
+        "unknown existing registration; refusing replacement"
+    );
+    let content = render(config)?;
+    private_write(
+        &item(config),
+        content.as_bytes(),
+        config.artifact_hashes.get("service").map(String::as_str),
+    )?;
+    config
+        .artifact_hashes
+        .insert("service".into(), hash(content.as_bytes()));
+    match config.platform {
+        Platform::Linux => {
+            checked(
+                "systemctl",
+                vec![
+                    "--user".into(),
+                    "link".into(),
+                    item(config).to_string_lossy().into_owned(),
+                ],
+            )?;
+            checked("systemctl", vec!["--user".into(), "daemon-reload".into()])?;
+            checked(
+                "systemctl",
+                vec!["--user".into(), "enable".into(), name(config)],
+            )?;
+        }
+        Platform::Macos => {
+            checked("launchctl", vec!["enable".into(), label(config)])?;
+        }
+        Platform::Windows => {
+            powershell(format!("{};$xml=[IO.File]::ReadAllText({});Register-ScheduledTask -TaskName {} -TaskPath '\' -Xml $xml {}|Out-Null",task_guard(config)?,ps_literal(item(config).to_str().context("non-UTF8 task path")?)?,ps_literal(&name(config))?,if before.registered{"-Force"}else{""}))?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn start(config: &Registration) -> Result<()> {
+    let current = inspect(config)?;
+    anyhow::ensure!(
+        current.registered,
+        "owned autostart registration is missing"
+    );
+    match config.platform {
+        Platform::Linux => {
+            checked(
+                "systemctl",
+                vec!["--user".into(), "start".into(), name(config)],
+            )?;
+        }
+        Platform::Macos => {
+            if !current.loaded {
+                checked(
+                    "launchctl",
+                    vec![
+                        "bootstrap".into(),
+                        domain(config),
+                        item(config).to_string_lossy().into_owned(),
+                    ],
+                )?;
+            } else if !current.running {
+                checked("launchctl", vec!["kickstart".into(), label(config)])?;
+            }
+        }
+        Platform::Windows => {
+            powershell(format!(
+                "{};Start-ScheduledTask -TaskName {} -TaskPath '\'",
+                task_guard(config)?,
+                ps_literal(&name(config))?
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn stop(config: &Registration) -> Result<()> {
+    let current = inspect(config)?;
+    match config.platform {
+        Platform::Linux => {
+            if current.registered {
+                checked(
+                    "systemctl",
+                    vec!["--user".into(), "stop".into(), name(config)],
+                )?;
+            }
+        }
+        Platform::Macos => {
+            if current.loaded {
+                checked("launchctl", vec!["bootout".into(), label(config)])?;
+            }
+        }
+        Platform::Windows => {
+            if current.running {
+                powershell(format!(
+                    "{};Stop-ScheduledTask -TaskName {} -TaskPath '\'",
+                    task_guard(config)?,
+                    ps_literal(&name(config))?
+                ))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn disable(config: &Registration) -> Result<()> {
+    let current = inspect(config)?;
+    match config.platform {
+        Platform::Linux => {
+            if current.registered {
+                checked(
+                    "systemctl",
+                    vec!["--user".into(), "disable".into(), name(config)],
+                )?;
+            }
+        }
+        Platform::Macos => {
+            checked("launchctl", vec!["disable".into(), label(config)])?;
+        }
+        Platform::Windows => {
+            if current.registered {
+                powershell(format!(
+                    "{};Disable-ScheduledTask -TaskName {} -TaskPath '\'|Out-Null",
+                    task_guard(config)?,
+                    ps_literal(&name(config))?
+                ))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn remove(config: &Registration) -> Result<()> {
+    let current = inspect(config)?;
+    anyhow::ensure!(
+        !current.running,
+        "stop the owned runtime before removing its startup registration"
+    );
+    match config.platform {
+        Platform::Linux => {
+            disable(config)?;
+        }
+        Platform::Macos => {
+            if current.loaded {
+                stop(config)?;
+            }
+            disable(config)?;
+        }
+        Platform::Windows => {
+            if current.registered {
+                powershell(format!(
+                    "{};Unregister-ScheduledTask -TaskName {} -TaskPath '\' -Confirm:$false",
+                    task_guard(config)?,
+                    ps_literal(&name(config))?
+                ))?;
+            }
+        }
+    }
+    file_guard(config)?;
+    if item(config).is_file() {
+        std::fs::remove_file(item(config))?;
+    }
+    if config.platform == Platform::Linux {
+        checked("systemctl", vec!["--user".into(), "daemon-reload".into()])?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn windows_quoting_and_task_guard_are_literal_and_current_user_only() -> Result<()> {
+        anyhow::ensure!(windows_argument("C:\\user folder\\")? == "\"C:\\user folder\\\\\"");
+        anyhow::ensure!(ps_literal("a';&b")? == "'a'';&b'");
+        let config = super::super::tests::fixture(Platform::Windows);
+        let script = task_guard(&config)?;
+        anyhow::ensure!(
+            script.contains("Interactive")
+                && script.contains("Limited")
+                && script.contains(".Arguments -cne")
+        );
+        anyhow::ensure!(
+            !script.contains("RunLevel Highest") && !script.contains("ExecutionPolicy Bypass")
+        );
+        Ok(())
+    }
+}

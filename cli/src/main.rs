@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 mod admission;
 mod app_version;
+mod autostart;
 mod bench;
 mod classify;
 mod classify_config;
