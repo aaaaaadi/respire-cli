@@ -2395,10 +2395,29 @@ pub(crate) fn ensure_daemon_locked() -> Result<()> {
     result
 }
 
+// A shutdown can finish before its HTTP acknowledgement is flushed. Never
+// replay the request: accept only an independently confirmed stopped owner.
+fn confirm_stop_outcome(request: Result<()>, confirm: impl FnOnce() -> Result<()>) -> Result<()> {
+    match request {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if matches!(error.downcast_ref::<crate::runtime_error::RuntimeError>(),
+                Some(crate::runtime_error::RuntimeError::Transport(_))) && confirm().is_ok() {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
 pub(crate) fn stop_occupant(pid: u32) -> Result<()> {
     let health = crate::net_rpc::health()?;
     anyhow::ensure!(health.pid == pid, "runtime owner changed before shutdown");
-    crate::net_rpc::request_stop()?;
+    confirm_stop_outcome(crate::net_rpc::request_stop(), || {
+        crate::net_rpc::wait_until_exited(pid)?;
+        crate::net_rpc::wait_until_down()
+    })?;
     if crate::autostart::lifecycle_boot_token().is_some() {
         let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline && crate::net_rpc::process_is_running(pid)? {
@@ -2453,6 +2472,24 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn shutdown_transport_requires_confirmed_exit_without_replay() {
+        use crate::runtime_error::RuntimeError;
+        assert!(confirm_stop_outcome(Err(RuntimeError::Transport("lost ack".into()).into()), || Ok(())).is_ok());
+        let rejected = confirm_stop_outcome(Err(RuntimeError::Transport("original lost ack".into()).into()), || anyhow::bail!("still alive"));
+        assert!(rejected.is_err_and(|error| error.to_string().contains("original lost ack")));
+        for error in [RuntimeError::Unauthorized, RuntimeError::Unavailable,
+            RuntimeError::TokenUnreadable("synthetic".into()),
+            RuntimeError::OutcomeUnknown { request_id: "synthetic".into(), detail: "unknown".into() }] {
+            let mut called = false;
+            assert!(confirm_stop_outcome(Err(error.into()), || { called = true; Ok(()) }).is_err());
+            assert!(!called, "non-transport failures must never become a successful stop");
+        }
+        let mut called = false;
+        assert!(confirm_stop_outcome(Ok(()), || { called = true; Ok(()) }).is_ok());
+        assert!(!called);
+    }
 
     fn req(method: &str, id: &str) -> RpcRequest {
         RpcRequest {

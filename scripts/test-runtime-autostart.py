@@ -109,7 +109,7 @@ def main():
         (off_root / "client.json").write_text(json.dumps({"service_mode":"off"}))
         off_env = dict(env, RSRS_DATA_DIR=str(off_root), RSRS_BIN_DIR=str(base/"off-bin"))
         try:
-            for argv in [("runtime","start"),("runtime","stop"),("runtime","restart")]:
+            for argv in [("runtime","start"),("runtime","stop")]*3+[("runtime","restart")]:
                 result = subprocess.run([binary,"--json",*argv],env=off_env,capture_output=True,text=True,timeout=45)
                 assert result.returncode == 0, f"off mode {argv}: {result.stdout} {result.stderr}"
                 assert not (off_root/"rsrs.db").exists() and not (off_root/"onememory.db").exists(), "off restart created a database"
@@ -148,8 +148,6 @@ def main():
                 # Kernel-backed process handles bind the exact instances; a
                 # stale PID or a Task Scheduler engine must never be killed.
                 import ctypes
-                import base64
-                import re
                 from ctypes import wintypes
                 assert os.name == "nt"
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health",timeout=5) as response:
@@ -179,11 +177,34 @@ def main():
                     return handle,(values[0].dwHighDateTime<<32)|values[0].dwLowDateTime
                 try:
                     child,child_birth=checked_process(current["pid"])
-                    script=f"$ErrorActionPreference='Stop';$p=Get-CimInstance Win32_Process -Filter 'ProcessId={current['pid']}';[Console]::Out.WriteLine([uint32]$p.ParentProcessId)"
-                    ps=Path(env["SystemRoot"])/"System32/WindowsPowerShell/v1.0/powershell.exe"
-                    result=subprocess.run([str(ps),"-NoProfile","-NonInteractive","-EncodedCommand",base64.b64encode(script.encode("utf-16le")).decode("ascii")],env=env,capture_output=True,text=True,timeout=20)
-                    assert result.returncode==0 and re.fullmatch(r"[0-9]+",result.stdout.strip()), "native supervisor parent unavailable"
-                    parent_pid=int(result.stdout.strip())
+                    class ProcessEntry(ctypes.Structure):
+                        _fields_=[("dwSize",wintypes.DWORD),("cntUsage",wintypes.DWORD),
+                            ("th32ProcessID",wintypes.DWORD),("th32DefaultHeapID",ctypes.c_size_t),
+                            ("th32ModuleID",wintypes.DWORD),("cntThreads",wintypes.DWORD),
+                            ("th32ParentProcessID",wintypes.DWORD),("pcPriClassBase",wintypes.LONG),
+                            ("dwFlags",wintypes.DWORD),("szExeFile",wintypes.WCHAR*260)]
+                    kernel.CreateToolhelp32Snapshot.argtypes=[wintypes.DWORD,wintypes.DWORD]
+                    kernel.CreateToolhelp32Snapshot.restype=wintypes.HANDLE
+                    for name in ("Process32FirstW","Process32NextW"):
+                        method=getattr(kernel,name)
+                        method.argtypes=[wintypes.HANDLE,ctypes.POINTER(ProcessEntry)]
+                        method.restype=wintypes.BOOL
+                    snapshot=kernel.CreateToolhelp32Snapshot(2,0)
+                    assert snapshot not in (None,ctypes.c_void_p(-1).value), "process snapshot unavailable"
+                    parent_pid=None
+                    try:
+                        entry=ProcessEntry();entry.dwSize=ctypes.sizeof(entry)
+                        available=kernel.Process32FirstW(snapshot,ctypes.byref(entry))
+                        for _ in range(65536):
+                            if not available:
+                                break
+                            if entry.th32ProcessID==current["pid"]:
+                                parent_pid=entry.th32ParentProcessID
+                                break
+                            available=kernel.Process32NextW(snapshot,ctypes.byref(entry))
+                    finally:
+                        kernel.CloseHandle(snapshot)
+                    assert parent_pid is not None, "owned child absent from process snapshot"
                     assert parent_pid != current["pid"]
                     parent,parent_birth=checked_process(parent_pid)
                     assert parent_birth <= child_birth, "supervisor PID was reused after the owned child started"
