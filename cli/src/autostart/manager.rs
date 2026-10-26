@@ -182,6 +182,99 @@ fn name(config: &Registration) -> String {
 fn domain(config: &Registration) -> String {
     format!("gui/{}", config.owner)
 }
+
+fn systemd_property(
+    config: &Registration,
+    interface: &str,
+    property: &str,
+) -> Result<serde_json::Value> {
+    let lookup = checked(
+        "busctl",
+        vec![
+            "--user".into(),
+            "--json=short".into(),
+            "call".into(),
+            "org.freedesktop.systemd1".into(),
+            "/org/freedesktop/systemd1".into(),
+            "org.freedesktop.systemd1.Manager".into(),
+            "GetUnit".into(),
+            "s".into(),
+            name(config),
+        ],
+    )?;
+    let object: serde_json::Value = serde_json::from_str(&lookup)?;
+    let path = object["data"][0]
+        .as_str()
+        .context("systemd unit object unavailable")?;
+    anyhow::ensure!(
+        path.starts_with("/org/freedesktop/systemd1/unit/"),
+        "unexpected systemd unit object"
+    );
+    let value = checked(
+        "busctl",
+        vec![
+            "--user".into(),
+            "--json=short".into(),
+            "get-property".into(),
+            "org.freedesktop.systemd1".into(),
+            path.into(),
+            interface.into(),
+            property.into(),
+        ],
+    )?;
+    Ok(serde_json::from_str(&value)?)
+}
+
+fn verify_systemd_loaded(
+    config: &Registration,
+    exec: &serde_json::Value,
+    dropins: &serde_json::Value,
+) -> Result<()> {
+    let overrides = dropins["data"][0]
+        .as_array()
+        .context("systemd loaded drop-in list unavailable")?;
+    anyhow::ensure!(
+        overrides.is_empty(),
+        "unknown systemd drop-in override; refusing lifecycle action"
+    );
+    let entries = exec["data"][0]
+        .as_array()
+        .context("systemd loaded ExecStart unavailable")?;
+    anyhow::ensure!(entries.len() == 1, "unknown systemd loaded ExecStart count");
+    let row = entries[0]
+        .as_array()
+        .context("invalid systemd loaded ExecStart")?;
+    let executable = config.executable.to_str().context("non-UTF8 executable")?;
+    anyhow::ensure!(
+        row.first().and_then(serde_json::Value::as_str) == Some(executable),
+        "systemd loaded executable changed; refusing lifecycle action"
+    );
+    let argv = row
+        .get(1)
+        .and_then(serde_json::Value::as_array)
+        .context("systemd loaded argv unavailable")?;
+    let expected = [
+        executable,
+        "runtime",
+        "run",
+        "--managed",
+        &config.id,
+        "--installation-root",
+        config
+            .installation
+            .to_str()
+            .context("non-UTF8 installation")?,
+    ];
+    anyhow::ensure!(
+        argv.len() == expected.len()
+            && argv
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| actual.as_str() == Some(expected)),
+        "systemd loaded arguments changed; refusing lifecycle action"
+    );
+    Ok(())
+}
 fn label(config: &Registration) -> String {
     format!("{}/{}", domain(config), name(config))
 }
@@ -301,6 +394,11 @@ pub(super) fn inspect(config: &Registration) -> Result<State> {
                     Path::new(fragment) == item(config),
                     "unknown systemd user unit path; refusing lifecycle action"
                 );
+                verify_systemd_loaded(
+                    config,
+                    &systemd_property(config, "org.freedesktop.systemd1.Service", "ExecStart")?,
+                    &systemd_property(config, "org.freedesktop.systemd1.Unit", "DropInPaths")?,
+                )?;
             }
             Ok(State {
                 registered,
@@ -560,6 +658,49 @@ pub(super) fn remove(config: &Registration) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn loaded_systemd_configuration_must_match_disk_identity_without_overrides() -> Result<()> {
+        let config = super::super::tests::fixture(Platform::Linux);
+        let row = serde_json::json!([
+            config.executable,
+            [
+                config.executable,
+                "runtime",
+                "run",
+                "--managed",
+                config.id,
+                "--installation-root",
+                config.installation
+            ],
+            false,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+        ]);
+        let exec = serde_json::json!({"data":[[row]]});
+        let clean = serde_json::json!({"data":[[]]});
+        verify_systemd_loaded(&config, &exec, &clean)?;
+        anyhow::ensure!(verify_systemd_loaded(
+            &config,
+            &exec,
+            &serde_json::json!({"data":[["/tmp/foreign.conf"]]})
+        )
+        .is_err());
+        let mut changed = exec.clone();
+        changed["data"][0][0][0] = serde_json::json!("/tmp/foreign");
+        anyhow::ensure!(verify_systemd_loaded(&config, &changed, &clean).is_err());
+        changed = exec.clone();
+        changed["data"][0][0][1][4] = serde_json::json!("another-installation");
+        anyhow::ensure!(verify_systemd_loaded(&config, &changed, &clean).is_err());
+        anyhow::ensure!(
+            verify_systemd_loaded(&config, &serde_json::json!({"data":[[]]}), &clean).is_err()
+        );
+        Ok(())
+    }
     #[test]
     fn windows_quoting_and_task_guard_are_literal_and_current_user_only() -> Result<()> {
         anyhow::ensure!(windows_argument("C:\\user folder\\")? == "\"C:\\user folder\\\\\"");

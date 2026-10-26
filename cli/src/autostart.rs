@@ -10,7 +10,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+mod lifecycle;
 mod manager;
+pub(crate) use lifecycle::current_boot_token as lifecycle_boot_token;
+pub(crate) use lifecycle::{
+    begin_maintenance_locked, check_direct_access, check_managed_request, ensure_managed_locked,
+    execute, managed_id, stop_managed_locked, verify_managed_boot,
+};
 
 #[derive(Debug, Subcommand)]
 pub enum RuntimeCommand {
@@ -45,6 +51,11 @@ pub enum AutostartCommand {
     },
     /// Disable future sign-in startup; stop the existing host only with --stop.
     Disable {
+        #[arg(long)]
+        stop: bool,
+    },
+    /// Remove only this installation's startup registration; preserve data and keys.
+    Remove {
         #[arg(long)]
         stop: bool,
     },
@@ -94,6 +105,8 @@ struct Registration {
     maintenance: bool,
     environment: BTreeMap<String, String>,
     artifact_hashes: BTreeMap<String, String>,
+    #[serde(skip)]
+    digest: Option<String>,
 }
 
 fn control_path(root: &Path) -> PathBuf {
@@ -129,8 +142,9 @@ fn read_registration(root: &Path) -> Result<Option<Registration>> {
         metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= 64 * 1024,
         "autostart registration must be a bounded regular file"
     );
-    let config: Registration =
-        serde_json::from_slice(&fs::read(&path)?).context("invalid autostart registration")?;
+    let bytes = fs::read(&path)?;
+    let mut config: Registration =
+        serde_json::from_slice(&bytes).context("invalid autostart registration")?;
     anyhow::ensure!(
         config.schema == 1 && config.platform == Platform::current()?,
         "unsupported autostart registration schema/platform"
@@ -147,6 +161,7 @@ fn read_registration(root: &Path) -> Result<Option<Registration>> {
         );
         plain_value(value)?;
     }
+    config.digest = Some(hash(&bytes));
     Ok(Some(config))
 }
 
@@ -298,6 +313,7 @@ mod tests {
             maintenance: false,
             environment: BTreeMap::new(),
             artifact_hashes: BTreeMap::new(),
+            digest: None,
         }
     }
 

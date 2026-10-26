@@ -270,7 +270,7 @@ fn is_cargo_test_bin(path: &Path) -> bool {
     text.contains("/deps/") || text.contains("/incremental/")
 }
 
-fn same_path(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
     fn canon(path: &Path) -> PathBuf {
         path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
     }

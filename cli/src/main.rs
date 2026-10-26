@@ -602,6 +602,11 @@ enum ModelAction {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Host-owned foreground runtime and opt-in current-user sign-in startup.
+    Runtime {
+        #[command(subcommand)]
+        command: autostart::RuntimeCommand,
+    },
     /// Restart the resident runtime; kill the verified process if graceful shutdown times out.
     Restart {
         /// Seconds to wait for graceful shutdown before force termination.
@@ -6055,7 +6060,7 @@ fn main_body() -> i32 {
             match Cli::try_parse_from(
                 std::iter::once(std::ffi::OsString::from("rsrs")).chain(args),
             ) {
-                Ok(cli) if matches!(cli.command, Some(Command::MemoryRevision | Command::Capabilities)) => run(cli),
+                Ok(cli) if matches!(cli.command, Some(Command::MemoryRevision | Command::Capabilities | Command::Runtime { .. })) => run(cli),
                 Ok(cli) => prepare_command_runtime().and_then(|()| run(cli)),
                 Err(error) if error.exit_code() == 0 => error.print().map_err(Into::into),
                 Err(error) => {
@@ -6276,11 +6281,15 @@ fn changes_profile(command: Option<&Command>) -> bool {
 }
 
 fn run(args: Cli) -> Result<()> {
+    if let Some(Command::Runtime { command }) = args.command.as_ref() {
+        return autostart::execute(command);
+    }
     // Static CLI support is safe to inspect even on a fresh or inaccessible
     // profile. It makes no statement about account rights or model readiness.
     if matches!(args.command, Some(Command::Capabilities)) {
         return run_capabilities();
     }
+    autostart::check_managed_request()?;
     if let Some(Command::Snapshot {
         cmd: SnapshotCmd::Restore { id, confirm },
     }) = args.command.as_ref()
@@ -6619,6 +6628,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
     // pre-dispatch check cannot authorize a mutation after that ownership wait.
     respire_app::snapshot::ensure_no_incomplete_restore(&respire::service::data_dir())?;
     progress::phase("执行本地操作", "Executing local operation");
+    autostart::check_direct_access()?;
     // -- Read-only gate (added 2026-09-20; same-day audit moved it) --
     // When this space's agent.json has readonly=true, every write command is refused.
     //
@@ -7284,6 +7294,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
         }};
     }
     match command {
+        Command::Runtime { command } => return autostart::execute(&command),
         Command::Remember {
             content,
             r#type,

@@ -885,6 +885,7 @@ pub fn runtime_brief() -> Option<(u32, String, String)> {
 
 pub fn stop_if_running() -> Result<()> {
     let _takeover = crate::runtime_policy::takeover_lock()?;
+    if crate::autostart::stop_managed_locked()? { return Ok(()); }
     if let Some(health) = probe_runtime()? {
         stop_occupant(health.pid)?;
     }
@@ -993,6 +994,7 @@ pub fn change_profile_with_rollback(change: impl FnOnce() -> Result<()>, rollbac
 pub fn change_profile_with_verification(change: impl FnOnce() -> Result<()>, rollback: impl FnOnce() -> Result<()>, verify: impl FnOnce() -> Result<()>) -> Result<()> {
     crate::progress::phase("协调账户操作；等待当前 runtime 释放", "Coordinating account operation; waiting for current runtime to release");
     let _takeover = crate::runtime_policy::takeover_lock()?;
+    let mut maintenance = crate::autostart::begin_maintenance_locked()?;
     let config_path = respire::service::client_config_path();
     let original = match std::fs::read(&config_path) {
         Ok(bytes) => Some(bytes),
@@ -1058,11 +1060,13 @@ pub fn change_profile_with_verification(change: impl FnOnce() -> Result<()>, rol
         if let Some(path) = backup {
             if let Err(cleanup) = std::fs::remove_file(&path) { return Err(error.context(format!("configuration restored; backup retained at {}: {cleanup}", path.display()))); }
         }
+        maintenance.finish()?;
         return Err(error);
     }
     if let Some(path) = backup {
         if let Err(error) = std::fs::remove_file(&path) { eprintln!("profile verified; configuration backup retained at {}: {error}", path.display()); }
     }
+    maintenance.finish()?;
     Ok(())
 }
 
@@ -1260,6 +1264,7 @@ fn serve(flags: RuntimeFlags) -> Result<()> {
     let library = respire::lock::LibraryLock::acquire(
         &respire::service::data_dir(), Duration::from_secs(120),
     ).context("runtime failed to lock the library")?;
+    crate::autostart::verify_managed_boot()?;
     // Probe and bind only the existing loopback HTTP/TCP transport; no legacy
     // pipe/socket fallback is necessary.
     let bound = crate::runtime_http::bind_runtime(flags.port, &flags.host)?;
@@ -2284,7 +2289,7 @@ pub(crate) fn force_stop_for_reset() -> Result<Option<u32>> {
 
 /// Only a refused connection permits startup; authentication and access failures
 /// leave the existing service untouched.
-fn probe_runtime() -> Result<Option<crate::net_rpc::Health>> {
+pub(crate) fn probe_runtime() -> Result<Option<crate::net_rpc::Health>> {
     match crate::net_rpc::health() {
         Ok(health) => Ok(Some(health)),
         Err(error)
@@ -2313,7 +2318,7 @@ pub(crate) fn ensure_daemon() -> Result<()> {
     ensure_daemon_locked()
 }
 
-fn runtime_matches_current(health: &crate::net_rpc::Health) -> Result<bool> {
+pub(crate) fn runtime_matches_current(health: &crate::net_rpc::Health) -> Result<bool> {
     let dest = crate::mcp::stable_bin_path();
     let src = std::env::current_exe().context("failed to locate the rsrs binary")?;
     Ok(health.data_dir == respire::service::data_dir().display().to_string()
@@ -2323,7 +2328,9 @@ fn runtime_matches_current(health: &crate::net_rpc::Health) -> Result<bool> {
         && !crate::mcp::bin_needs_refresh(&src, &dest).map_err(anyhow::Error::msg)?)
 }
 
-fn ensure_daemon_locked() -> Result<()> {
+pub(crate) fn ensure_daemon_locked() -> Result<()> {
+    if crate::autostart::ensure_managed_locked()? { return Ok(()); }
+    crate::autostart::check_direct_access()?;
     if let Some(health) = probe_runtime()? {
         if runtime_matches_current(&health)? {
             return Ok(());
@@ -2336,7 +2343,7 @@ fn ensure_daemon_locked() -> Result<()> {
     }
     let executable = crate::mcp::materialize_bin().map_err(anyhow::Error::msg)?;
     let mut child =
-        respire_spawn::spawn_runtime(&executable).context("failed to start host runtime")?;
+        respire_spawn::spawn_runtime_with_boot_token(&executable, crate::autostart::lifecycle_boot_token().as_deref()).context("failed to start host runtime")?;
     let result = wait_daemon_ready(&mut child, &executable);
     if result.is_err() && child.try_wait()?.is_none() {
         // Do not leave a delayed startup racing the next lock holder.
@@ -2350,7 +2357,7 @@ fn ensure_daemon_locked() -> Result<()> {
     result
 }
 
-fn stop_occupant(pid: u32) -> Result<()> {
+pub(crate) fn stop_occupant(pid: u32) -> Result<()> {
     let health = crate::net_rpc::health()?;
     anyhow::ensure!(health.pid == pid, "runtime owner changed before shutdown");
     crate::net_rpc::request_stop()?;
