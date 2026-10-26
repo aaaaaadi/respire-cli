@@ -13,6 +13,25 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 export class PackageNotVisibleError extends Error {}
 
+class RegistryTransientError extends Error {}
+const temporaryTransportCodes = new Set([
+  'ETIMEDOUT', 'ECONNRESET', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET',
+]);
+
+// Classify failures only at the read boundary, never validation errors or npm
+// submission. Generic fetch/TLS/redirect failures remain fatal.
+async function registryRead(read) {
+  try { return await read(); }
+  catch (error) {
+    if (error?.name === 'TimeoutError' || temporaryTransportCodes.has(error?.code)
+        || temporaryTransportCodes.has(error?.cause?.code)) {
+      throw new RegistryTransientError('Temporary registry transport failure', {cause: error});
+    }
+    throw error;
+  }
+}
+
 function identity(expected) {
   if (!expected || !packageName.test(expected.name) || !versionPattern.test(expected.version)) {
     throw new Error('Invalid expected npm package identity');
@@ -101,14 +120,17 @@ async function get(raw, options, tarball = false) {
   const requestTimeoutMs = options.deadline === undefined ? requestedTimeout
     : Math.min(requestedTimeout, Math.max(1, options.deadline - (options.now || Date.now)()));
   if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0) throw new Error('Invalid registry request timeout');
-  const response = await (options.fetchImpl || globalThis.fetch)(url, {
+  const response = await registryRead(() => (options.fetchImpl || globalThis.fetch)(url, {
     method: 'GET', headers: {'Accept': options.accept || 'application/json', 'Cache-Control': 'no-cache'},
     credentials: 'omit', redirect: 'error', cache: 'no-store',
     signal: AbortSignal.timeout(Math.max(1, Math.ceil(requestTimeoutMs))),
-  });
+  }));
   // fetchImpl is injectable for offline tests; native fetch supplies response.url.
   if (response.url && registryUrl(response.url) !== url) throw new Error('Unexpected registry redirect');
   if (response.status !== 200 && response.status !== 404) {
+    if ([408, 429, 500, 502, 503, 504].includes(response.status)) {
+      throw new RegistryTransientError(`Registry HTTP ${response.status}: ${url}`);
+    }
     throw new Error(`Registry HTTP ${response.status}: ${url}`);
   }
   return response;
@@ -127,7 +149,9 @@ async function verifyTarball(metadata, expected, options) {
     sha512.update(bytes); sha1.update(bytes);
   };
   if (response.body?.[Symbol.asyncIterator]) {
-    for await (const chunk of response.body) add(chunk);
+    await registryRead(async () => {
+      for await (const chunk of response.body) add(chunk);
+    });
   } else {
     throw new Error('Registry tarball response must provide a streaming body');
   }
@@ -140,7 +164,7 @@ export async function checkPackage(expected, options = {}) {
   const label = identity(expected);
   const response = await get(`${REGISTRY}/${encodeURIComponent(expected.name)}/${encodeURIComponent(expected.version)}`, options);
   if (response.status === 404) return null;
-  const metadata = await response.json();
+  const metadata = await registryRead(() => response.json());
   if (metadata.name !== expected.name || metadata.version !== expected.version) throw new Error(`Registry identity mismatch: ${label}`);
   for (const dependencyField of ['dependencies', 'optionalDependencies']) {
     if (!expected[dependencyField]) continue;
@@ -156,7 +180,7 @@ export async function checkPackage(expected, options = {}) {
       ...options, accept: 'application/vnd.npm.install-v1+json',
     });
     if (indexResponse.status === 404) throw new PackageNotVisibleError(`Registry install index is not visible: ${label}`);
-    const index = await indexResponse.json();
+    const index = await registryRead(() => indexResponse.json());
     if (index.name !== expected.name || !index.versions || typeof index.versions !== 'object' || Array.isArray(index.versions)) {
       throw new Error(`Registry install index is invalid: ${label}`);
     }
@@ -199,7 +223,7 @@ export async function waitForPackage(expected, options = {}) {
       const metadata = await checkPackage(expected, {...options, deadline});
       if (metadata) return metadata;
     } catch (error) {
-      if (!(error instanceof PackageNotVisibleError)) throw error;
+      if (!(error instanceof PackageNotVisibleError) && !(error instanceof RegistryTransientError)) throw error;
     }
     const remaining = deadline - now();
     if (remaining <= 0) throw new PackageNotVisibleError(`Registry propagation timed out: ${identity(expected)}`);
