@@ -129,7 +129,10 @@ async function get(raw, options, tarball = false) {
   if (response.url && registryUrl(response.url) !== url) throw new Error('Unexpected registry redirect');
   if (response.status !== 200 && response.status !== 404) {
     if ([408, 429, 500, 502, 503, 504].includes(response.status)) {
-      throw new RegistryTransientError(`Registry HTTP ${response.status}: ${url}`);
+      const message = `Registry HTTP ${response.status}: ${url}`;
+      try { await response.body?.cancel(); }
+      catch (cause) { throw new RegistryTransientError(message, {cause}); }
+      throw new RegistryTransientError(message);
     }
     throw new Error(`Registry HTTP ${response.status}: ${url}`);
   }

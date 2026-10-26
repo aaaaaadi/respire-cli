@@ -75,11 +75,13 @@ test('404 may become visible within the bounded propagation wait', async () => {
   const mock = registry({absent: 2});
   assert.equal((await waitForPackage(expected, {...mock, ...fastClock()})).name, expected.name);
   assert.equal(mock.calls.filter(call => !call.url.endsWith('.tgz')).length, 3);
+  let cancelled = 0;
+  const transientStatuses = [408, 429, 500, 502, 503, 504];
   for (const failure of [
     () => {throw new DOMException('request timed out', 'TimeoutError');},
     () => {throw new TypeError('fetch failed', {cause: {code: 'ECONNRESET'}});},
     () => {throw Object.assign(new Error('body stalled'), {code: 'UND_ERR_BODY_TIMEOUT'});},
-    ...[408, 429, 500, 502, 503, 504].map(status => () => new Response('', {status})),
+    ...transientStatuses.map(status => () => ({status, body: {cancel: async () => {cancelled++;}}})),
   ]) {
     const mock = registry();
     let attempts = 0;
@@ -90,6 +92,7 @@ test('404 may become visible within the bounded propagation wait', async () => {
     await assert.rejects(waitForPackage(expected, {...fastClock(), fetchImpl: () => {polls++; return failure();}}), /timed out/);
     assert.equal(polls, 4, 'temporary failures retain the original total deadline');
   }
+  assert.equal(cancelled, transientStatuses.length * 5, 'every transient HTTP response releases its unread body');
 });
 
 test('only HTTP 404 is absence; errors and invalid identity fail closed', async () => {
