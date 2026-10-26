@@ -15,8 +15,9 @@ mod manager;
 pub(crate) use lifecycle::current_boot_token as lifecycle_boot_token;
 pub(crate) use lifecycle::{
     authorize_detached_boot_locked, background_paused, begin_maintenance_locked,
-    check_direct_access, check_managed_request, ensure_managed_locked, execute, managed_id,
-    restart_maintenance_locked, stop_managed_locked, verify_managed_boot,
+    check_direct_access, check_managed_request, coordinate_materialization, ensure_managed_locked,
+    execute, managed_id, restart_maintenance_locked, stop_managed_locked, verify_managed_boot,
+    with_explicit_recovery,
 };
 
 #[derive(Debug, Subcommand)]

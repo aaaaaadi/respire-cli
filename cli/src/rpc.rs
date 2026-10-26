@@ -719,6 +719,8 @@ struct RpcRequest {
     args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     queue_wait_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lifecycle: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1404,6 +1406,9 @@ fn dispatch(request: RpcRequest, tx: &Sender<Job>) -> RpcResponse {
             response
         }
         "runtime.stop" => {
+            if crate::autostart::managed_id().is_some() && request.lifecycle.as_deref() != Some("coordinator-v1") {
+                return error_response(&request, "managed_lifecycle_required", "use the current host runtime lifecycle coordinator");
+            }
             request_drain_exit();
             status_response(&request)
         }
@@ -2372,6 +2377,13 @@ pub(crate) fn stop_occupant(pid: u32) -> Result<()> {
     let health = crate::net_rpc::health()?;
     anyhow::ensure!(health.pid == pid, "runtime owner changed before shutdown");
     crate::net_rpc::request_stop()?;
+    if crate::autostart::lifecycle_boot_token().is_some() {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline && crate::net_rpc::process_is_running(pid)? {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        anyhow::ensure!(!crate::net_rpc::process_is_running(pid)?, "managed runtime did not drain; maintenance remains paused without forcing database shutdown");
+    }
     if crate::net_rpc::wait_until_down().is_err() {
         // Reauthenticate before escalation; a different owner may have bound.
         if let Some(health) = probe_runtime()? {
@@ -2427,6 +2439,7 @@ mod tests {
             method: method.to_owned(),
             args: Vec::new(),
             queue_wait_ms: None,
+            lifecycle: None,
         }
     }
 

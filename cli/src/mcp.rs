@@ -188,6 +188,7 @@ pub fn materialize_bin() -> Result<PathBuf, String> {
     {
         return Ok(src);
     }
+    if let Some(path) = crate::autostart::coordinate_materialization().map_err(|error| error.to_string())? { return Ok(path); }
     install_binary(&src, &dest, respire::core_sdk::RUNTIME_FILES)?;
     Ok(dest)
 }

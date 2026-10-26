@@ -6361,13 +6361,13 @@ fn run(args: Cli) -> Result<()> {
         anyhow::ensure!(*confirm,"snapshot recover requires --confirm");
         respire::service::ensure_writable()?;
         let root=respire::service::data_dir();let account=respire::service::session_user_of_dir(&root);
-        rpc::change_profile_with_verification(|| {
+        autostart::with_explicit_recovery(|| rpc::change_profile_with_verification(|| {
             let ownership=respire::lock::LibraryLock::acquire(&root,std::time::Duration::from_secs(15))?;
             respire_app::snapshot::recover_locked(&root,&account,&ownership)
         },||Ok(()),||{
             if !respire::service::off_mode(){rpc::verify_open_store(&root)?;}
             Ok(())
-        })?;
+        }))?;
         return emit_result(ResultEnvelope::new("snapshot",OutputStatus::Ok,serde_json::json!({"action":"recovered","runtime_verified":true}),Vec::new()));
     }
     respire_app::snapshot::ensure_no_incomplete_restore(&respire::service::data_dir())?;

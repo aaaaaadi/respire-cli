@@ -339,6 +339,7 @@ pub(crate) fn rpc_method_with_timeout(method: &str, args: Vec<String>, test_time
         "id": uuid::Uuid::new_v4().to_string(),
         "method": method,
         "args": args,
+        "lifecycle": if method == "runtime.stop" { Some("coordinator-v1") } else { None },
     });
     // Downloading M3 or rebuilding a library can legitimately exceed the normal RPC budget.
     // Native inference runs inside the runtime; a request is never replayed here.

@@ -19,7 +19,10 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 static MANAGED_ID: OnceLock<String> = OnceLock::new();
-thread_local! { static ACTIVE: RefCell<Option<String>> = const { RefCell::new(None) }; }
+thread_local! {
+    static ACTIVE: RefCell<Option<String>> = const { RefCell::new(None) };
+    static RECOVERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 enum Phase {
@@ -298,7 +301,7 @@ pub(crate) fn begin_maintenance_locked() -> Result<Maintenance> {
         return Ok(Maintenance::inactive());
     }
     match read_registration(&respire::service::main_data_dir())? {
-        Some(config) if config.enabled => Maintenance::begin(config, false),
+        Some(config) if config.enabled => Maintenance::begin(config, RECOVERY.with(|v| v.get())),
         _ => Ok(Maintenance::inactive()),
     }
 }
@@ -336,6 +339,38 @@ pub(crate) fn authorize_detached_boot_locked() -> Result<()> {
 pub(crate) fn background_paused() -> bool {
     // Malformed/unreadable control state also fences background mutations.
     !matches!(marker(&respire::service::main_data_dir()), Ok(None))
+}
+
+pub(crate) fn with_explicit_recovery<T>(action: impl FnOnce() -> Result<T>) -> Result<T> {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            RECOVERY.with(|v| v.set(self.0));
+        }
+    }
+    let _reset = Reset(RECOVERY.with(|v| v.replace(true)));
+    action()
+}
+
+pub(crate) fn coordinate_materialization() -> Result<Option<PathBuf>> {
+    if current_boot_token().is_some() {
+        return Ok(None);
+    }
+    let root = respire::service::main_data_dir();
+    let Some(config) = read_registration(&root)?.filter(|c| c.enabled) else {
+        return Ok(None);
+    };
+    let _ownership = crate::runtime_policy::takeover_lock()?;
+    owned(&config)?;
+    let was_running = crate::rpc::probe_runtime()?.is_some();
+    let mut guard = Maintenance::begin(config, false)?;
+    raw_stop_owned(guard.config.as_ref().context("registration missing")?)?;
+    let executable = crate::mcp::materialize_bin().map_err(anyhow::Error::msg)?;
+    if was_running {
+        start_candidate(&mut guard)?;
+    }
+    guard.finish()?;
+    Ok(Some(executable))
 }
 
 fn raw_stop_owned(config: &Registration) -> Result<()> {
@@ -697,7 +732,7 @@ fn run_foreground(id: Option<&str>, root: Option<&Path>) -> Result<()> {
         std::env::set_var("HOME", &config.user_home);
         std::env::set_var("USERPROFILE", &config.user_home);
         if let Some(value) = marker(&config.installation)? {
-            if !controller_alive(&value)? {
+            if value.phase == Phase::Paused || !controller_alive(&value)? {
                 return Ok(());
             }
         }
