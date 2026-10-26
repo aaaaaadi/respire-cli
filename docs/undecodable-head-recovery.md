@@ -26,7 +26,7 @@
 - 使用源码中的 SQL 和内存 SQLite 验证：初始化可重复执行；dirty 保护；新操作改基线但保留 sync_base 与历史；事务回滚；失败幂等键保留；重复键拒绝；reset 旧操作不复用。
 - 独立代码复核；修正 reset 后幂等早退误报成功的问题。
 
-已添加、尚未编译执行的 Rust 回归用例：
+原提交添加的 Rust 回归用例（维护验收已实际执行）：
 
 1. 坏 head + 好候选恢复及同请求重复排队。
 2. 内容 applied 后仍待 resolution 回执，完整回执后幂等重试。
@@ -35,7 +35,7 @@
 5. 可读但尚未应用的 head 仍要求先同步。
 6. 坏候选导致事务回滚。
 7. 模拟服务端并发冲突，保留未解决状态且重复请求不增加冲突。
-8. 同 epoch reset 后旧恢复重试显式失效，不创建额外操作。
+8. 同 epoch reset 后旧恢复重试显式失效，不创建额外操作；覆盖 pending、已 applied 和已 conflict_saved 的内容回执。旧的未完成 resolution 关联失效，操作历史保留，新 head 可发起新的显式恢复。
 9. 新客户端没有已应用基线时仍可显式恢复。
 
 执行入口（需先按仓库说明配置匹配的 Core SDK 和 Windows 构建工具）：
@@ -45,7 +45,9 @@ cargo test --locked -p respire_storage transport::local::conflicts::tests -- --t
 cargo test --locked -p respire_storage transport::local::sync::tests -- --test-threads=1
 ```
 
-当前限制：官方 prepare-sdk 要求私有 Core SDK 下载权限，本机没有可用 SDK；离线 cargo test 还缺 crates.io 的 clap 索引缓存。没有使用替代 SDK、跳过锁定校验或把 SQL 检查冒充 Rust 测试。以上回执模拟不构成真实服务端并发验收。
+原提交阶段没有匹配 SDK 与完整依赖缓存，因此当时未能运行 Rust 测试。维护验收使用已验证的官方 SDK `1.0.2-dev.12`（源 `77fc566e47c6c283c0bde9192528debad23d6248`）和离线依赖，在隔离 HOME/库目录、无凭据环境运行全部 storage 测试：53 项通过，包括上述 9 项恢复回归。扩展的 reset 负向用例在修复前实际失败，修复后通过。
+
+reset 的修复只取消与恢复意图绑定、尚未完成的 resolution outbox 关联；不删除操作、候选、坏版本或已处理的 resolution 历史。不能把这里的回执模拟或本地 Rust 通过当成真实服务端并发验收。
 
 ## 后续验收与未解决项
 
