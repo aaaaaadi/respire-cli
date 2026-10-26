@@ -217,7 +217,7 @@ async function pollRegistryRead(expected, options, read) {
     throw new Error('Invalid registry propagation timeout/poll interval');
   }
   const now = options.now || Date.now;
-  const deadline = now() + timeoutMs;
+  const deadline = Math.min(now() + timeoutMs, options.deadline ?? Infinity);
   let lastError;
   while (true) {
     try {
@@ -286,9 +286,13 @@ export async function publishPackage(dir, expected, tag, options = {}) {
   try {
     const packed = packPackage(dir, temp, options);
     assertPackMatches(packed, expected);
-    const existing = await pollRegistryRead(expected, options, bounded => checkPackage(expected, bounded));
+    // Preflight, tag checks and post-submission confirmation share one budget;
+    // adding a read retry must not multiply the publication wait by stages.
+    const readOptions = {...options, deadline: Math.min(options.deadline ?? Infinity,
+      (options.now || Date.now)() + (options.timeoutMs ?? 600000))};
+    const existing = await pollRegistryRead(expected, readOptions, bounded => checkPackage(expected, bounded));
     if (existing) return {status: 'existing', metadata: existing};
-    await pollRegistryRead(expected, options, bounded => assertTagSafe(expected, tag, bounded));
+    await pollRegistryRead(expected, readOptions, bounded => assertTagSafe(expected, tag, bounded));
     // Publish the checked bytes, never repack a mutable directory inside npm publish.
     // A failed/uncertain submission is never repeated here: only visibility is retried.
     let result;
@@ -299,7 +303,7 @@ export async function publishPackage(dir, expected, tag, options = {}) {
     } catch (error) { result = {status: null, error}; }
     const accepted = result.status === 0 && !result.error;
     try {
-      const metadata = await waitForPackage(expected, options);
+      const metadata = await waitForPackage(expected, readOptions);
       return {status: accepted ? 'published' : 'recovered', metadata};
     } catch (error) {
       if (!accepted) throw new Error(`npm publish failed or was uncertain for ${identity(expected)}; registry did not confirm matching bytes: ${error.message}`, {cause: error});

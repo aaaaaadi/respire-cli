@@ -221,6 +221,18 @@ test('uncertain publish never reattempts after propagation timeout or different 
     await assert.rejects(publishPackage(dir, expected, 'dev', {...npm, ...mock, ...fastClock()}), /failed or was uncertain/);
     assert.equal(npm.calls.filter(call => call.args[0] === 'publish').length, 1);
   }
+  const clock = fastClock(), mock = registry({absent: 1});
+  let preflightFailed = false, tagFailed = false, submitted = false;
+  const npm = mockNpm({onPublish: () => {submitted = true;}});
+  await assert.rejects(publishPackage(dir, expected, 'dev', {...npm, ...clock, fetchImpl: (url, options) => {
+    if (submitted) throw new DOMException('confirmation timeout', 'TimeoutError');
+    if (url.endsWith('/dist-tags')) {
+      if (!tagFailed) {tagFailed = true; throw new DOMException('tag timeout', 'TimeoutError');}
+    } else if (!preflightFailed) {preflightFailed = true; throw new DOMException('preflight timeout', 'TimeoutError');}
+    return mock.fetchImpl(url, options);
+  }}), /timed out/);
+  assert.equal(clock.now(), clock.timeoutMs, 'all read stages share one deadline');
+  assert.equal(npm.calls.filter(call => call.args[0] === 'publish').length, 1);
 });
 
 test('registry permission/network error never triggers npm publish', async t => {
