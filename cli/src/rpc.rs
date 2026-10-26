@@ -916,7 +916,8 @@ pub(crate) fn restart_runtime(timeout: Duration) -> Result<Value> {
             Some(crate::runtime_error::RuntimeError::Transport(_))) => None,
         Err(error) => return Err(error),
     };
-    if crate::autostart::managed_enabled()? && health.is_some() {
+    if crate::autostart::managed_enabled()?
+        && health.as_ref().is_some_and(|value| !value.inference_stalled()) {
         // The active maintenance guard forces the managed coordinator to drain
         // the authenticated, exact registered executable/profile and stop its
         // service owner before replacement. Do not route this healthy owner
