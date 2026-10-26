@@ -162,9 +162,13 @@ fn control(name: &str, arguments: &[String]) -> Result<Output> {
                 .kill()
                 .context("could not stop timed-out service manager client")?;
             child.wait()?;
-            bail!(
-                "current-user service manager request timed out; inspect its state before retrying"
-            );
+            let partial = rx
+                .recv_timeout(Duration::from_secs(1))
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default();
+            let stage = last_control_stage(&partial);
+            bail!("current-user service manager request timed out at fixed stage {stage}; inspect its state before retrying");
         }
         std::thread::sleep(Duration::from_millis(25));
     };
@@ -179,6 +183,32 @@ fn control(name: &str, arguments: &[String]) -> Result<Output> {
         code: status.code().unwrap_or(-1),
         stdout: String::from_utf8(bytes).context("service manager returned invalid UTF-8")?,
     })
+}
+
+const CONTROL_STAGES: &[&str] = &[
+    "script",
+    "com-created",
+    "com-connected",
+    "task-looked-up",
+    "task-validated",
+];
+fn control_stage(line: &str) -> Option<&str> {
+    let value = line
+        .trim_start_matches('\u{feff}')
+        .strip_prefix("rsrs-control-stage:")?;
+    CONTROL_STAGES.contains(&value).then_some(value)
+}
+fn last_control_stage(bytes: &[u8]) -> String {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|value| value.lines().filter_map(control_stage).last())
+        .unwrap_or("unreported")
+        .into()
+}
+fn encoded_powershell(script: &str) -> String {
+    use base64::Engine as _;
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 fn checked(name: &str, args: Vec<String>) -> Result<String> {
@@ -209,7 +239,24 @@ fn powershell(script: String) -> Result<String> {
     .into_iter()
     .find_map(|(needle, label)| script.contains(needle).then_some(label))
     .unwrap_or("query process");
-    checked("powershell",vec!["-NoLogo".into(),"-NoProfile".into(),"-NonInteractive".into(),"-Command".into(),format!("$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);{script}")]).with_context(||format!("Windows current-user operation failed: {operation}"))
+    let wrapped=format!("$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);[Console]::Out.WriteLine('rsrs-control-stage:script');{script}");
+    let text = checked(
+        "powershell",
+        vec![
+            "-NoLogo".into(),
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-EncodedCommand".into(),
+            encoded_powershell(&wrapped),
+        ],
+    )
+    .with_context(|| format!("Windows current-user operation failed: {operation}"))?;
+    Ok(text
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .filter(|line| control_stage(line).is_none())
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 pub(super) fn owner() -> Result<String> {
@@ -455,8 +502,9 @@ fn task_guard(config: &Registration) -> Result<String> {
     Ok(format!(
         r#"
 function Sid($value){{try{{if($value -match '^S-\d-'){{return ([Security.Principal.SecurityIdentifier]::new($value)).Value}};return ([Security.Principal.NTAccount]::new($value)).Translate([Security.Principal.SecurityIdentifier]).Value}}catch{{return $null}}}}
-$scheduler=New-Object -ComObject 'Schedule.Service';$scheduler.Connect();$folder=$scheduler.GetFolder('\');$t=$null;
+$scheduler=[Activator]::CreateInstance([Type]::GetTypeFromProgID('Schedule.Service'));[Console]::Out.WriteLine('rsrs-control-stage:com-created');$scheduler.Connect();[Console]::Out.WriteLine('rsrs-control-stage:com-connected');$folder=$scheduler.GetFolder('\');$t=$null;
 try{{$t=$folder.GetTask({task})}}catch{{$failure=$_.Exception;while($null -ne $failure.InnerException){{$failure=$failure.InnerException}};if($failure.HResult -ne -2147024894){{throw}}}}
+[Console]::Out.WriteLine('rsrs-control-stage:task-looked-up');
 if($null -ne $t){{
  if($t.Xml.Length -gt 65536){{throw 'Task XML exceeds ownership validation limit'}};
  $settings=[Xml.XmlReaderSettings]::new();$settings.DtdProcessing=[Xml.DtdProcessing]::Prohibit;$settings.XmlResolver=$null;
@@ -471,6 +519,7 @@ if($null -ne $t){{
  if(-not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath((Text $a[0] 't:Command')),[IO.Path]::GetFullPath({exe})) -or $arguments -cne {args} -or -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath((Text $a[0] 't:WorkingDirectory')),[IO.Path]::GetFullPath({root}))){{throw 'Unknown task action; refusing lifecycle action'}};
  if((Text $doc '/t:Task/t:RegistrationInfo/t:Description') -cne {description}){{throw 'Unknown task marker; refusing lifecycle action'}};
 }}
+[Console]::Out.WriteLine('rsrs-control-stage:task-validated');
 
 "#,
         description = ps_literal(&format!("Respire current-user runtime {}", config.id))?
@@ -619,15 +668,20 @@ pub(super) fn inspect(config: &Registration) -> Result<State> {
             })
         }
         Platform::Windows => {
-            let text=powershell(format!("{};[pscustomobject]@{{registered=($null -ne $t);loaded=($null -ne $t);running=($null -ne $t -and $t.State -eq 4);enabled=($null -ne $t -and $t.Enabled)}}|ConvertTo-Json -Compress",task_guard(config)?))?;
-            let v: serde_json::Value =
-                serde_json::from_str(text.trim_start_matches('\u{feff}').trim())?;
-            let boolean = |key| v[key].as_bool().context("invalid scheduled task status");
+            let text=powershell(format!("{};$registered=($null -ne $t);$running=($registered -and $t.State -eq 4);$enabled=($registered -and [bool]$t.Enabled);[Console]::Out.WriteLine($registered.ToString().ToLowerInvariant());[Console]::Out.WriteLine($running.ToString().ToLowerInvariant());[Console]::Out.WriteLine($enabled.ToString().ToLowerInvariant())",task_guard(config)?))?;
+            let flags: Vec<bool> = text
+                .lines()
+                .map(str::parse)
+                .collect::<std::result::Result<_, _>>()?;
+            anyhow::ensure!(
+                flags.len() == 3,
+                "invalid scheduled task status field count"
+            );
             Ok(State {
-                registered: boolean("registered")?,
-                loaded: boolean("loaded")?,
-                running: boolean("running")?,
-                enabled: boolean("enabled")?,
+                registered: flags[0],
+                loaded: flags[0],
+                running: flags[1],
+                enabled: flags[2],
             })
         }
     }
@@ -668,7 +722,7 @@ pub(super) fn install(config: &mut Registration) -> Result<()> {
             checked("launchctl", vec!["enable".into(), label(config)])?;
         }
         Platform::Windows => {
-            powershell(format!("{};$xml=[IO.File]::ReadAllText({});$folder.RegisterTask({},$xml,{},$null,$null,3,$null)|Out-Null",task_guard(config)?,ps_literal(item(config).to_str().context("non-UTF8 task path")?)?,ps_literal(&name(config))?,if before.registered{6}else{2}))?;
+            powershell(format!("{};$xml=[IO.File]::ReadAllText({});[void]$folder.RegisterTask({},$xml,{},$null,$null,3,$null)",task_guard(config)?,ps_literal(item(config).to_str().context("non-UTF8 task path")?)?,ps_literal(&name(config))?,if before.registered{6}else{2}))?;
         }
     }
     Ok(())
@@ -714,7 +768,7 @@ pub(super) fn start(config: &Registration) -> Result<()> {
         }
         Platform::Windows => {
             powershell(format!(
-                "{};if($null -eq $t){{throw 'Owned task disappeared'}};$t.Run($null)|Out-Null",
+                "{};if($null -eq $t){{throw 'Owned task disappeared'}};[void]$t.Run($null)",
                 task_guard(config)?
             ))?;
         }
@@ -1060,6 +1114,23 @@ mod tests {
             process_birth(pid)?.is_none(),
             "timed out manager child was not reaped"
         );
+        Ok(())
+    }
+    #[test]
+    fn encoded_control_preserves_unicode_and_stages_never_echo_arbitrary_output() -> Result<()> {
+        use base64::Engine as _;
+        let script = "[Console]::WriteLine('你好 \" $ \\');";
+        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded_powershell(script))?;
+        let words: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        anyhow::ensure!(String::from_utf16(&words)? == script);
+        anyhow::ensure!(
+            last_control_stage(b"secret arbitrary output\nrsrs-control-stage:com-connected\n")
+                == "com-connected"
+        );
+        anyhow::ensure!(last_control_stage(b"rsrs-control-stage:secret-value") == "unreported");
         Ok(())
     }
     #[test]

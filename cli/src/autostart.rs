@@ -271,7 +271,6 @@ fn systemd_quote(raw: &str) -> Result<String> {
         raw.replace('\\', "\\\\")
             .replace('"', "\\\"")
             .replace('%', "%%")
-            .replace('$', "$$")
     ))
 }
 
@@ -310,7 +309,7 @@ fn render(config: &Registration) -> Result<String> {
         .to_str()
         .context("installation path is not UTF-8")?;
     match config.platform {
-        Platform::Linux => Ok(format!("# Respire user runtime {}\n[Unit]\nDescription=Respire current-user runtime\nStartLimitIntervalSec=120\nStartLimitBurst=3\n[Service]\nType=simple\nExecStart={} runtime run --managed {} --installation-root {}\nWorkingDirectory={}\nRestart=on-failure\nRestartSec=10\nTimeoutStopSec=60\nKillMode=control-group\nStandardOutput=null\nStandardError=null\n[Install]\nWantedBy=default.target\n",
+        Platform::Linux => Ok(format!("# Respire user runtime {}\n[Unit]\nDescription=Respire current-user runtime\nStartLimitIntervalSec=120\nStartLimitBurst=3\n[Service]\nType=simple\nExecStart=:{} runtime run --managed {} --installation-root {}\nWorkingDirectory={}\nRestart=on-failure\nRestartSec=10\nTimeoutStopSec=60\nKillMode=control-group\nStandardOutput=null\nStandardError=null\n[Install]\nWantedBy=default.target\n",
             config.id, systemd_quote(executable)?, config.id, systemd_quote(root)?, systemd_path(root)?)),
         Platform::Macos => Ok(format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>ai.risense.respire.runtime.{}</string><key>ProgramArguments</key><array><string>{}</string><string>runtime</string><string>run</string><string>--managed</string><string>{}</string><string>--installation-root</string><string>{}</string></array><key>WorkingDirectory</key><string>{}</string><key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict><key>ThrottleInterval</key><integer>10</integer><key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>/dev/null</string></dict></plist>\n",
             config.id, xml(executable)?, config.id, xml(root)?, xml(root)?)),
@@ -370,7 +369,7 @@ mod tests {
                 && mac.contains("SuccessfulExit")
                 && !mac.contains("LaunchDaemon")
         );
-        anyhow::ensure!(systemd_quote("/a%u/$x")? == "\"/a%%u/$$x\"");
+        anyhow::ensure!(systemd_quote("/a%u/$x")? == "\"/a%%u/$x\"");
         anyhow::ensure!(systemd_path("/a b%u/\"c\"\\d")? == "/a b%%u/\"c\"\\d/.");
         anyhow::ensure!(plain_value("bad\nvalue").is_err());
         for secret in [

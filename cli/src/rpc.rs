@@ -376,7 +376,11 @@ fn index_loop_inner() -> Result<()> {
     let mut model_wait_started: Option<Instant> = None;
     loop {
         if respire::service::service_paused() || crate::autostart::background_paused() {
-            if STOPPING.load(Ordering::Acquire) { return Ok(()); }
+            if STOPPING.load(Ordering::Acquire) {
+                let mut work=INDEX_WORK.lock().map_err(|_|anyhow::anyhow!("index work lock poisoned"))?;
+                work.requested=false;work.state="stopped";
+                return Ok(());
+            }
             let mut work = INDEX_WORK.lock().map_err(|_| anyhow::anyhow!("index work lock poisoned"))?;
             work.state = "paused";
             let _paused = INDEX_CV.wait_timeout(work, Duration::from_secs(1)).map_err(|_| anyhow::anyhow!("index work lock poisoned"))?;
@@ -1595,23 +1599,28 @@ fn execute_json(args: Vec<String>) -> std::result::Result<Value, String> {
     serde_json::to_value(&captured.envelope).map_err(|err| err.to_string())
 }
 
+fn wait_for_drain(supervised: bool, mut busy: impl FnMut() -> bool) {
+    let mut polls=0;
+    while busy() {
+        // Preserve legacy explicit-shutdown timing, but never silently turn a
+        // supervised upgrade/profile transition into a four-second forced exit.
+        if !supervised && polls >= 80 { break; }
+        std::thread::sleep(Duration::from_millis(50));
+        polls+=1;
+    }
+}
+
 pub(crate) fn request_drain_exit() {
     STOPPING.store(true, Ordering::Release);
     wake_dispatcher();
     SYNC_CV.notify_all();
     INDEX_CV.notify_all();
-    std::thread::spawn(|| {
-        for _ in 0..80 {
-            if RUNNING.load(Ordering::Acquire) == 0
-                && !WRITE_RUNNING.load(Ordering::Acquire)
-                && !CLASSIFY_RUNNING.load(Ordering::Acquire)
-                && !sync_running()
-                && !index_has_work()
-            {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+    let supervised=crate::autostart::managed_id().is_some();
+    std::thread::spawn(move || {
+        wait_for_drain(supervised, ||RUNNING.load(Ordering::Acquire) != 0
+            || WRITE_RUNNING.load(Ordering::Acquire)
+            || CLASSIFY_RUNNING.load(Ordering::Acquire)
+            || sync_running() || index_has_work());
         stop_process(0);
     });
 }
@@ -2451,6 +2460,26 @@ mod tests {
             queue_wait_ms: None,
             lifecycle: None,
         }
+    }
+
+    #[test]
+    fn supervised_drain_waits_past_legacy_deadline_until_work_finishes() -> Result<()> {
+        let busy=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (managed_tx,managed_rx)=mpsc::channel();
+        let work=busy.clone();
+        let managed=std::thread::spawn(move || {wait_for_drain(true,||work.load(Ordering::Acquire));let _=managed_tx.send(());});
+        let (legacy_tx,legacy_rx)=mpsc::channel();
+        let work=busy.clone();
+        let legacy=std::thread::spawn(move || {wait_for_drain(false,||work.load(Ordering::Acquire));let _=legacy_tx.send(());});
+        let legacy_result=legacy_rx.recv_timeout(Duration::from_secs(6));
+        let still_waiting=managed_rx.try_recv().is_err();
+        busy.store(false,Ordering::Release);
+        managed_rx.recv_timeout(Duration::from_secs(2))?;
+        managed.join().map_err(|_|anyhow::anyhow!("managed drain panicked"))?;
+        legacy.join().map_err(|_|anyhow::anyhow!("legacy drain panicked"))?;
+        anyhow::ensure!(legacy_result.is_ok() && still_waiting,
+            "supervised drain exited while work remained or legacy shutdown timing changed");
+        Ok(())
     }
 
     #[test]

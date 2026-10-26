@@ -1019,7 +1019,7 @@ fn run_foreground(id: Option<&str>, root: Option<&Path>) -> Result<()> {
             while !stopped.load(Ordering::Acquire) {
                 std::thread::sleep(Duration::from_millis(50));
             }
-            let _ = crate::net_rpc::request_stop_with_timeout(Duration::from_secs(5));
+            crate::rpc::request_drain_exit();
         });
     }
     let result = crate::rpc::runtime_entry(crate::rpc::RuntimeFlags {

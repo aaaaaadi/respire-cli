@@ -47,7 +47,7 @@ def main():
                     env.setdefault("XDG_RUNTIME_DIR", str(runtime))
                     env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={bus}")
         env.update(HOME=str(home), USERPROFILE=str(home), RSRS_DATA_DIR=str(root),
-                   RSRS_BIN_DIR=str(base / "bin"), RSRS_RPC_PORT=str(port),
+                   RSRS_BIN_DIR=str(root / "bin"), RSRS_RPC_PORT=str(port),
                    RSRS_CORE_TEST_MODE="1")
 
         def command(*argv):
