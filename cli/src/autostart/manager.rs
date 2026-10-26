@@ -225,6 +225,17 @@ const CONTROL_STAGES: &[&str] = &[
     "com-created",
     "com-connected",
     "task-looked-up",
+    "task-xml-loaded",
+    "task-shape",
+    "principal-sid",
+    "principal-logon",
+    "principal-runlevel",
+    "principal-runlevel-omitted-limited",
+    "trigger-sid",
+    "action-executable",
+    "action-arguments",
+    "action-directory",
+    "task-marker",
     "task-validated",
 ];
 fn control_stage(line: &str) -> Option<&str> {
@@ -568,13 +579,22 @@ if($null -ne $t){{
  $settings=[Xml.XmlReaderSettings]::new();$settings.DtdProcessing=[Xml.DtdProcessing]::Prohibit;$settings.XmlResolver=$null;
  $reader=[Xml.XmlReader]::Create([IO.StringReader]::new($t.Xml),$settings);
  $doc=[Xml.XmlDocument]::new();$doc.XmlResolver=$null;try{{$doc.Load($reader)}}finally{{$reader.Dispose()}};
+ [Console]::Out.WriteLine('rsrs-control-stage:task-xml-loaded');
  $ns=[Xml.XmlNamespaceManager]::new($doc.NameTable);$ns.AddNamespace('t','http://schemas.microsoft.com/windows/2004/02/mit/task');
  function Text($node,$xpath){{$value=$node.SelectSingleNode($xpath,$ns);if($null -eq $value){{return ''}};return $value.InnerText}}
  $a=@($doc.SelectNodes('/t:Task/t:Actions/*',$ns));$g=@($doc.SelectNodes('/t:Task/t:Triggers/*',$ns));$p=@($doc.SelectNodes('/t:Task/t:Principals/*',$ns));
+ [Console]::Out.WriteLine('rsrs-control-stage:task-shape');
  if($p.Count -ne 1 -or $a.Count -ne 1 -or $g.Count -ne 1 -or $a[0].LocalName -ne 'Exec' -or $g[0].LocalName -ne 'LogonTrigger'){{throw 'Unknown task principal/action/trigger count; refusing lifecycle action'}};
- if((Sid (Text $p[0] 't:UserId')) -cne {owner} -or (Text $p[0] 't:LogonType') -cne 'InteractiveToken' -or (Text $p[0] 't:RunLevel') -cne 'LeastPrivilege' -or (Sid (Text $g[0] 't:UserId')) -cne {owner}){{throw 'Unknown task principal/trigger; refusing lifecycle action'}};
+ [Console]::Out.WriteLine('rsrs-control-stage:principal-sid');if((Sid (Text $p[0] 't:UserId')) -cne {owner}){{throw 'Unknown task principal; refusing lifecycle action'}};
+ [Console]::Out.WriteLine('rsrs-control-stage:principal-logon');if((Text $p[0] 't:LogonType') -cne 'InteractiveToken'){{throw 'Unknown task logon type; refusing lifecycle action'}};
+ [Console]::Out.WriteLine('rsrs-control-stage:principal-runlevel');if((Text $p[0] 't:RunLevel') -eq '' -and $t.Definition.Principal.RunLevel -eq 0){{[Console]::Out.WriteLine('rsrs-control-stage:principal-runlevel-omitted-limited')}};
+ if((Text $p[0] 't:RunLevel') -cne 'LeastPrivilege'){{throw 'Unknown task run level; refusing lifecycle action'}};
+ [Console]::Out.WriteLine('rsrs-control-stage:trigger-sid');if((Sid (Text $g[0] 't:UserId')) -cne {owner}){{throw 'Unknown task trigger identity; refusing lifecycle action'}};
  $arguments=Text $a[0] 't:Arguments';
- if(-not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath((Text $a[0] 't:Command')),[IO.Path]::GetFullPath({exe})) -or $arguments -cne {args} -or -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath((Text $a[0] 't:WorkingDirectory')),[IO.Path]::GetFullPath({root}))){{throw 'Unknown task action; refusing lifecycle action'}};
+ [Console]::Out.WriteLine('rsrs-control-stage:action-executable');if(-not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath((Text $a[0] 't:Command')),[IO.Path]::GetFullPath({exe}))){{throw 'Unknown task executable; refusing lifecycle action'}};
+ [Console]::Out.WriteLine('rsrs-control-stage:action-arguments');if($arguments -cne {args}){{throw 'Unknown task arguments; refusing lifecycle action'}};
+ [Console]::Out.WriteLine('rsrs-control-stage:action-directory');if(-not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath((Text $a[0] 't:WorkingDirectory')),[IO.Path]::GetFullPath({root}))){{throw 'Unknown task directory; refusing lifecycle action'}};
+ [Console]::Out.WriteLine('rsrs-control-stage:task-marker');
  if((Text $doc '/t:Task/t:RegistrationInfo/t:Description') -cne {description}){{throw 'Unknown task marker; refusing lifecycle action'}};
 }}
 [Console]::Out.WriteLine('rsrs-control-stage:task-validated');
