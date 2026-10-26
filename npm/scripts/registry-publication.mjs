@@ -164,6 +164,9 @@ export async function checkPackage(expected, options = {}) {
   const label = identity(expected);
   const response = await get(`${REGISTRY}/${encodeURIComponent(expected.name)}/${encodeURIComponent(expected.version)}`, options);
   if (response.status === 404) return null;
+  // Once an exact version responds 200, later propagation misses may never
+  // authorize a second submission, even if this response body times out.
+  options.onVersionVisible?.();
   const metadata = await registryRead(() => response.json());
   if (metadata.name !== expected.name || metadata.version !== expected.version) throw new Error(`Registry identity mismatch: ${label}`);
   for (const dependencyField of ['dependencies', 'optionalDependencies']) {
@@ -290,7 +293,12 @@ export async function publishPackage(dir, expected, tag, options = {}) {
     // adding a read retry must not multiply the publication wait by stages.
     const readOptions = {...options, deadline: Math.min(options.deadline ?? Infinity,
       (options.now || Date.now)() + (options.timeoutMs ?? 600000))};
-    const existing = await pollRegistryRead(expected, readOptions, bounded => checkPackage(expected, bounded));
+    let versionSeen = false;
+    const existing = await pollRegistryRead(expected, readOptions, async bounded => {
+      const metadata = await checkPackage(expected, {...bounded, onVersionVisible: () => {versionSeen = true;}});
+      if (!metadata && versionSeen) throw new PackageNotVisibleError(`Previously visible registry version is pending: ${identity(expected)}`);
+      return metadata;
+    });
     if (existing) return {status: 'existing', metadata: existing};
     await pollRegistryRead(expected, readOptions, bounded => assertTagSafe(expected, tag, bounded));
     // Publish the checked bytes, never repack a mutable directory inside npm publish.

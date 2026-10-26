@@ -328,6 +328,40 @@ test('already visible metadata with delayed tarball cannot trigger publication',
   const result = await publishPackage(dir, expected, 'dev', {...npm, fetchImpl, ...fastClock()});
   assert.equal(result.status, 'existing');
   assert.equal(npm.calls.filter(call => call.args[0] === 'publish').length, 0);
+  const exactUrl = `https://registry.npmjs.org/${encodeURIComponent(expected.name)}/${expected.version}`;
+  const indexUrl = `https://registry.npmjs.org/${encodeURIComponent(expected.name)}`;
+  for (const pendingAt of ['tarball-404', 'tarball-timeout', 'index-404', 'index-timeout', 'metadata-body-timeout']) {
+    for (const recovers of [true, false]) {
+      const npm = mockNpm(), clock = fastClock();
+      let exactReads = 0, interrupted = false;
+      const fetchImpl = async url => {
+        if (url === exactUrl) {
+          exactReads++;
+          if (exactReads > 1 && (!recovers || exactReads === 2)) return missing();
+          if (pendingAt === 'metadata-body-timeout' && !interrupted) {
+            interrupted = true;
+            return {status: 200, json: async () => {throw new DOMException('metadata body timed out', 'TimeoutError');}};
+          }
+          return json(metadata());
+        }
+        if (!interrupted && ((url.endsWith('.tgz') && pendingAt.startsWith('tarball'))
+            || (url === indexUrl && pendingAt.startsWith('index')))) {
+          interrupted = true;
+          if (pendingAt.endsWith('timeout')) throw new DOMException('propagation read timed out', 'TimeoutError');
+          return missing();
+        }
+        if (url === indexUrl) return json({name: expected.name, versions: {[expected.version]: metadata()}});
+        if (url.endsWith('/dist-tags')) return json({});
+        assert(url.endsWith('.tgz'));
+        return new Response(bytes);
+      };
+      const publication = publishPackage(dir, expected, 'dev', {...npm, ...clock, fetchImpl, requireInstallIndex: true});
+      const result = recovers ? await publication : await assert.rejects(publication, /timed out/);
+      assert(interrupted);
+      assert.equal(npm.calls.filter(c => c.args[0] === 'publish').length, 0, `${pendingAt} then metadata404 must never submit`);
+      if (recovers) assert.equal(result.status, 'existing');
+    }
+  }
 });
 
 test('missing verified receipt blocks pack --publish without clearing dist', t => {
