@@ -310,7 +310,35 @@ $s=[Activator]::CreateInstance([Type]::GetTypeFromProgID('Schedule.Service'));$s
                         owned_health=json.load(response)
                     assert owned_health["pid"] == first_pid and Path(owned_health["installation_root"]).resolve() == root.resolve()
                     assert owned_health["managed_id"] == json.loads(config_path.read_text())["id"]
-                    os.kill(first_pid,signal.SIGTERM if os.name == "nt" else signal.SIGKILL)
+                    if os.name == "nt":
+                        # Inject the same failure HRESULT emitted by supervised
+                        # runtime errors. Python os.kill(SIGTERM) instead emits
+                        # positive 15, observed as LastTaskResult=15 with no
+                        # scheduler retry despite the loaded 3 x 60s policy.
+                        import ctypes
+                        from ctypes import wintypes
+                        kernel=ctypes.WinDLL("kernel32",use_last_error=True)
+                        kernel.OpenProcess.argtypes=[wintypes.DWORD,wintypes.BOOL,wintypes.DWORD]
+                        kernel.OpenProcess.restype=wintypes.HANDLE
+                        kernel.GetProcessId.argtypes=[wintypes.HANDLE]
+                        kernel.GetProcessId.restype=wintypes.DWORD
+                        kernel.QueryFullProcessImageNameW.argtypes=[wintypes.HANDLE,wintypes.DWORD,wintypes.LPWSTR,ctypes.POINTER(wintypes.DWORD)]
+                        kernel.QueryFullProcessImageNameW.restype=wintypes.BOOL
+                        kernel.TerminateProcess.argtypes=[wintypes.HANDLE,wintypes.UINT]
+                        kernel.TerminateProcess.restype=wintypes.BOOL
+                        kernel.CloseHandle.argtypes=[wintypes.HANDLE]
+                        kernel.CloseHandle.restype=wintypes.BOOL
+                        process=kernel.OpenProcess(0x1001,False,first_pid) # terminate + limited identity query, no debug privilege
+                        assert process, "cannot open the owned fixture process"
+                        try:
+                            image=ctypes.create_unicode_buffer(32768);size=wintypes.DWORD(len(image))
+                            assert kernel.GetProcessId(process)==first_pid and kernel.QueryFullProcessImageNameW(process,0,image,ctypes.byref(size)), "fixture process identity unavailable"
+                            assert Path(image.value).resolve()==Path(owned_health["exe"]).resolve(), "fixture process executable changed"
+                            assert kernel.TerminateProcess(process,0x80004005), "failed to inject owned fixture failure status"
+                        finally:
+                            kernel.CloseHandle(process)
+                    else:
+                        os.kill(first_pid,signal.SIGKILL)
                     restart_deadline=time.monotonic()+140
                     recovered_health=None
                     while time.monotonic() < restart_deadline:
