@@ -28,13 +28,15 @@ def main():
         base = Path(temporary)
         home = base / "home"
         home.mkdir()
-        root = base / "data"
+        root = base / ('data spaces % $ " \\' if os.name == "posix" else "data spaces % and $")
         with socket.socket() as port_socket:
             port_socket.bind(("127.0.0.1", 0))
             port = port_socket.getsockname()[1]
         env = {key: os.environ[key] for key in (
             "PATH", "LANG", "LC_ALL", "SystemRoot", "WINDIR", "TEMP", "TMP",
-            "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "LLVM_PROFILE_FILE"
+            "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "LLVM_PROFILE_FILE",
+            "APPDATA", "LOCALAPPDATA", "COMPUTERNAME", "COMSPEC", "PATHEXT",
+            "ProgramFiles", "ProgramFiles(x86)", "ProgramData"
         ) if key in os.environ}
         if args.register and os.name == "posix" and os.uname().sysname == "Linux":
             import stat
@@ -91,6 +93,21 @@ def main():
                     child.terminate()
                     child.wait(timeout=20)
         print("PASS: read-only default-off status, client-only denial, actual foreground store readiness and owned stop")
+        # A fresh off-mode installation must restart without opening/creating a
+        # library. Its detached child is always stopped before leaving the test.
+        off_root = base / "off installation"
+        off_root.mkdir()
+        (off_root / "client.json").write_text(json.dumps({"service_mode":"off"}))
+        off_env = dict(env, RSRS_DATA_DIR=str(off_root), RSRS_BIN_DIR=str(base/"off-bin"))
+        try:
+            for argv in [("runtime","start"),("runtime","stop"),("runtime","restart")]:
+                result = subprocess.run([binary,"--json",*argv],env=off_env,capture_output=True,text=True,timeout=45)
+                assert result.returncode == 0, f"off mode {argv}: {result.stdout} {result.stderr}"
+                assert not (off_root/"rsrs.db").exists() and not (off_root/"onememory.db").exists(), "off restart created a database"
+        finally:
+            result = subprocess.run([binary,"--json","runtime","stop"],env=off_env,capture_output=True,text=True,timeout=45)
+            assert result.returncode == 0, f"off-mode child cleanup failed: {result.stdout} {result.stderr}"
+        print("PASS: fresh memory-off start/stop/restart without a database")
         if args.register:
             def collect_managed_profiles():
                 # A service manager deliberately does not inherit test-runner
@@ -107,8 +124,30 @@ def main():
                     assert not profile.is_symlink() and profile.stat().st_size <= 64 * 1024 * 1024
                     shutil.copyfile(profile, destination / f"autostart-managed-{uuid.uuid4().hex}.profraw")
 
+            def diagnose_registration():
+                import hashlib
+                import platform
+                if os.name != "posix":
+                    return
+                identity = hashlib.sha256(f"respire-runtime-v1\0{root.resolve()}\0{os.getuid()}".encode()).hexdigest()[:24]
+                system = platform.system()
+                if system == "Linux":
+                    name = f"respire-runtime-{identity}.service"
+                    output = subprocess.run(["/usr/bin/systemctl", "--user", "show", name,
+                        "--property=LoadState,FragmentPath,DropInPaths,UnitFileState"], env=env,
+                        capture_output=True, text=True, timeout=15)
+                    print("isolated systemd path diagnostic", json.dumps({"expected":str(home.resolve()/".config/systemd/user"/name),"properties":output.stdout[:8192]}))
+                elif system == "Darwin":
+                    label = f"ai.risense.respire.runtime.{identity}"
+                    output = subprocess.run(["/bin/launchctl", "print-disabled", f"gui/{os.getuid()}"],
+                        env=env, capture_output=True, text=True, timeout=15)
+                    matching = [line.strip() for line in output.stdout.splitlines() if line.strip().startswith(f'"{label}" => ')]
+                    print("isolated launchd override diagnostic",json.dumps({"label":label,"entries":[line[:160] for line in matching]}))
+
             def run(*argv):
                 result = command(*argv)
+                if result.returncode != 0:
+                    diagnose_registration()
                 assert result.returncode == 0, f"{argv}: {result.stderr} {result.stdout}"
                 value = json.loads(result.stdout)
                 assert value["status"] == "ok", value
@@ -123,6 +162,8 @@ def main():
                 up = run("runtime", "status")
                 assert up["runtime"]["running"] is True and up["runtime"]["store_ready"] is True, up
                 first_pid = up["runtime"]["pid"]
+                if os.name == "posix" and os.uname().sysname == "Linux":
+                    assert Path(f"/proc/{first_pid}/cwd").resolve() == root.resolve(), "supervised process has the wrong actual working directory"
                 run("runtime", "stop")
                 time.sleep(1)
                 stopped = run("runtime", "status")
@@ -130,6 +171,28 @@ def main():
                 run("runtime", "restart")
                 restarted = run("runtime", "status")
                 assert restarted["runtime"]["running"] and restarted["runtime"]["pid"] != first_pid, restarted
+                # Managed off-mode uses process/profile readiness, not a store
+                # that this mode intentionally never opens.
+                run("runtime", "stop")
+                client = root / "client.json"
+                previous_client = client.read_bytes() if client.exists() else None
+                settings = json.loads(previous_client) if previous_client else {}
+                database = root / "rsrs.db"
+                before_database = database.read_bytes()
+                before_modified = database.stat().st_mtime_ns
+                settings["service_mode"] = "off"
+                client.write_text(json.dumps(settings))
+                run("runtime", "restart")
+                off_status = run("runtime", "status")
+                assert off_status["runtime"]["running"] and off_status["runtime"]["store_ready"] is False, off_status
+                assert database.read_bytes() == before_database and database.stat().st_mtime_ns == before_modified
+                run("runtime", "stop")
+                if previous_client is None:
+                    client.unlink()
+                else:
+                    client.write_bytes(previous_client)
+                run("runtime", "restart")
+                assert run("runtime", "status")["runtime"]["store_ready"] is True
                 run("runtime", "autostart", "disable", "--stop")
                 disabled = run("runtime", "status")
                 assert disabled["enabled"] is False and disabled["runtime"]["running"] is False, disabled

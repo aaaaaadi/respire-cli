@@ -1833,6 +1833,12 @@ fn build_session() -> Result<SessionKeys> {
 /// Preserve only the owner alias from the local snapshot that supplied these keys.
 /// Environment-key fallback must never inherit identity from an unrelated profile.
 fn build_session_with_owner() -> Result<(SessionKeys, Option<String>)> {
+    let result = build_session_with_owner_inner();
+    autostart::note_credential_access(result.is_ok());
+    result
+}
+
+fn build_session_with_owner_inner() -> Result<(SessionKeys, Option<String>)> {
     if let Ok(session) = auth::load_local_session_with_owner() {
         return Ok(session);
     }
@@ -6470,6 +6476,11 @@ fn run(args: Cli) -> Result<()> {
         })
     ) {
         runtime_policy::require_host("CPU recovery and runtime shutdown")?;
+        if autostart::managed_enabled()? {
+            rpc::change_profile(respire::memory::onnx::reset_cpu_config)?;
+            return emit_result(ResultEnvelope::new("model", OutputStatus::Ok,
+                serde_json::json!({"engine":"cpu","force_cpu":true,"runtime_restarted":true}),Vec::new()));
+        }
         let _takeover = runtime_policy::takeover_lock()?;
         respire::memory::onnx::reset_cpu_config()?;
         let stopped_pid = rpc::force_stop_for_reset()?;

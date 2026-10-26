@@ -15,8 +15,9 @@ mod manager;
 pub(crate) use lifecycle::current_boot_token as lifecycle_boot_token;
 pub(crate) use lifecycle::{
     authorize_detached_boot_locked, background_paused, begin_maintenance_locked,
-    check_direct_access, check_managed_request, coordinate_materialization, ensure_managed_locked,
-    execute, managed_id, restart_maintenance_locked, stop_managed_locked, verify_managed_boot,
+    check_direct_access, check_managed_request, coordinate_materialization, credential_state,
+    ensure_managed_locked, execute, managed_enabled, managed_id, note_credential_access,
+    record_exit, restart_maintenance_locked, stop_managed_locked, verify_managed_boot,
     with_explicit_recovery,
 };
 
@@ -266,19 +267,17 @@ fn systemd_quote(raw: &str) -> Result<String> {
     ))
 }
 
-// Path-valued systemd directives are not ExecStart argv. Escape whitespace as
-// C-style bytes, without introducing literal quote characters into the path.
+// Path-valued systemd directives are not ExecStart argv. Keep literal path
+// characters and escape only percent specifiers.
 fn systemd_path(raw: &str) -> Result<String> {
     plain_value(raw)?;
     anyhow::ensure!(
         raw.starts_with('/'),
         "systemd working directory must be absolute"
     );
-    Ok(raw
-        .replace('\\', "\\\\")
-        .replace('%', "%%")
-        .replace(' ', "\\x20")
-        .replace('"', "\\x22"))
+    // Unlike ExecStart argv this directive is a scalar path. Keep literal
+    // spaces, quotes and backslashes; only escape systemd specifiers.
+    Ok(raw.replace('%', "%%"))
 }
 
 fn xml(raw: &str) -> Result<String> {
@@ -362,6 +361,7 @@ mod tests {
                 && !mac.contains("LaunchDaemon")
         );
         anyhow::ensure!(systemd_quote("/a%u/$x")? == "\"/a%%u/$$x\"");
+        anyhow::ensure!(systemd_path("/a b%u/\"c\"\\d")? == "/a b%%u/\"c\"\\d");
         anyhow::ensure!(plain_value("bad\nvalue").is_err());
         for secret in [
             "RSRS_SUPER",

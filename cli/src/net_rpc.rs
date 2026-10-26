@@ -42,6 +42,8 @@ pub struct Health {
     pub installation_root: String,
     #[serde(default)]
     pub managed_id: Option<String>,
+    #[serde(default)]
+    pub credential_state: String,
 }
 
 impl Health {

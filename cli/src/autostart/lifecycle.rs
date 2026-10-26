@@ -12,12 +12,13 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
     Arc, OnceLock,
 };
 use std::time::{Duration, Instant};
 
 static MANAGED_ID: OnceLock<String> = OnceLock::new();
+static CREDENTIAL_STATE: AtomicU8 = AtomicU8::new(0);
 thread_local! {
     static ACTIVE: RefCell<Option<String>> = const { RefCell::new(None) };
     static RECOVERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -96,6 +97,29 @@ fn owned(config: &Registration) -> Result<()> {
         "runtime registration has an unexpected executable"
     );
     Ok(())
+}
+
+pub(crate) fn note_credential_access(available: bool) {
+    CREDENTIAL_STATE.store(if available { 1 } else { 2 }, Ordering::Release);
+}
+pub(crate) fn credential_state() -> &'static str {
+    match CREDENTIAL_STATE.load(Ordering::Acquire) {
+        1 => "ready",
+        2 => "unavailable",
+        _ => "unknown",
+    }
+}
+pub(crate) fn managed_enabled() -> Result<bool> {
+    Ok(read_registration(&respire::service::main_data_dir())?.is_some_and(|config| config.enabled))
+}
+pub(crate) fn record_exit(success: bool) {
+    if managed_id().is_some() {
+        if let Ok(Some(config)) = read_registration(&respire::service::main_data_dir()) {
+            if event(&config, if success { "exit_ok" } else { "exit_error" }).is_err() {
+                eprintln!("Managed runtime event could not be recorded.");
+            }
+        }
+    }
 }
 
 pub(crate) fn managed_id() -> Option<&'static str> {
@@ -685,11 +709,11 @@ fn status() -> Result<Value> {
     }
     match crate::rpc::probe_runtime() {
         Ok(Some(health)) => {
-            anyhow::ensure!(
-                Path::new(&health.installation_root) == root,
-                "runtime belongs to another installation"
-            );
-            value["runtime"] = json!({"running":true,"pid":health.pid,"version":health.bin,"data_dir":health.data_dir,"store_ready":health.store_ready,"inference":health.inference,"credential_state":"unknown"});
+            if Path::new(&health.installation_root) != root {
+                value["runtime"] = json!({"running":null,"state":if health.installation_root.is_empty() {"legacy_identity_unavailable"} else {"another_installation"},"version":health.bin});
+                return Ok(value);
+            }
+            value["runtime"] = json!({"running":true,"pid":health.pid,"version":health.bin,"data_dir":health.data_dir,"store_ready":health.store_ready,"inference":health.inference,"credential_state":if health.credential_state.is_empty() {"unknown"} else {health.credential_state.as_str()},"network_state":"not_probed"});
         }
         Ok(None) => value["runtime"] = json!({"running":false}),
         Err(_) => value["runtime"] = json!({"running":null,"state":"unreachable_or_unverified"}),
@@ -846,6 +870,15 @@ fn run_foreground(id: Option<&str>, root: Option<&Path>) -> Result<()> {
             crate::mcp::same_path(&std::env::current_exe()?, &config.executable),
             "managed startup must use the configured stable native executable"
         );
+        for (key, _) in std::env::vars_os() {
+            if key.to_str().is_some_and(|key| {
+                key.starts_with("RSRS_")
+                    || key.starts_with("ONEMEMORY_")
+                    || key.starts_with("RESPIRE_")
+            }) {
+                std::env::remove_var(key);
+            }
+        }
         for (key, value) in &config.environment {
             std::env::set_var(key, value);
         }

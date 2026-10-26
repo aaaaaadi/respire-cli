@@ -959,7 +959,7 @@ pub(crate) fn restart_runtime(timeout: Duration) -> Result<Value> {
     crate::progress::phase("启动 runtime；等待就绪", "Starting runtime; waiting for readiness");
     ensure_daemon_locked()?;
     let ready = crate::net_rpc::health()?;
-    verify_open_store(&respire::service::data_dir())?;
+    if !respire::service::off_mode() { verify_open_store(&respire::service::data_dir())?; }
     maintenance.finish()?;
     Ok(json!({"state":"ready", "stopped_pid":pid, "pid":ready.pid,
         "forced":forced, "data_dir":ready.data_dir, "version":ready.bin}))
@@ -969,8 +969,12 @@ pub(crate) fn restart_runtime(timeout: Duration) -> Result<Value> {
 pub fn recover_interrupted_login() -> Result<()> {
     let _takeover = crate::runtime_policy::takeover_lock()?;
     if !respire_app::login_transaction::recovery_pending() { return Ok(()); }
+    let managed = crate::autostart::managed_enabled()?;
+    let mut maintenance = crate::autostart::with_explicit_recovery(crate::autostart::begin_maintenance_locked)?;
     if let Some(health) = probe_runtime()? { stop_occupant(health.pid)?; }
     respire_app::login_transaction::recover_interrupted()?;
+    if managed { ensure_daemon_locked()?; }
+    maintenance.finish()?;
     eprintln!("Recovered an interrupted login; the original account and configuration were restored.");
     Ok(())
 }
@@ -1656,6 +1660,7 @@ pub(crate) fn health_body() -> Value {
         "store_ready": STORE_READY.load(Ordering::Acquire),
         "installation_root": respire::service::main_data_dir().display().to_string(),
         "managed_id": crate::autostart::managed_id(),
+        "credential_state": crate::autostart::credential_state(),
         "snapshot_restore_id": SNAPSHOT_BOOT_ID.lock().ok().and_then(|slot|slot.clone()),
         "recall_statistics": recall_stats_status(),
         "retrieval_index": index_status(),
@@ -1677,6 +1682,7 @@ pub(crate) fn health_body() -> Value {
 }
 
 fn stop_process(code: i32) -> ! {
+    crate::autostart::record_exit(code == 0);
     #[cfg(test)]
     {
         let _ = code;

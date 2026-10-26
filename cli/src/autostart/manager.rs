@@ -113,6 +113,14 @@ fn control(name: &str, arguments: &[String]) -> Result<Output> {
         "WINDIR",
         "TEMP",
         "TMP",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "COMPUTERNAME",
+        "COMSPEC",
+        "PATHEXT",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramData",
         "XDG_RUNTIME_DIR",
         "DBUS_SESSION_BUS_ADDRESS",
     ] {
@@ -130,8 +138,7 @@ fn control(name: &str, arguments: &[String]) -> Result<Output> {
             PathBuf::from("/usr/bin:/bin")
         },
     );
-    let mut child = command
-        .spawn()
+    let mut child = respire_spawn::spawn_host_control(&mut command)
         .context("could not invoke current-user service manager")?;
     let stdout = child
         .stdout
@@ -188,7 +195,19 @@ fn ps_literal(value: &str) -> Result<String> {
 }
 
 fn powershell(script: String) -> Result<String> {
-    checked("powershell",vec!["-NoLogo".into(),"-NoProfile".into(),"-NonInteractive".into(),"-Command".into(),format!("$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);{script}")])
+    let operation = [
+        ("WindowsIdentity", "query current user"),
+        ("Unregister-ScheduledTask", "remove owned task"),
+        ("Register-ScheduledTask", "register owned task"),
+        ("Start-ScheduledTask", "start owned task"),
+        ("Stop-ScheduledTask", "stop owned task"),
+        ("Disable-ScheduledTask", "disable owned task"),
+        ("Get-ScheduledTask", "inspect owned task"),
+    ]
+    .into_iter()
+    .find_map(|(needle, label)| script.contains(needle).then_some(label))
+    .unwrap_or("query process");
+    checked("powershell",vec!["-NoLogo".into(),"-NoProfile".into(),"-NonInteractive".into(),"-Command".into(),format!("$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);{script}")]).with_context(||format!("Windows current-user operation failed: {operation}"))
 }
 
 pub(super) fn owner() -> Result<String> {
@@ -460,14 +479,31 @@ pub(super) fn inspect(config: &Registration) -> Result<State> {
                 .lines()
                 .filter_map(|line| line.split_once('='))
                 .collect();
-            let registered = fields.get("LoadState").is_some_and(|v| *v != "not-found");
+            let registered = match fields.get("LoadState").copied() {
+                Some("not-found") => false,
+                Some("loaded") => true,
+                _ => bail!("systemd unit load state is unavailable or unexpected; no lifecycle action taken"),
+            };
             if registered {
                 let fragment = fields
                     .get("FragmentPath")
                     .context("systemd unit path missing")?;
+                // systemctl link can expose an installation-owned source via a
+                // user-unit symlink. Require the exact same resolved file, not
+                // merely matching bytes at an unrelated path.
                 anyhow::ensure!(
-                    Path::new(fragment) == item(config),
+                    Path::new(fragment).canonicalize()? == item(config).canonicalize()?,
                     "unknown systemd user unit path; refusing lifecycle action"
+                );
+                let directory = systemd_property(
+                    config,
+                    "org.freedesktop.systemd1.Service",
+                    "WorkingDirectory",
+                )?;
+                anyhow::ensure!(
+                    directory["data"].as_str().map(Path::new)
+                        == Some(config.installation.as_path()),
+                    "systemd loaded working directory differs from this installation"
                 );
                 verify_systemd_loaded(
                     config,
@@ -755,6 +791,7 @@ pub(super) mod test_adapter {
         pub enabled: bool,
         pub running: bool,
         pub dropin: bool,
+        pub fragment: Option<PathBuf>,
         pub fail: Option<String>,
         pub changes: Vec<String>,
     }
@@ -777,7 +814,7 @@ pub(super) mod test_adapter {
                     anyhow::ensure!(args.first().map(String::as_str) == Some("--user"), "fake refuses non-user operation");
                     let operation = args.get(1).context("manager operation missing")?;
                     if state.fail.as_ref() == Some(operation) { return Ok(Output{code:1,stdout:String::new()}); }
-                    if operation == "show" { return ok(format!("LoadState={}\nActiveState={}\nMainPID=0\nFragmentPath={}\nUnitFileState={}\n", if state.registered {"loaded"}else{"not-found"},if state.running {"active"}else{"inactive"},item(&config).display(),if state.enabled {"enabled"}else{"disabled"})); }
+                    if operation == "show" { return ok(format!("LoadState={}\nActiveState={}\nMainPID=0\nFragmentPath={}\nUnitFileState={}\n", if state.registered {"loaded"}else{"not-found"},if state.running {"active"}else{"inactive"},state.fragment.clone().unwrap_or_else(||item(&config)).display(),if state.enabled {"enabled"}else{"disabled"})); }
                     state.changes.push(operation.clone());
                     match operation.as_str() {
                         "link" => state.registered = true,
@@ -795,6 +832,7 @@ pub(super) mod test_adapter {
                     if args.iter().any(|v|v == "GetUnit") { return ok(serde_json::json!({"data":["/org/freedesktop/systemd1/unit/test"]}).to_string()); }
                     match args.last().map(String::as_str) {
                         Some("DropInPaths") => ok(serde_json::json!({"data":if state.dropin {vec!["/tmp/unknown.conf"]}else{vec![]}}).to_string()),
+                        Some("WorkingDirectory") => ok(serde_json::json!({"data":config.installation}).to_string()),
                         Some("ExecStart") => ok(serde_json::json!({"data":[[config.executable,[config.executable,"runtime","run","--managed",config.id,"--installation-root",config.installation],false,0,0,0,0,0,0,0]]}).to_string()),
                         _ => bail!("unexpected fake property"),
                     }
@@ -889,6 +927,22 @@ mod tests {
         start(&config)?;
         anyhow::ensure!(inspect(&config)?.running);
         let changes = state.borrow().changes.len();
+        let alias = config.installation.join("unit-link.service");
+        std::os::unix::fs::symlink(item(&config), &alias)?;
+        state.borrow_mut().fragment = Some(alias.clone());
+        anyhow::ensure!(
+            inspect(&config)?.registered,
+            "exact resolved owned source should be recognized"
+        );
+        std::fs::remove_file(&alias)?;
+        let foreign = config.installation.join("foreign.service");
+        std::fs::copy(item(&config), &foreign)?;
+        std::os::unix::fs::symlink(&foreign, &alias)?;
+        anyhow::ensure!(
+            inspect(&config).is_err(),
+            "matching bytes at an unrelated source are not ownership"
+        );
+        state.borrow_mut().fragment = None;
         state.borrow_mut().dropin = true;
         anyhow::ensure!(stop(&config).is_err());
         anyhow::ensure!(remove(&config).is_err());
@@ -908,6 +962,56 @@ mod tests {
         anyhow::ensure!(!item(&config).exists() && std::fs::read(preserved)? == b"synthetic data");
         config.artifact_hashes.clear();
         anyhow::ensure!(!inspect(&config)?.registered);
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn manager_control_is_bounded_private_and_reaps_its_timed_out_child() -> Result<()> {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("test environment lock poisoned"))?;
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var("RSRS_SUPER", v),
+                    None => std::env::remove_var("RSRS_SUPER"),
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os("RSRS_SUPER"));
+        std::env::set_var("RSRS_SUPER", "synthetic-not-for-child");
+        let output = checked(
+            "sh",
+            vec![
+                "-c".into(),
+                "test -z \"${RSRS_SUPER+x}\" && printf safe".into(),
+            ],
+        )?;
+        anyhow::ensure!(output == "safe");
+        anyhow::ensure!(checked("sh", vec!["-c".into(), "exit 7".into()]).is_err());
+        anyhow::ensure!(control("sh", &["-c".into(), "head -c 65537 /dev/zero".into()]).is_err());
+        anyhow::ensure!(control("sh", &["-c".into(), "printf '\\377'".into()]).is_err());
+        anyhow::ensure!(program("respire-missing-manager-fixture").is_err());
+        let temp = tempfile::tempdir()?;
+        let pid_file = temp.path().join("child.pid");
+        let error = control(
+            "sh",
+            &[
+                "-c".into(),
+                "printf '%s' \"$$\" > \"$1\"; exec sleep 90".into(),
+                "respire-fixture".into(),
+                pid_file.to_string_lossy().into_owned(),
+            ],
+        )
+        .err()
+        .context("timeout was not enforced")?;
+        anyhow::ensure!(error.to_string().contains("timed out"));
+        let pid: u32 = std::fs::read_to_string(pid_file)?.parse()?;
+        anyhow::ensure!(
+            process_birth(pid)?.is_none(),
+            "timed out manager child was not reaped"
+        );
         Ok(())
     }
     #[test]
