@@ -359,6 +359,71 @@ mod tests {
     }
 
     #[test]
+    fn tampered_registration_is_rejected_without_rewriting_evidence() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        let path = control_path(&root);
+        fs::create_dir_all(path.parent().context("registration parent missing")?)?;
+        let mut config = fixture(Platform::current()?);
+        config.installation = root.clone();
+        config.id = identity(&root, &config.owner);
+        config.environment.insert("RSRS_RPC_PORT".into(), "45678".into());
+        let original = serde_json::to_value(&config)?;
+        let bytes = serde_json::to_vec(&original)?;
+        fs::write(&path, &bytes)?;
+        let loaded = read_registration(&root)?.context("valid registration missing")?;
+        anyhow::ensure!(loaded.digest.as_deref() == Some(hash(&bytes).as_str()));
+        // All mutations use synthetic fields. Rejecting a registration must
+        // preserve its exact bytes for diagnosis, rather than repairing trust.
+        let mut cases = Vec::new();
+        for (field, value) in [
+            ("schema", json!(2)),
+            ("platform", json!(if config.platform == Platform::Linux { "windows" } else { "linux" })),
+            ("installation", json!(root.join("other"))),
+            ("id", json!("foreign-installation")),
+            ("unexpected", json!(true)),
+        ] {
+            let mut changed = original.clone();
+            changed[field] = value;
+            cases.push(changed);
+        }
+        for port in [json!("0"), json!("65536"), json!("invalid"), json!(null)] {
+            let mut changed = original.clone();
+            changed["environment"]["RSRS_RPC_PORT"] = port;
+            cases.push(changed);
+        }
+        for (key, value) in [("RSRS_SUPER", "synthetic-only"), ("RSRS_ENGINE", "cpu\nforeign")] {
+            let mut changed = original.clone();
+            changed["environment"][key] = json!(value);
+            cases.push(changed);
+        }
+        for changed in cases {
+            let evidence = serde_json::to_vec(&changed)?;
+            fs::write(&path, &evidence)?;
+            anyhow::ensure!(read_registration(&root).is_err(), "tampered registration accepted");
+            anyhow::ensure!(fs::read(&path)? == evidence, "read rewrote rejected evidence");
+        }
+        for evidence in [b"invalid-json".to_vec(), vec![b' '; 65537]] {
+            fs::write(&path, &evidence)?;
+            anyhow::ensure!(read_registration(&root).is_err());
+            anyhow::ensure!(fs::read(&path)? == evidence);
+        }
+        fs::remove_file(&path)?;
+        fs::create_dir(&path)?;
+        anyhow::ensure!(read_registration(&root).is_err());
+        fs::remove_dir(&path)?;
+        #[cfg(unix)]
+        {
+            let target = root.join("synthetic-registration.json");
+            fs::write(&target, &bytes)?;
+            std::os::unix::fs::symlink(&target, &path)?;
+            anyhow::ensure!(read_registration(&root).is_err());
+            anyhow::ensure!(fs::read(&target)? == bytes);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn templates_supervise_foreground_user_runtime_without_elevation() -> Result<()> {
         // RegisterTask receives a Unicode BSTR, not the UTF-8 file bytes.
         // Keep its declaration encoding-neutral after ReadAllText.
