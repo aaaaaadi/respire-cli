@@ -162,6 +162,15 @@ test('existing identical package skips publish and makes no tag read/change', as
   assert.equal(result.status, 'existing');
   assert.equal(npm.calls.length, 1);
   assert(!mock.calls.some(call => call.url.includes('/dist-tags')));
+  const flaky = registry();
+  let reads = 0;
+  const resultAfterTimeout = await publishPackage(dir, expected, 'dev', {...npm, ...fastClock(),
+    fetchImpl: (url, options) => {
+      if (reads++ === 0) throw new DOMException('preflight timed out', 'TimeoutError');
+      return flaky.fetchImpl(url, options);
+    }});
+  assert.equal(resultAfterTimeout.status, 'existing');
+  assert.equal(npm.calls.filter(call => call.args[0] === 'publish').length, 0);
 });
 
 test('missing package publishes checked tarball exactly once, then waits', async t => {
@@ -184,6 +193,18 @@ test('missing package publishes checked tarball exactly once, then waits', async
     assert.equal(result.status, publishStatus === 0 ? 'published' : 'recovered');
     assert.equal(npm.calls.filter(call => call.args[0] === 'publish').length, 1);
   }
+  const delayedTag = registry({absent: 1});
+  let tagFailed = false;
+  const tagNpm = mockNpm();
+  await publishPackage(dir, expected, 'dev', {...tagNpm, ...fastClock(), fetchImpl: (url, options) => {
+    if (url.endsWith('/dist-tags') && !tagFailed) {
+      tagFailed = true;
+      throw new DOMException('tag read timed out', 'TimeoutError');
+    }
+    return delayedTag.fetchImpl(url, options);
+  }});
+  assert(tagFailed);
+  assert.equal(tagNpm.calls.filter(call => call.args[0] === 'publish').length, 1);
 });
 
 test('uncertain publish failure recovers only via matching registry bytes, never republish', async t => {
@@ -209,6 +230,14 @@ test('registry permission/network error never triggers npm publish', async t => 
     await assert.rejects(publishPackage(dir, expected, 'dev', {...npm, fetchImpl}));
     assert.equal(npm.calls.filter(call => call.args[0] === 'publish').length, 0);
   }
+  const npm = mockNpm();
+  let polls = 0;
+  await assert.rejects(publishPackage(dir, expected, 'dev', {...npm, ...fastClock(), fetchImpl: async () => {
+    polls++;
+    throw new DOMException('preflight permanently stalled', 'TimeoutError');
+  }}), /timed out/);
+  assert.equal(polls, 4);
+  assert.equal(npm.calls.filter(call => call.args[0] === 'publish').length, 0);
 });
 
 test('tag rollback is blocked including dev.10 versus dev.9; DEV cannot touch latest', async t => {

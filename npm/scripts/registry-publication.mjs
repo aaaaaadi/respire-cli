@@ -209,7 +209,7 @@ export async function checkPackage(expected, options = {}) {
   return metadata;
 }
 
-export async function waitForPackage(expected, options = {}) {
+async function pollRegistryRead(expected, options, read) {
   identity(expected);
   const timeoutMs = options.timeoutMs ?? 600000;
   const pollMs = options.pollMs ?? 3000;
@@ -218,17 +218,26 @@ export async function waitForPackage(expected, options = {}) {
   }
   const now = options.now || Date.now;
   const deadline = now() + timeoutMs;
+  let lastError;
   while (true) {
     try {
-      const metadata = await checkPackage(expected, {...options, deadline});
-      if (metadata) return metadata;
+      return await read({...options, deadline});
     } catch (error) {
       if (!(error instanceof PackageNotVisibleError) && !(error instanceof RegistryTransientError)) throw error;
+      lastError = error;
     }
     const remaining = deadline - now();
-    if (remaining <= 0) throw new PackageNotVisibleError(`Registry propagation timed out: ${identity(expected)}`);
+    if (remaining <= 0) throw new PackageNotVisibleError(`Registry propagation timed out: ${identity(expected)}; ${lastError.message}`, {cause: lastError});
     await (options.sleep || pause)(Math.min(pollMs, remaining));
   }
+}
+
+export async function waitForPackage(expected, options = {}) {
+  return pollRegistryRead(expected, options, async bounded => {
+    const metadata = await checkPackage(expected, bounded);
+    if (!metadata) throw new PackageNotVisibleError(`Registry package is not visible: ${identity(expected)}`);
+    return metadata;
+  });
 }
 
 // SemVer precedence, including numeric prerelease identifiers (dev.10 > dev.9).
@@ -261,7 +270,7 @@ export async function assertTagSafe(expected, tag, options = {}) {
   if (expected.version.includes('-dev') && tag === 'latest') throw new Error('Refusing to publish a dev version under latest');
   const response = await get(`${REGISTRY}/-/package/${encodeURIComponent(expected.name)}/dist-tags`, options);
   if (response.status === 404) return;
-  const tags = await response.json();
+  const tags = await registryRead(() => response.json());
   if (!tags || typeof tags !== 'object' || Array.isArray(tags)) throw new Error('Invalid npm distribution tags response');
   if (Object.hasOwn(tags, tag) && compareVersions(tags[tag], expected.version) > 0) {
     throw new Error(`Refusing npm tag rollback: ${expected.name} ${tag}=${tags[tag]} > ${expected.version}`);
@@ -277,14 +286,9 @@ export async function publishPackage(dir, expected, tag, options = {}) {
   try {
     const packed = packPackage(dir, temp, options);
     assertPackMatches(packed, expected);
-    let existing;
-    try { existing = await checkPackage(expected, options); }
-    catch (error) {
-      if (!(error instanceof PackageNotVisibleError)) throw error;
-      existing = await waitForPackage(expected, options);
-    }
+    const existing = await pollRegistryRead(expected, options, bounded => checkPackage(expected, bounded));
     if (existing) return {status: 'existing', metadata: existing};
-    await assertTagSafe(expected, tag, options);
+    await pollRegistryRead(expected, options, bounded => assertTagSafe(expected, tag, bounded));
     // Publish the checked bytes, never repack a mutable directory inside npm publish.
     // A failed/uncertain submission is never repeated here: only visibility is retried.
     let result;
