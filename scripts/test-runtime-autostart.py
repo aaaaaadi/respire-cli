@@ -157,9 +157,11 @@ def main():
                     assert kernel.WaitForSingleObject(owned,0)==258
                     assert ntdll.NtSuspendProcess(owned)>=0
                     suspended=True
-                    recovered=subprocess.run([binary,"--json","restart","--timeout","1"],env=off_env,capture_output=True,text=True,timeout=45)
+                    recovered=subprocess.run([binary,"--json","runtime","restart"],env=off_env,capture_output=True,text=True,timeout=45)
                     assert recovered.returncode==0, f"suspended owner recovery: {recovered.stdout} {recovered.stderr}"
-                    summary=json.loads(recovered.stdout)["summary"]
+                    envelope=json.loads(recovered.stdout)
+                    assert envelope["command"]=="runtime.restart" and envelope["status"]=="ok", envelope
+                    summary=envelope["summary"]
                     assert summary["forced"] is True and summary["stopped_pid"]==frozen["pid"] and summary["pid"]!=frozen["pid"]
                     assert kernel.WaitForSingleObject(owned,15000)==0, "the inspected suspended process survived forced recovery"
                     assert not (off_root/"rsrs.db").exists() and not (off_root/"onememory.db").exists()
