@@ -185,8 +185,16 @@ jobs:
       - run: cargo test --workspace --exclude respire --locked
       - name: CLI line coverage ≥ 90% (exclude entry points, UI and network adapters)
         run: |
+          result=0
           cargo llvm-cov --locked -p respire --fail-under-lines 90 \
-            --ignore-filename-regex '(main\.rs|web\.rs|rpc\.rs|runtime_(policy|error|http)\.rs|extract_tui\.rs|inject_tui\.rs|shell\.rs|/shell/|/core/|model_(install|progress)\.rs|space\.rs|update_check\.rs|classify(_config)?\.rs|recall_select\.rs)'
+            --ignore-filename-regex '(main\.rs|web\.rs|rpc\.rs|runtime_(policy|error|http)\.rs|extract_tui\.rs|inject_tui\.rs|shell\.rs|/shell/|/core/|model_(install|progress)\.rs|space\.rs|update_check\.rs|classify(_config)?\.rs|recall_select\.rs)' || result=$?
+          if [ "$result" -ne 0 ]; then
+            # Diagnose missing production lines without changing the gate or
+            # uploading another temporary artifact. Preserve the original exit.
+            cargo llvm-cov report -p respire --show-missing-lines \
+              --ignore-filename-regex '(main\.rs|web\.rs|rpc\.rs|runtime_(policy|error|http)\.rs|extract_tui\.rs|inject_tui\.rs|shell\.rs|/shell/|/core/|model_(install|progress)\.rs|space\.rs|update_check\.rs|classify(_config)?\.rs|recall_select\.rs)' || printf "%s\n" "Coverage diagnostic unavailable; original failure retained"
+          fi
+          exit "$result"
       - uses: actions/setup-node@v4
         with:
           node-version: 22

@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 mod admission;
 mod app_version;
+mod autostart;
 mod bench;
 mod classify;
 mod classify_config;
@@ -601,6 +602,11 @@ enum ModelAction {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Host-owned foreground runtime and opt-in current-user sign-in startup.
+    Runtime {
+        #[command(subcommand)]
+        command: autostart::RuntimeCommand,
+    },
     /// Restart the resident runtime; kill the verified process if graceful shutdown times out.
     Restart {
         /// Seconds to wait for graceful shutdown before force termination.
@@ -1827,6 +1833,12 @@ fn build_session() -> Result<SessionKeys> {
 /// Preserve only the owner alias from the local snapshot that supplied these keys.
 /// Environment-key fallback must never inherit identity from an unrelated profile.
 fn build_session_with_owner() -> Result<(SessionKeys, Option<String>)> {
+    let result = build_session_with_owner_inner();
+    autostart::note_credential_access(result.is_ok());
+    result
+}
+
+fn build_session_with_owner_inner() -> Result<(SessionKeys, Option<String>)> {
     if let Ok(session) = auth::load_local_session_with_owner() {
         return Ok(session);
     }
@@ -6054,7 +6066,7 @@ fn main_body() -> i32 {
             match Cli::try_parse_from(
                 std::iter::once(std::ffi::OsString::from("rsrs")).chain(args),
             ) {
-                Ok(cli) if matches!(cli.command, Some(Command::MemoryRevision | Command::Capabilities)) => run(cli),
+                Ok(cli) if matches!(cli.command, Some(Command::MemoryRevision | Command::Capabilities | Command::Runtime { .. })) => run(cli),
                 Ok(cli) => prepare_command_runtime().and_then(|()| run(cli)),
                 Err(error) if error.exit_code() == 0 => error.print().map_err(Into::into),
                 Err(error) => {
@@ -6245,6 +6257,7 @@ fn run_classify_config(
 }
 
 fn run_memory_revision() -> Result<()> {
+    autostart::check_direct_access()?;
     emit_result(ResultEnvelope::new(
         "memory-revision",
         OutputStatus::Ok,
@@ -6275,11 +6288,15 @@ fn changes_profile(command: Option<&Command>) -> bool {
 }
 
 fn run(args: Cli) -> Result<()> {
+    if let Some(Command::Runtime { command }) = args.command.as_ref() {
+        return autostart::execute(command);
+    }
     // Static CLI support is safe to inspect even on a fresh or inaccessible
     // profile. It makes no statement about account rights or model readiness.
     if matches!(args.command, Some(Command::Capabilities)) {
         return run_capabilities();
     }
+    autostart::check_managed_request()?;
     if let Some(Command::Snapshot {
         cmd: SnapshotCmd::Restore { id, confirm },
     }) = args.command.as_ref()
@@ -6351,13 +6368,13 @@ fn run(args: Cli) -> Result<()> {
         anyhow::ensure!(*confirm,"snapshot recover requires --confirm");
         respire::service::ensure_writable()?;
         let root=respire::service::data_dir();let account=respire::service::session_user_of_dir(&root);
-        rpc::change_profile_with_verification(|| {
+        autostart::with_explicit_recovery(|| rpc::change_profile_with_verification(|| {
             let ownership=respire::lock::LibraryLock::acquire(&root,std::time::Duration::from_secs(15))?;
             respire_app::snapshot::recover_locked(&root,&account,&ownership)
         },||Ok(()),||{
             if !respire::service::off_mode(){rpc::verify_open_store(&root)?;}
             Ok(())
-        })?;
+        }))?;
         return emit_result(ResultEnvelope::new("snapshot",OutputStatus::Ok,serde_json::json!({"action":"recovered","runtime_verified":true}),Vec::new()));
     }
     respire_app::snapshot::ensure_no_incomplete_restore(&respire::service::data_dir())?;
@@ -6460,6 +6477,11 @@ fn run(args: Cli) -> Result<()> {
         })
     ) {
         runtime_policy::require_host("CPU recovery and runtime shutdown")?;
+        if autostart::managed_enabled()? {
+            rpc::change_profile(respire::memory::onnx::reset_cpu_config)?;
+            return emit_result(ResultEnvelope::new("model", OutputStatus::Ok,
+                serde_json::json!({"engine":"cpu","force_cpu":true,"runtime_restarted":true}),Vec::new()));
+        }
         let _takeover = runtime_policy::takeover_lock()?;
         respire::memory::onnx::reset_cpu_config()?;
         let stopped_pid = rpc::force_stop_for_reset()?;
@@ -6618,6 +6640,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
     // pre-dispatch check cannot authorize a mutation after that ownership wait.
     respire_app::snapshot::ensure_no_incomplete_restore(&respire::service::data_dir())?;
     progress::phase("执行本地操作", "Executing local operation");
+    autostart::check_direct_access()?;
     // -- Read-only gate (added 2026-09-20; same-day audit moved it) --
     // When this space's agent.json has readonly=true, every write command is refused.
     //
@@ -7283,6 +7306,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
         }};
     }
     match command {
+        Command::Runtime { command } => return autostart::execute(&command),
         Command::Remember {
             content,
             r#type,
