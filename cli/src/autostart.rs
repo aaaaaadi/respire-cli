@@ -21,13 +21,6 @@ pub(crate) use lifecycle::{
     verify_managed_boot, with_explicit_recovery,
 };
 
-/// Preserve the legacy process argument/creation checks while bounding and
-/// reaping their Windows inspection subprocess like other lifecycle controls.
-#[cfg(windows)]
-pub(crate) fn windows_process_inspection(script: String) -> Result<String> {
-    manager::powershell(script)
-}
-
 #[derive(Debug, Subcommand)]
 pub enum RuntimeCommand {
     /// Serve in the foreground; service managers supervise this process.

@@ -130,6 +130,44 @@ def main():
                 result = subprocess.run([binary,"--json",*argv],env=off_env,capture_output=True,text=True,timeout=45)
                 assert result.returncode == 0, f"off mode {argv}: {result.stdout} {result.stderr}"
                 assert not (off_root/"rsrs.db").exists() and not (off_root/"onememory.db").exists(), "off restart created a database"
+            if os.name == "nt":
+                # Reproduce the real upgrade failure without an account/model:
+                # suspend only this fixture's verified unmanaged native owner.
+                import ctypes
+                from ctypes import wintypes
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health",timeout=5) as response:
+                    frozen=json.load(response)
+                assert Path(frozen["data_dir"]).resolve()==off_root.resolve()
+                kernel=ctypes.WinDLL("kernel32",use_last_error=True)
+                kernel.OpenProcess.argtypes=[wintypes.DWORD,wintypes.BOOL,wintypes.DWORD];kernel.OpenProcess.restype=wintypes.HANDLE
+                kernel.GetProcessId.argtypes=[wintypes.HANDLE];kernel.GetProcessId.restype=wintypes.DWORD
+                kernel.QueryFullProcessImageNameW.argtypes=[wintypes.HANDLE,wintypes.DWORD,wintypes.LPWSTR,ctypes.POINTER(wintypes.DWORD)];kernel.QueryFullProcessImageNameW.restype=wintypes.BOOL
+                kernel.WaitForSingleObject.argtypes=[wintypes.HANDLE,wintypes.DWORD];kernel.WaitForSingleObject.restype=wintypes.DWORD
+                kernel.CloseHandle.argtypes=[wintypes.HANDLE];kernel.CloseHandle.restype=wintypes.BOOL
+                ntdll=ctypes.WinDLL("ntdll")
+                ntdll.NtSuspendProcess.argtypes=[wintypes.HANDLE];ntdll.NtSuspendProcess.restype=wintypes.LONG
+                ntdll.NtResumeProcess.argtypes=[wintypes.HANDLE];ntdll.NtResumeProcess.restype=wintypes.LONG
+                owned=kernel.OpenProcess(0x101800,False,frozen["pid"]) # synchronize/query/suspend, never an arbitrary PID
+                assert owned and kernel.GetProcessId(owned)==frozen["pid"]
+                suspended=False
+                try:
+                    image=ctypes.create_unicode_buffer(32768);length=wintypes.DWORD(len(image))
+                    assert kernel.QueryFullProcessImageNameW(owned,0,image,ctypes.byref(length))
+                    assert os.path.samefile(image.value,Path(off_env["RSRS_BIN_DIR"])/"rsrs.exe")
+                    assert kernel.WaitForSingleObject(owned,0)==258
+                    assert ntdll.NtSuspendProcess(owned)>=0
+                    suspended=True
+                    recovered=subprocess.run([binary,"--json","restart","--timeout","1"],env=off_env,capture_output=True,text=True,timeout=45)
+                    assert recovered.returncode==0, f"suspended owner recovery: {recovered.stdout} {recovered.stderr}"
+                    summary=json.loads(recovered.stdout)["summary"]
+                    assert summary["forced"] is True and summary["stopped_pid"]==frozen["pid"] and summary["pid"]!=frozen["pid"]
+                    assert kernel.WaitForSingleObject(owned,15000)==0, "the inspected suspended process survived forced recovery"
+                    assert not (off_root/"rsrs.db").exists() and not (off_root/"onememory.db").exists()
+                    print("PASS: actual suspended unmanaged Windows runtime recovered with verified native identity, no WMI, and no database")
+                finally:
+                    if suspended and kernel.WaitForSingleObject(owned,0)==258:
+                        assert ntdll.NtResumeProcess(owned)>=0, "owned failed fixture could not be resumed"
+                    kernel.CloseHandle(owned)
         finally:
             result = subprocess.run([binary,"--json","runtime","stop"],env=off_env,capture_output=True,text=True,timeout=45)
             assert result.returncode == 0, f"off-mode child cleanup failed: {result.stdout} {result.stderr}"
