@@ -20,7 +20,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--register", action="store_true", help="Exercise a disposable current-user OS registration on an ephemeral GitHub runner")
+    parser.add_argument("--previous-binary", type=Path, help="Pinned official DEV.6 native executable for upgrade acceptance")
     args = parser.parse_args()
+    if args.previous_binary and not args.register:
+        parser.error("previous-version upgrade acceptance requires --register")
     if args.register and not (os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"):
         parser.error("OS registration acceptance is limited to an ephemeral GitHub-hosted runner")
     binary = str(args.binary.resolve(strict=True))
@@ -47,7 +50,7 @@ def main():
                     env.setdefault("XDG_RUNTIME_DIR", str(runtime))
                     env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={bus}")
         env.update(HOME=str(home), USERPROFILE=str(home), RSRS_DATA_DIR=str(root),
-                   RSRS_BIN_DIR=str(root / "bin"), RSRS_RPC_PORT=str(port),
+                   RSRS_BIN_DIR=str(base / "bin"), RSRS_RPC_PORT=str(port),
                    RSRS_CORE_TEST_MODE="1")
 
         def command(*argv):
@@ -109,6 +112,14 @@ def main():
             assert result.returncode == 0, f"off-mode child cleanup failed: {result.stdout} {result.stderr}"
         print("PASS: fresh memory-off start/stop/restart without a database")
         if args.register:
+            if os.name == "posix" and os.uname().sysname == "Linux":
+                rejected_root=base/"rejected-native-path"
+                rejected=subprocess.run([binary,"--json","runtime","autostart","enable"],
+                    env=dict(env,RSRS_DATA_DIR=str(rejected_root),RSRS_BIN_DIR=str(base/'unsupported \" backslash\\')),
+                    capture_output=True,text=True,timeout=45)
+                assert rejected.returncode != 0 and not rejected_root.exists(), "unsupported executable path created state"
+                print("PASS: unsupported systemd executable path refused before any lifecycle state")
+
             def collect_managed_profiles():
                 # A service manager deliberately does not inherit test-runner
                 # profiling variables. Collect the real instrumented native
@@ -154,6 +165,68 @@ def main():
                 return value["summary"]
 
             try:
+                if args.previous_binary:
+                    import hashlib
+                    import shutil
+                    previous=args.previous_binary.resolve(strict=True)
+                    version=subprocess.run([str(previous),"--version"],env=env,capture_output=True,text=True,timeout=15)
+                    assert version.returncode == 0 and "1.0.17-dev.6" in version.stdout, "unexpected previous native version"
+                    upgrade_root=base/"previous-version-upgrade"
+                    upgrade_env=dict(env,RSRS_DATA_DIR=str(upgrade_root),RSRS_BIN_DIR=str(upgrade_root/"bin"))
+                    def upgrade_call(executable,*argv):
+                        return subprocess.run([str(executable),"--json",*argv],env=upgrade_env,capture_output=True,text=True,timeout=45)
+                    def require_upgrade(*argv):
+                        result=upgrade_call(binary,*argv)
+                        assert result.returncode == 0, f"upgrade {argv}: {result.stdout} {result.stderr}"
+                        return json.loads(result.stdout)["summary"]
+                    try:
+                        old=upgrade_call(previous,"status")
+                        assert old.returncode in (0,2), f"previous native startup failed: {old.stdout} {old.stderr}"
+                        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health",timeout=5) as response:
+                            old_health=json.load(response)
+                        assert old_health["bin"] == "1.0.17-dev.6"
+                        upgraded=require_upgrade("runtime","autostart","enable")
+                        assert upgraded["enabled"] and upgraded["runtime"]["running"]
+                        assert upgraded["runtime"]["version"] == health["bin"] and upgraded["runtime"]["pid"] != old_health["pid"]
+                        stable=upgrade_root/"bin"/("rsrs.exe" if os.name=="nt" else "rsrs")
+                        fingerprint=hashlib.sha256(stable.read_bytes()).digest()
+                        legacy=upgrade_call(previous,"status")
+                        # A compatible old client may remain read-only; it must
+                        # never replace or restart the live supervised owner.
+                        still=require_upgrade("runtime","status")
+                        assert still["runtime"]["pid"] == upgraded["runtime"]["pid"] and hashlib.sha256(stable.read_bytes()).digest() == fingerprint
+                        require_upgrade("runtime","autostart","disable","--stop")
+                        # Restore only known public previous-version native
+                        # files while stopped. Do not run old code against the
+                        # now-upgraded database; the next start is the new CLI.
+                        for source in previous.parent.rglob("*"):
+                            assert not source.is_symlink(), "previous native package has a symlink"
+                            destination=upgrade_root/"bin"/source.relative_to(previous.parent)
+                            if source.is_dir():
+                                destination.mkdir(parents=True,exist_ok=True)
+                            else:
+                                assert source.is_file() and not destination.is_symlink()
+                                destination.parent.mkdir(parents=True,exist_ok=True)
+                                shutil.copy2(source,destination)
+                        require_upgrade("runtime","start")
+                        disabled_upgrade=require_upgrade("runtime","status")
+                        assert disabled_upgrade["enabled"] is False and disabled_upgrade["runtime"]["version"] == health["bin"]
+                        require_upgrade("runtime","stop")
+                        print("PASS: actual DEV.6 handoff, live legacy-client no-replacement, and disabled-state preservation across native upgrade")
+                    finally:
+                        stopped=upgrade_call(binary,"runtime","stop")
+                        removed=upgrade_call(binary,"runtime","autostart","remove","--stop")
+                        assert stopped.returncode == 0 and removed.returncode == 0, "previous-version fixture cleanup failed"
+
+                failure_root=base/"failed-installation"
+                blocked=base/"blocked-native-directory"
+                blocked.write_text("synthetic file, not a directory")
+                failure_env=dict(env,RSRS_DATA_DIR=str(failure_root),RSRS_BIN_DIR=str(blocked))
+                failed=subprocess.run([binary,"--json","runtime","autostart","enable"],env=failure_env,capture_output=True,text=True,timeout=45)
+                assert failed.returncode != 0 and (failure_root/"runtime/autostart/maintenance.json").exists(), "failure fixture did not reach persisted maintenance"
+                cleaned=subprocess.run([binary,"--json","runtime","autostart","remove","--stop"],env=failure_env,capture_output=True,text=True,timeout=45)
+                assert cleaned.returncode == 0 and not (failure_root/"runtime/autostart/maintenance.json").exists(), f"explicit failed-install cleanup did not recover: {cleaned.stdout} {cleaned.stderr}"
+                print("PASS: failed native installation retains a fence and explicit remove --stop safely clears it")
                 enabled = run("runtime", "autostart", "enable")
                 assert enabled["enabled"] is True and enabled["registered"] is True, enabled
                 assert enabled["runtime"]["running"] is False, "enable without --now unexpectedly starts runtime"

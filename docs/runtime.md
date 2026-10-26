@@ -51,6 +51,9 @@ LaunchAgent, and Windows uses a Limited, interactive current-user logon task.
 They do not install a system service, enable linger, elevate privileges, store a
 Windows password, or start before anyone signs in. Missing user service-manager
 support is an error, without an automatic system-wide fallback.
+Systemd itself rejects quotes/backslashes in an executable pathname. Such a data
+root remains usable with a separate safe absolute `RSRS_BIN_DIR`; enable rejects
+an unsupported native path before creating lifecycle/registration state.
 
 Status is read-only and does not create a profile, download a model, start a
 runtime or change a registration. It reports configuration separately from the

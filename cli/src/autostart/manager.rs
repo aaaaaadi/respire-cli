@@ -65,6 +65,41 @@ pub(super) fn process_birth(pid: u32) -> Result<Option<String>> {
     }
 }
 
+pub(super) fn validate_executable(platform: Platform, path: &Path) -> Result<()> {
+    let value = path
+        .to_str()
+        .context("startup executable path is not UTF-8")?;
+    plain_value(value)?;
+    anyhow::ensure!(
+        path.is_absolute(),
+        "startup requires an absolute native path; use an absolute RSRS_DATA_DIR/RSRS_BIN_DIR"
+    );
+    if platform == Platform::Linux {
+        anyhow::ensure!(!value.chars().any(|c|matches!(c,'\\'|'\"'|'\'')),
+            "systemd does not support quotes/backslashes in executable paths; choose a safe absolute RSRS_BIN_DIR (the data directory may still contain these characters)");
+    }
+    Ok(())
+}
+
+pub(super) fn windows_task_path(raw: &str) -> Result<String> {
+    plain_value(raw)?;
+    if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        return Ok(format!(r"\\{}", unc));
+    }
+    if let Some(dos) = raw.strip_prefix(r"\\?\") {
+        let bytes = dos.as_bytes();
+        anyhow::ensure!(
+            bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && bytes[2] == b'\\',
+            "unsupported Windows startup path namespace"
+        );
+        return Ok(dos.to_owned());
+    }
+    Ok(raw.to_owned())
+}
+
 fn program(name: &str) -> Result<PathBuf> {
     if name == "powershell" {
         let root = std::env::var_os("SystemRoot").context("Windows SystemRoot unavailable")?;
@@ -205,6 +240,14 @@ fn last_control_stage(bytes: &[u8]) -> String {
         .unwrap_or("unreported")
         .into()
 }
+fn control_hresult(text: &str) -> &str {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("rsrs-control-hresult:"))
+        .filter(|value| value.len() == 8 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .last()
+        .unwrap_or("unreported")
+}
+
 fn encoded_powershell(script: &str) -> String {
     use base64::Engine as _;
     let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
@@ -213,6 +256,9 @@ fn encoded_powershell(script: &str) -> String {
 
 fn checked(name: &str, args: Vec<String>) -> Result<String> {
     let result = control(name, &args)?;
+    if result.code != 0 && name == "powershell" {
+        bail!("Windows current-user operation failed (exit {}, fixed stage {}, HRESULT {}); inspect the owned registration",result.code,last_control_stage(result.stdout.as_bytes()),control_hresult(&result.stdout));
+    }
     anyhow::ensure!(
         result.code == 0,
         "{name} current-user operation failed (exit {}); inspect the owned registration",
@@ -239,7 +285,7 @@ fn powershell(script: String) -> Result<String> {
     .into_iter()
     .find_map(|(needle, label)| script.contains(needle).then_some(label))
     .unwrap_or("query process");
-    let wrapped=format!("$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);[Console]::Out.WriteLine('rsrs-control-stage:script');{script}");
+    let wrapped=format!("$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);[Console]::Out.WriteLine('rsrs-control-stage:script');try{{{script}}}catch{{$failure=$_.Exception;while($null -ne $failure.InnerException){{$failure=$failure.InnerException}};[Console]::Out.WriteLine('rsrs-control-hresult:'+$failure.HResult.ToString('X8'));exit 1}};exit 0");
     let text = checked(
         "powershell",
         vec![
@@ -491,13 +537,15 @@ fn arguments(config: &Registration) -> Result<String> {
 fn task_guard(config: &Registration) -> Result<String> {
     let task = ps_literal(&name(config))?;
     let owner = ps_literal(&config.owner)?;
-    let exe = ps_literal(config.executable.to_str().context("non-UTF8 executable")?)?;
-    let root = ps_literal(
+    let exe = ps_literal(&windows_task_path(
+        config.executable.to_str().context("non-UTF8 executable")?,
+    )?)?;
+    let root = ps_literal(&windows_task_path(
         config
             .installation
             .to_str()
             .context("non-UTF8 installation")?,
-    )?;
+    )?)?;
     let args = ps_literal(&arguments(config)?)?;
     Ok(format!(
         r#"
@@ -688,6 +736,7 @@ pub(super) fn inspect(config: &Registration) -> Result<State> {
 }
 
 pub(super) fn install(config: &mut Registration) -> Result<()> {
+    validate_executable(config.platform, &config.executable)?;
     let before = inspect(config)?;
     anyhow::ensure!(
         !before.registered || config.artifact_hashes.contains_key("service"),
@@ -722,7 +771,7 @@ pub(super) fn install(config: &mut Registration) -> Result<()> {
             checked("launchctl", vec!["enable".into(), label(config)])?;
         }
         Platform::Windows => {
-            powershell(format!("{};$xml=[IO.File]::ReadAllText({});[void]$folder.RegisterTask({},$xml,{},$null,$null,3,$null)",task_guard(config)?,ps_literal(item(config).to_str().context("non-UTF8 task path")?)?,ps_literal(&name(config))?,if before.registered{6}else{2}))?;
+            powershell(format!("{};$xml=[IO.File]::ReadAllText({});[void]$folder.RegisterTask({},$xml,{},{},$null,3,$null)",task_guard(config)?,ps_literal(item(config).to_str().context("non-UTF8 task path")?)?,ps_literal(&name(config))?,if before.registered{6}else{2},ps_literal(&config.owner)?))?;
         }
     }
     Ok(())
@@ -813,6 +862,9 @@ pub(super) fn disable(config: &Registration) -> Result<()> {
                     "systemctl",
                     vec!["--user".into(), "disable".into(), name(config)],
                 )?;
+                // Disabling can remove the user-unit link for an external
+                // owned source. Refresh cached FragmentPath before readback.
+                checked("systemctl", vec!["--user".into(), "daemon-reload".into()])?;
             }
         }
         Platform::Macos => {
@@ -1131,6 +1183,30 @@ mod tests {
                 == "com-connected"
         );
         anyhow::ensure!(last_control_stage(b"rsrs-control-stage:secret-value") == "unreported");
+        Ok(())
+    }
+    #[test]
+    fn scheduler_paths_keep_identity_without_nt_namespace_or_environment_interpretation(
+    ) -> Result<()> {
+        anyhow::ensure!(
+            windows_task_path(r"\\?\C:\safe folder\rsrs.exe")? == r"C:\safe folder\rsrs.exe"
+        );
+        anyhow::ensure!(windows_task_path(r"\\?\UNC\server\share\data")? == r"\\server\share\data");
+        anyhow::ensure!(windows_task_path(r"\\?\GLOBALROOT\Device").is_err());
+        anyhow::ensure!(control_hresult("rsrs-control-hresult:80070005") == "80070005");
+        anyhow::ensure!(control_hresult("rsrs-control-hresult:secret-material") == "unreported");
+        #[cfg(target_os = "linux")]
+        {
+            validate_executable(Platform::Linux, Path::new("/tmp/data spaces % $/rsrs"))?;
+            for path in [
+                "/tmp/bad\"/rsrs",
+                "/tmp/bad'/rsrs",
+                r"/tmp/bad\name/rsrs",
+                "relative/rsrs",
+            ] {
+                anyhow::ensure!(validate_executable(Platform::Linux, Path::new(path)).is_err());
+            }
+        }
         Ok(())
     }
     #[test]

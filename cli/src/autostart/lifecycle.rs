@@ -867,6 +867,8 @@ pub(crate) fn execute(command: &RuntimeCommand) -> Result<()> {
 }
 
 fn enable(now: bool) -> Result<()> {
+    // A platform-rejected native path must not even create lifecycle state.
+    manager::validate_executable(Platform::current()?, &crate::mcp::stable_bin_path())?;
     let _ownership = crate::runtime_policy::takeover_lock()?;
     let mut config = match read_registration(&respire::service::main_data_dir())? {
         Some(config) if !config.enabled && config.artifact_hashes.is_empty() => {
@@ -929,6 +931,10 @@ fn disable(stop: bool, remove: bool) -> Result<()> {
     owned(&config)?;
     let actual = manager::inspect(&config)?;
     anyhow::ensure!(
+        !remove || stop || marker(&config.installation)?.is_none(),
+        "interrupted maintenance requires remove --stop or explicit host runtime restart"
+    );
+    anyhow::ensure!(
         !remove || stop || !actual.running,
         "stop the owned runtime before removing its startup registration"
     );
@@ -936,7 +942,7 @@ fn disable(stop: bool, remove: bool) -> Result<()> {
         ensure_control_endpoint(&config)?;
         config.manually_stopped = true;
         save(&mut config)?;
-        let mut guard = Maintenance::begin(config, false)?;
+        let mut guard = Maintenance::begin(config, true)?;
         raw_stop_owned(guard.config.as_ref().context("registration missing")?)?;
         guard.finish()?;
         config = read_registration(&respire::service::main_data_dir())?
@@ -1259,6 +1265,29 @@ mod tests {
         let mut recovered = restart_maintenance_locked()?;
         recovered.finish()?;
         anyhow::ensure!(!background_paused());
+        state.borrow_mut().fail = Some("enable".into());
+        let failed = enable(false)
+            .err()
+            .context("backend registration failure was not returned")?;
+        anyhow::ensure!(
+            format!("{failed:#}").contains("systemctl current-user operation failed"),
+            "fixture did not reach backend registration failure"
+        );
+        anyhow::ensure!(
+            marker(&root)?.is_some()
+                && !read_registration(&root)?
+                    .context("failed registration missing")?
+                    .enabled
+        );
+        state.borrow_mut().fail = None;
+        disable(true, true)?;
+        anyhow::ensure!(
+            marker(&root)?.is_none()
+                && !manager::inspect(
+                    &read_registration(&root)?.context("removed registration missing")?
+                )?
+                .registered
+        );
         Ok(())
     }
 

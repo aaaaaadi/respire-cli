@@ -26,9 +26,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {os: ubuntu-latest, target: x86_64-unknown-linux-gnu, suffix: ''}
-          - {os: macos-latest, target: aarch64-apple-darwin, suffix: ''}
-          - {os: windows-latest, target: x86_64-pc-windows-msvc, suffix: '.exe'}
+          - {os: ubuntu-latest, target: x86_64-unknown-linux-gnu, suffix: '', previous_package: '@rsrsai/linux-x64-gnu'}
+          - {os: macos-latest, target: aarch64-apple-darwin, suffix: '', previous_package: '@rsrsai/macos-arm64'}
+          - {os: windows-latest, target: x86_64-pc-windows-msvc, suffix: '.exe', previous_package: '@rsrsai/win-x64'}
     env:
       RSRS_ENGINE: cpu
       RUST_TEST_THREADS: '1'
@@ -85,11 +85,25 @@ jobs:
           cargo test --locked -p respire_spawn --target "$SDK_TARGET" --target-dir target/autostart-validation
           cargo test --locked -p respire --bin rsrs autostart:: --target "$SDK_TARGET" --target-dir target/autostart-validation -- --test-threads=1
           cargo build --locked -p respire --bin rsrs --target "$SDK_TARGET" --target-dir target/autostart-validation
+      - name: Fetch immutable previous public native version without install scripts
+        shell: bash
+        env:
+          PREVIOUS_PACKAGE: ${{ matrix.previous_package }}
+        run: |
+          set -euo pipefail
+          : > "$RUNNER_TEMP/autostart-user.npmrc"
+          : > "$RUNNER_TEMP/autostart-global.npmrc"
+          export NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/autostart-user.npmrc"
+          export NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/autostart-global.npmrc"
+          unset NODE_AUTH_TOKEN NPM_TOKEN
+          npm install --prefix "$RUNNER_TEMP/autostart-previous" --ignore-scripts --no-bin-links --no-audit --no-fund --registry https://registry.npmjs.org "$PREVIOUS_PACKAGE@1.0.17-dev.6"
+          node -e 'const fs=require("fs"),p=require("path");const lock=JSON.parse(fs.readFileSync(p.join(process.env.RUNNER_TEMP,"autostart-previous/package-lock.json")));const key="node_modules/"+process.env.PREVIOUS_PACKAGE;const x=lock.packages[key];if(x.version!=="1.0.17-dev.6"||!x.integrity.startsWith("sha512-"))throw Error("previous native integrity unavailable");console.log(JSON.stringify({name:process.env.PREVIOUS_PACKAGE,version:x.version,integrity:x.integrity}));'
       - name: Foreground and actual isolated current-user service lifecycle
         shell: bash
         env:
           SDK_TARGET: ${{ matrix.target }}
           EXE_SUFFIX: ${{ matrix.suffix }}
+          PREVIOUS_PACKAGE: ${{ matrix.previous_package }}
         run: |
           set -euo pipefail
-          python scripts/test-runtime-autostart.py --binary "target/autostart-validation/$SDK_TARGET/debug/rsrs$EXE_SUFFIX" --register
+          python scripts/test-runtime-autostart.py --binary "target/autostart-validation/$SDK_TARGET/debug/rsrs$EXE_SUFFIX" --register --previous-binary "$RUNNER_TEMP/autostart-previous/node_modules/$PREVIOUS_PACKAGE/bin/rsrs$EXE_SUFFIX"
