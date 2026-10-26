@@ -293,7 +293,7 @@ fn ps_literal(value: &str) -> Result<String> {
     Ok(format!("'{}'", value.replace('\'', "''")))
 }
 
-fn powershell(script: String) -> Result<String> {
+pub(super) fn powershell(script: String) -> Result<String> {
     let operation = [
         ("WindowsIdentity", "query current user"),
         (".DeleteTask(", "remove owned task"),

@@ -422,33 +422,23 @@ pub(crate) fn process_is_running(pid: u32) -> Result<bool> {
             Err(error) => Err(error).context("runtime process inspection failed"),
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
     {
-        #[cfg(windows)]
-        let output = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-            .output().context("cannot check stopped runtime process")?;
-        #[cfg(unix)]
+        // Query-limited kernel handles avoid spawning tasklist on every drain
+        // poll and retain fail-closed errors for inaccessible process identity.
+        Ok(respire_spawn::process_birth(pid)?.is_some())
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
         let output = std::process::Command::new("ps")
             .args(["-p", &pid.to_string(), "-o", "pid=", "-o", "stat="])
             .output().context("cannot check stopped runtime process")?;
         let text = String::from_utf8_lossy(&output.stdout);
-        #[cfg(windows)]
-        let alive = {
-            anyhow::ensure!(output.status.success(), "runtime process inspection failed");
-            text.lines().any(|line| line.split(',').nth(1)
-                .is_some_and(|value| value.trim_matches('"') == pid.to_string()))
-        };
-        #[cfg(unix)]
-        let alive = {
-            anyhow::ensure!(output.status.success() || output.stderr.is_empty(), "runtime process inspection failed");
-            let mut fields = text.split_whitespace();
-            // An unreaped child still has a PID, but has exited and released its
-            // listener, native session and database locks. Do not wait for its parent.
-            fields.next() == Some(pid.to_string().as_str())
-                && fields.next().is_some_and(|state| !state.starts_with('Z'))
-        };
-        Ok(alive)
+        anyhow::ensure!(output.status.success() || output.stderr.is_empty(), "runtime process inspection failed");
+        let mut fields = text.split_whitespace();
+        // Zombies have released their listener, native session and database locks.
+        Ok(fields.next() == Some(pid.to_string().as_str())
+            && fields.next().is_some_and(|state| !state.starts_with('Z')))
     }
 }
 
@@ -487,12 +477,10 @@ pub(crate) fn runtime_process_identity(pid: u32) -> Result<RuntimeProcessIdentit
     #[cfg(windows)]
     {
         let script = format!(r#"$ErrorActionPreference='Stop'; $runtimeProc=Get-CimInstance Win32_Process -Filter 'ProcessId={pid}'; if ($null -eq $runtimeProc) {{ exit 0 }}; $runtimeArgs=$runtimeProc.CommandLine -split '\s+'; $isRuntime=($runtimeArgs -contains '--runtime-internal') -or (($runtimeArgs -contains 'web') -and ($runtimeArgs -contains '--internal')) -or ($runtimeProc.CommandLine -cmatch '^\s*(?:"[^"]+"|\S+)(?:\s+--(?:json|direct))*\s+runtime\s+run(?:\s|$)'); [pscustomobject]@{{started_at=$runtimeProc.CreationDate.ToUniversalTime().Ticks.ToString(); executable=$runtimeProc.ExecutablePath; runtime=$isRuntime}} | ConvertTo-Json -Compress"#);
-        let output = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script]).output()?;
-        anyhow::ensure!(output.status.success(), "cannot inspect runtime process {pid}");
+        let output = crate::autostart::windows_process_inspection(script)?;
         #[derive(serde::Deserialize)]
         struct Process { started_at: String, executable: String, runtime: bool }
-        let process: Process = serde_json::from_slice(&output.stdout)
+        let process: Process = serde_json::from_str(&output)
             .context("runtime process disappeared or could not be identified")?;
         anyhow::ensure!(process.runtime, "process {pid} is not a runtime; restart refused");
         Ok(RuntimeProcessIdentity { started_at: process.started_at, executable: process.executable })

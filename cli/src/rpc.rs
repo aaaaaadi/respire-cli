@@ -915,6 +915,19 @@ pub(crate) fn restart_runtime(timeout: Duration) -> Result<Value> {
             Some(crate::runtime_error::RuntimeError::Transport(_))) => None,
         Err(error) => return Err(error),
     };
+    if crate::autostart::managed_enabled()? && health.is_some() {
+        // The active maintenance guard forces the managed coordinator to drain
+        // the authenticated, exact registered executable/profile and stop its
+        // service owner before replacement. Do not route this healthy owner
+        // through legacy unresponsive-process discovery (including WMI).
+        let stopped_pid = health.as_ref().map(|value| value.pid);
+        ensure_daemon_locked()?;
+        let ready = crate::net_rpc::health()?;
+        if !respire::service::off_mode() { verify_open_store(&respire::service::data_dir())?; }
+        maintenance.finish()?;
+        return Ok(json!({"state":"ready", "stopped_pid":stopped_pid, "pid":ready.pid,
+            "forced":false, "data_dir":ready.data_dir, "version":ready.bin}));
+    }
     let listener = crate::net_rpc::pid_listening_on(crate::net_rpc::rpc_port());
     let pid = health.as_ref().map(|health| health.pid).or(listener)
         .or_else(|| endpoint_pid().filter(|pid| crate::net_rpc::pid_is_respire(*pid)));
