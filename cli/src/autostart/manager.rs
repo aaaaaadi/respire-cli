@@ -46,8 +46,7 @@ pub(super) fn process_birth(pid: u32) -> Result<Option<String>> {
     }
     #[cfg(windows)]
     {
-        let raw = powershell(format!("$p=Get-CimInstance Win32_Process -Filter 'ProcessId={pid}';if($null -ne $p){{$p.CreationDate.ToUniversalTime().Ticks.ToString()}}"))?;
-        return Ok((!raw.trim().is_empty()).then(|| raw.trim().to_owned()));
+        return Ok(respire_spawn::process_birth(pid)?.map(|value| value.to_string()));
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
@@ -490,7 +489,8 @@ pub(super) fn inspect(config: &Registration) -> Result<State> {
             let enabled = launchd_enabled(&disabled, &name(config))?;
             let output = control("launchctl", &["print".into(), label(config)])?;
             if output.code != 0 {
-                checked("launchctl", vec!["print".into(), domain(config)])?;
+                // print-disabled above already verified the user domain; a
+                // full domain print can exceed the deliberately bounded output.
                 anyhow::ensure!(
                     [3, 113].contains(&output.code),
                     "LaunchAgent query failed; refusing lifecycle action"

@@ -33,8 +33,17 @@ def main():
             port_socket.bind(("127.0.0.1", 0))
             port = port_socket.getsockname()[1]
         env = {key: os.environ[key] for key in (
-            "PATH", "LANG", "LC_ALL", "SystemRoot", "WINDIR", "TEMP", "TMP"
+            "PATH", "LANG", "LC_ALL", "SystemRoot", "WINDIR", "TEMP", "TMP",
+            "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "LLVM_PROFILE_FILE"
         ) if key in os.environ}
+        if args.register and os.name == "posix" and os.uname().sysname == "Linux":
+            import stat
+            runtime = Path(f"/run/user/{os.getuid()}")
+            if runtime.is_dir() and runtime.stat().st_uid == os.getuid():
+                bus = runtime / "bus"
+                if bus.exists() and stat.S_ISSOCK(bus.stat().st_mode):
+                    env.setdefault("XDG_RUNTIME_DIR", str(runtime))
+                    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={bus}")
         env.update(HOME=str(home), USERPROFILE=str(home), RSRS_DATA_DIR=str(root),
                    RSRS_BIN_DIR=str(base / "bin"), RSRS_RPC_PORT=str(port),
                    RSRS_CORE_TEST_MODE="1")
@@ -83,6 +92,21 @@ def main():
                     child.wait(timeout=20)
         print("PASS: read-only default-off status, client-only denial, actual foreground store readiness and owned stop")
         if args.register:
+            def collect_managed_profiles():
+                # A service manager deliberately does not inherit test-runner
+                # profiling variables. Collect the real instrumented native
+                # child's default profiles from this disposable working root.
+                pattern = os.environ.get("LLVM_PROFILE_FILE")
+                if not pattern:
+                    return
+                import shutil
+                import uuid
+                destination = Path(pattern).parent
+                assert destination.is_dir(), "coverage profile destination missing"
+                for profile in root.rglob("*.profraw"):
+                    assert not profile.is_symlink() and profile.stat().st_size <= 64 * 1024 * 1024
+                    shutil.copyfile(profile, destination / f"autostart-managed-{uuid.uuid4().hex}.profraw")
+
             def run(*argv):
                 result = command(*argv)
                 assert result.returncode == 0, f"{argv}: {result.stderr} {result.stdout}"
@@ -123,6 +147,7 @@ def main():
                 # never delete unknown OS tasks/units merely to make a test pass.
                 cleanup = command("runtime", "autostart", "remove", "--stop")
                 assert cleanup.returncode == 0, f"Owned registration cleanup failed: {cleanup.stderr} {cleanup.stdout}"
+                collect_managed_profiles()
 
 
 
