@@ -1053,6 +1053,33 @@ fn run_foreground(id: Option<&str>, root: Option<&Path>) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn registration_captures_nonsecret_opt_outs_and_legacy_names_canonically() -> Result<()> {
+        let _lock = crate::TEST_ENV_LOCK.lock().map_err(|_| anyhow::anyhow!("test environment lock poisoned"))?;
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key,value) in &self.0 {
+                    match value { Some(value) => std::env::set_var(key,value), None => std::env::remove_var(key) }
+                }
+            }
+        }
+        let keys=["RSRS_DATA_DIR","RSRS_BIN_DIR","RSRS_NO_AUTOSYNC","ONEMEMORY_NO_AUTOSYNC","RSRS_UPDATE_CHECK"];
+        let _restore=Restore(keys.into_iter().map(|key|(key,std::env::var_os(key))).collect());
+        let root=tempfile::tempdir()?;
+        std::env::set_var("RSRS_DATA_DIR",root.path());
+        std::env::set_var("RSRS_BIN_DIR",root.path().join("bin"));
+        std::env::remove_var("RSRS_NO_AUTOSYNC");
+        std::env::set_var("ONEMEMORY_NO_AUTOSYNC","1");
+        std::env::set_var("RSRS_UPDATE_CHECK","0");
+        let config=new_registration()?;
+        anyhow::ensure!(config.environment.get("RSRS_NO_AUTOSYNC").map(String::as_str)==Some("1"));
+        anyhow::ensure!(config.environment.get("RSRS_UPDATE_CHECK").map(String::as_str)==Some("0"));
+        anyhow::ensure!(!config.environment.keys().any(|key|key.starts_with("ONEMEMORY_")));
+        anyhow::ensure!(!control_path(root.path()).exists(),"capturing settings registered startup");
+        Ok(())
+    }
+
+    #[test]
     fn every_unfinished_phase_fences_requests_and_background_work() -> Result<()> {
         let _lock = crate::TEST_ENV_LOCK
             .lock()

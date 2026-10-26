@@ -82,7 +82,9 @@ then explicitly enable again with the new settings. A mismatched caller port is
 refused before stopping a service, so an unreachable old endpoint cannot silently
 turn into a forced shutdown. Status reports `configured_rpc_port`.
 
-Only non-secret allowlisted runtime settings are saved. Credentials and recovery
+Only non-secret allowlisted runtime settings are saved, including explicit
+`RSRS_NO_AUTOSYNC` and `RSRS_UPDATE_CHECK` opt-outs (legacy prefixes are read and
+saved under their canonical names). Credentials and recovery
 material are never stored in a service command line or registration. Managed
 launches have a persistent limit of three attempts per 120 seconds, plus the OS
 restart delay. Explicit start/restart resets the owned unit's launch budget.

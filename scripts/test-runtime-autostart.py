@@ -51,7 +51,7 @@ def main():
                     env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={bus}")
         env.update(HOME=str(home), USERPROFILE=str(home), RSRS_DATA_DIR=str(root),
                    RSRS_BIN_DIR=str(base / "bin"), RSRS_RPC_PORT=str(port),
-                   RSRS_CORE_TEST_MODE="1")
+                   RSRS_CORE_TEST_MODE="1", RSRS_NO_AUTOSYNC="1", RSRS_UPDATE_CHECK="0")
 
         def command(*argv):
             return subprocess.run([binary, "--json", *argv], env=env,
@@ -236,6 +236,14 @@ def main():
                 assert up["runtime"]["running"] is True and up["runtime"]["store_ready"] is True, up
                 first_pid = up["runtime"]["pid"]
                 config_path = root / "runtime/autostart/registration.json"
+                # Observe the managed child's captured opt-out through the
+                # existing client-only RPC, with the caller deliberately set
+                # to the opposite value. No sync or network write is requested.
+                config_reply=subprocess.run([binary,"--json","--client-only","config"],
+                    env=dict(env,RSRS_NO_AUTOSYNC="0"),capture_output=True,text=True,timeout=45)
+                assert config_reply.returncode == 0, f"managed config query failed: {config_reply.stdout} {config_reply.stderr}"
+                assert json.loads(config_reply.stdout)["summary"]["autosync"] is False, "managed runtime lost explicit no-autosync opt-out"
+                print("PASS: managed child retains no-autosync opt-out independently of caller environment")
                 unchanged_config = config_path.read_bytes()
                 with socket.socket() as other_socket:
                     other_socket.bind(("127.0.0.1",0))
