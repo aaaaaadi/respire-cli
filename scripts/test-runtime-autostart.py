@@ -19,7 +19,10 @@ import urllib.request
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--register", action="store_true", help="Exercise a disposable current-user OS registration on an ephemeral GitHub runner")
     args = parser.parse_args()
+    if args.register and not (os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"):
+        parser.error("OS registration acceptance is limited to an ephemeral GitHub-hosted runner")
     binary = str(args.binary.resolve(strict=True))
     with tempfile.TemporaryDirectory(prefix="respire-autostart-") as temporary:
         base = Path(temporary)
@@ -79,6 +82,48 @@ def main():
                     child.terminate()
                     child.wait(timeout=20)
         print("PASS: read-only default-off status, client-only denial, actual foreground store readiness and owned stop")
+        if args.register:
+            def run(*argv):
+                result = command(*argv)
+                assert result.returncode == 0, f"{argv}: {result.stderr} {result.stdout}"
+                value = json.loads(result.stdout)
+                assert value["status"] == "ok", value
+                return value["summary"]
+
+            try:
+                enabled = run("runtime", "autostart", "enable")
+                assert enabled["enabled"] is True and enabled["registered"] is True, enabled
+                assert enabled["runtime"]["running"] is False, "enable without --now unexpectedly starts runtime"
+                run("runtime", "autostart", "enable")  # idempotent, same installation
+                run("runtime", "start")
+                up = run("runtime", "status")
+                assert up["runtime"]["running"] is True and up["runtime"]["store_ready"] is True, up
+                first_pid = up["runtime"]["pid"]
+                run("runtime", "stop")
+                time.sleep(1)
+                stopped = run("runtime", "status")
+                assert stopped["runtime"]["running"] is False, "manual stop was automatically resurrected"
+                run("runtime", "restart")
+                restarted = run("runtime", "status")
+                assert restarted["runtime"]["running"] and restarted["runtime"]["pid"] != first_pid, restarted
+                run("runtime", "autostart", "disable", "--stop")
+                disabled = run("runtime", "status")
+                assert disabled["enabled"] is False and disabled["runtime"]["running"] is False, disabled
+                run("runtime", "autostart", "enable", "--now")
+                assert run("runtime", "status")["runtime"]["running"] is True
+                preserved = root / "synthetic-preserved-file"
+                preserved.write_text("must survive uninstall")
+                run("runtime", "autostart", "remove", "--stop")
+                removed = run("runtime", "status")
+                assert not removed["registered"] and not removed["enabled"] and not removed["runtime"]["running"], removed
+                assert preserved.read_text() == "must survive uninstall"
+                print("PASS: actual current-user register/readback/start/stop/restart/disable/reenable/remove; data retained")
+            finally:
+                # The CLI revalidates exact owner/action/files before cleanup;
+                # never delete unknown OS tasks/units merely to make a test pass.
+                cleanup = command("runtime", "autostart", "remove", "--stop")
+                assert cleanup.returncode == 0, f"Owned registration cleanup failed: {cleanup.stderr} {cleanup.stdout}"
+
 
 
 if __name__ == "__main__":
