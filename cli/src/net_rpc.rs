@@ -38,6 +38,10 @@ pub struct Health {
     pub store_ready: bool,
     #[serde(default)]
     pub snapshot_restore_id: Option<String>,
+    #[serde(default)]
+    pub installation_root: String,
+    #[serde(default)]
+    pub managed_id: Option<String>,
 }
 
 impl Health {
@@ -315,7 +319,7 @@ pub fn request_stop() -> Result<()> {
 pub(crate) fn request_stop_with_timeout(timeout: Duration) -> Result<()> {
     crate::runtime_policy::require_host("runtime shutdown")?;
     let url = format!("{}/api/runtime/stop", rpc_base_url());
-    send_loopback(agent().post(&url).timeout(timeout), |request| request.send_string("{}"))?;
+    send_loopback(agent().post(&url).timeout(timeout).set("X-Respire-Lifecycle", "coordinator-v1"), |request| request.send_string("{}"))?;
     Ok(())
 }
 
@@ -464,11 +468,22 @@ pub(crate) struct RuntimeProcessIdentity {
 
 /// An endpoint PID is only a locator. Verify runtime arguments and creation time
 /// before waiting, then compare again before forcefully terminating the process.
+fn foreground_runtime_arguments(args: &[&str]) -> bool {
+    let mut args = args.iter().copied().skip(1);
+    let command = loop {
+        match args.next() {
+            Some("--json" | "--direct") => continue,
+            other => break other,
+        }
+    };
+    command == Some("runtime") && args.next() == Some("run")
+}
+
 pub(crate) fn runtime_process_identity(pid: u32) -> Result<RuntimeProcessIdentity> {
     anyhow::ensure!(pid != std::process::id() && pid_is_respire(pid), "cannot verify runtime process {pid}");
     #[cfg(windows)]
     {
-        let script = format!(r#"$ErrorActionPreference='Stop'; $runtimeProc=Get-CimInstance Win32_Process -Filter 'ProcessId={pid}'; if ($null -eq $runtimeProc) {{ exit 0 }}; $runtimeArgs=$runtimeProc.CommandLine -split '\s+'; $isRuntime=($runtimeArgs -contains '--runtime-internal') -or (($runtimeArgs -contains 'web') -and ($runtimeArgs -contains '--internal')); [pscustomobject]@{{started_at=$runtimeProc.CreationDate.ToUniversalTime().Ticks.ToString(); executable=$runtimeProc.ExecutablePath; runtime=$isRuntime}} | ConvertTo-Json -Compress"#);
+        let script = format!(r#"$ErrorActionPreference='Stop'; $runtimeProc=Get-CimInstance Win32_Process -Filter 'ProcessId={pid}'; if ($null -eq $runtimeProc) {{ exit 0 }}; $runtimeArgs=$runtimeProc.CommandLine -split '\s+'; $isRuntime=($runtimeArgs -contains '--runtime-internal') -or (($runtimeArgs -contains 'web') -and ($runtimeArgs -contains '--internal')) -or ($runtimeProc.CommandLine -cmatch '^\s*(?:"[^"]+"|\S+)(?:\s+--(?:json|direct))*\s+runtime\s+run(?:\s|$)'); [pscustomobject]@{{started_at=$runtimeProc.CreationDate.ToUniversalTime().Ticks.ToString(); executable=$runtimeProc.ExecutablePath; runtime=$isRuntime}} | ConvertTo-Json -Compress"#);
         let output = std::process::Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script]).output()?;
         anyhow::ensure!(output.status.success(), "cannot inspect runtime process {pid}");
@@ -485,7 +500,7 @@ pub(crate) fn runtime_process_identity(pid: u32) -> Result<RuntimeProcessIdentit
         let command = std::fs::read(directory.join("cmdline"))?;
         let args: Vec<_> = command.split(|byte| *byte == 0)
             .filter_map(|arg| std::str::from_utf8(arg).ok()).collect();
-        anyhow::ensure!(args.contains(&"--runtime-internal") || (args.contains(&"web") && args.contains(&"--internal")),
+        anyhow::ensure!(args.contains(&"--runtime-internal") || (args.contains(&"web") && args.contains(&"--internal")) || foreground_runtime_arguments(&args),
             "process {pid} is not a runtime; restart refused");
         let stat = std::fs::read_to_string(directory.join("stat"))?;
         let started_at = stat.rsplit_once(')').and_then(|(_, fields)| fields.split_whitespace().nth(19))
@@ -503,8 +518,11 @@ pub(crate) fn runtime_process_identity(pid: u32) -> Result<RuntimeProcessIdentit
         let text = text.trim_end();
         let started_at = text.get(..24).context("runtime process creation time missing")?.to_owned();
         let command = text.get(24..).context("runtime process command missing")?.trim();
+        let stable = crate::mcp::stable_bin_path();
+        let foreground = command.strip_prefix(stable.to_string_lossy().as_ref())
+            .is_some_and(|tail| { let mut args = vec!["rsrs"]; args.extend(tail.split_whitespace()); foreground_runtime_arguments(&args) });
         let args: Vec<_> = command.split_whitespace().collect();
-        anyhow::ensure!(args.contains(&"--runtime-internal") || (args.contains(&"web") && args.contains(&"--internal")),
+        anyhow::ensure!(args.contains(&"--runtime-internal") || (args.contains(&"web") && args.contains(&"--internal")) || foreground || foreground_runtime_arguments(&args),
             "process {pid} is not a runtime; restart refused");
         Ok(RuntimeProcessIdentity { started_at, executable: command.to_owned() })
     }

@@ -22,6 +22,50 @@ struct Output {
     stdout: String,
 }
 
+/// Creation identity only: never persist a controller command line, which may
+/// contain login material. None means that the controller has exited.
+pub(super) fn process_birth(pid: u32) -> Result<Option<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        let raw = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let fields = raw.rsplit_once(')').context("invalid process identity")?.1;
+        if fields.split_whitespace().next() == Some("Z") {
+            return Ok(None);
+        }
+        return Ok(Some(
+            fields
+                .split_whitespace()
+                .nth(19)
+                .context("process birth missing")?
+                .into(),
+        ));
+    }
+    #[cfg(windows)]
+    {
+        let raw = powershell(format!("$p=Get-CimInstance Win32_Process -Filter 'ProcessId={pid}';if($null -ne $p){{$p.CreationDate.ToUniversalTime().Ticks.ToString()}}"))?;
+        return Ok((!raw.trim().is_empty()).then(|| raw.trim().to_owned()));
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let output = control(
+            "ps",
+            &["-p".into(), pid.to_string(), "-o".into(), "lstart=".into()],
+        )?;
+        if output.code == 1 && output.stdout.trim().is_empty() {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            output.code == 0 && !output.stdout.trim().is_empty(),
+            "process identity unavailable"
+        );
+        Ok(Some(output.stdout.trim().into()))
+    }
+}
+
 fn program(name: &str) -> Result<PathBuf> {
     if name == "powershell" {
         let root = std::env::var_os("SystemRoot").context("Windows SystemRoot unavailable")?;
@@ -230,14 +274,14 @@ fn verify_systemd_loaded(
     exec: &serde_json::Value,
     dropins: &serde_json::Value,
 ) -> Result<()> {
-    let overrides = dropins["data"][0]
+    let overrides = dropins["data"]
         .as_array()
         .context("systemd loaded drop-in list unavailable")?;
     anyhow::ensure!(
         overrides.is_empty(),
         "unknown systemd drop-in override; refusing lifecycle action"
     );
-    let entries = exec["data"][0]
+    let entries = exec["data"]
         .as_array()
         .context("systemd loaded ExecStart unavailable")?;
     anyhow::ensure!(entries.len() == 1, "unknown systemd loaded ExecStart count");
@@ -275,6 +319,25 @@ fn verify_systemd_loaded(
     );
     Ok(())
 }
+fn launchd_enabled(disabled: &str, name: &str) -> Result<bool> {
+    anyhow::ensure!(
+        disabled.contains("disabled services = {") && disabled.trim_end().ends_with('}'),
+        "launchd disabled override status unavailable"
+    );
+    let key = format!("\"{name}\" => ");
+    let mut matched = disabled
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(&key));
+    let enabled = match matched.next() {
+        None => true,
+        Some("true") => false,
+        Some("false") => true,
+        Some(_) => bail!("unknown launchd disabled override value"),
+    };
+    anyhow::ensure!(matched.next().is_none(), "duplicate launchd override entry");
+    Ok(enabled)
+}
+
 fn label(config: &Registration) -> String {
     format!("{}/{}", domain(config), name(config))
 }
@@ -410,6 +473,8 @@ pub(super) fn inspect(config: &Registration) -> Result<State> {
             })
         }
         Platform::Macos => {
+            let disabled = checked("launchctl", vec!["print-disabled".into(), domain(config)])?;
+            let enabled = launchd_enabled(&disabled, &name(config))?;
             let output = control("launchctl", &["print".into(), label(config)])?;
             if output.code != 0 {
                 checked("launchctl", vec!["print".into(), domain(config)])?;
@@ -421,7 +486,7 @@ pub(super) fn inspect(config: &Registration) -> Result<State> {
                     registered: item(config).is_file(),
                     loaded: false,
                     running: false,
-                    enabled: config.enabled,
+                    enabled,
                 });
             }
             let property = |key: &str| {
@@ -466,7 +531,7 @@ pub(super) fn inspect(config: &Registration) -> Result<State> {
                 registered: true,
                 loaded: true,
                 running: property("state") == Some("running"),
-                enabled: config.enabled,
+                enabled,
             })
         }
         Platform::Windows => {
@@ -681,24 +746,46 @@ mod tests {
             0,
             0
         ]);
-        let exec = serde_json::json!({"data":[[row]]});
-        let clean = serde_json::json!({"data":[[]]});
+        let exec = serde_json::json!({"data":[row]});
+        let clean = serde_json::json!({"data":[]});
         verify_systemd_loaded(&config, &exec, &clean)?;
         anyhow::ensure!(verify_systemd_loaded(
             &config,
             &exec,
-            &serde_json::json!({"data":[["/tmp/foreign.conf"]]})
+            &serde_json::json!({"data":["/tmp/foreign.conf"]})
         )
         .is_err());
         let mut changed = exec.clone();
-        changed["data"][0][0][0] = serde_json::json!("/tmp/foreign");
+        changed["data"][0][0] = serde_json::json!("/tmp/foreign");
         anyhow::ensure!(verify_systemd_loaded(&config, &changed, &clean).is_err());
         changed = exec.clone();
-        changed["data"][0][0][1][4] = serde_json::json!("another-installation");
+        changed["data"][0][1][4] = serde_json::json!("another-installation");
         anyhow::ensure!(verify_systemd_loaded(&config, &changed, &clean).is_err());
         anyhow::ensure!(
-            verify_systemd_loaded(&config, &serde_json::json!({"data":[[]]}), &clean).is_err()
+            verify_systemd_loaded(&config, &serde_json::json!({"data":[]}), &clean).is_err()
         );
+        Ok(())
+    }
+    #[test]
+    fn launchd_status_uses_actual_disabled_override() -> Result<()> {
+        anyhow::ensure!(launchd_enabled(
+            "disabled services = {\n}",
+            "ai.risense.test"
+        )?);
+        anyhow::ensure!(!launchd_enabled(
+            "disabled services = {\n \"ai.risense.test\" => true\n}",
+            "ai.risense.test"
+        )?);
+        anyhow::ensure!(launchd_enabled(
+            "disabled services = {\n \"ai.risense.test\" => false\n}",
+            "ai.risense.test"
+        )?);
+        anyhow::ensure!(launchd_enabled(
+            "disabled services = {\n \"ai.risense.test\" => unknown\n}",
+            "ai.risense.test"
+        )
+        .is_err());
+        anyhow::ensure!(launchd_enabled("unrecognized", "ai.risense.test").is_err());
         Ok(())
     }
     #[test]

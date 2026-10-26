@@ -277,6 +277,7 @@ pub(crate) fn invalidate_sync_boundary(generation: usize) -> Result<()> {
 }
 
 pub(crate) fn check_sync_context(generation: usize) -> Result<()> {
+    anyhow::ensure!(!crate::autostart::background_paused(), "runtime maintenance pauses background work");
     respire::service::ensure_runtime_profile()?;
     if STOPPING.load(Ordering::Acquire) {
         bail!("runtime is stopping");
@@ -374,7 +375,7 @@ fn index_has_work() -> bool {
 fn index_loop_inner() -> Result<()> {
     let mut model_wait_started: Option<Instant> = None;
     loop {
-        if respire::service::service_paused() {
+        if respire::service::service_paused() || crate::autostart::background_paused() {
             if STOPPING.load(Ordering::Acquire) { return Ok(()); }
             let mut work = INDEX_WORK.lock().map_err(|_| anyhow::anyhow!("index work lock poisoned"))?;
             work.state = "paused";
@@ -581,6 +582,10 @@ fn flight_loop() {
                     }
                     FLIGHT_ON.store(false, Ordering::Release);
                     return;
+                }
+                if crate::autostart::background_paused() {
+                    state = SYNC_CV.wait_timeout(state, Duration::from_millis(250)).unwrap_or_else(|e| e.into_inner()).0;
+                    continue;
                 }
                 if let Some(job) = state.manual.pop_front() {
                     break Some(job);
@@ -896,6 +901,7 @@ pub fn stop_if_running() -> Result<()> {
 pub(crate) fn restart_runtime(timeout: Duration) -> Result<Value> {
     crate::runtime_policy::require_host("runtime restart")?;
     let _takeover = crate::runtime_policy::takeover_lock()?;
+    let mut maintenance = crate::autostart::restart_maintenance_locked()?;
     crate::progress::phase("检查 runtime 进程", "Checking runtime process");
     let health = match probe_runtime() {
         Ok(health) => health,
@@ -951,6 +957,8 @@ pub(crate) fn restart_runtime(timeout: Duration) -> Result<Value> {
     crate::progress::phase("启动 runtime；等待就绪", "Starting runtime; waiting for readiness");
     ensure_daemon_locked()?;
     let ready = crate::net_rpc::health()?;
+    verify_open_store(&respire::service::data_dir())?;
+    maintenance.finish()?;
     Ok(json!({"state":"ready", "stopped_pid":pid, "pid":ready.pid,
         "forced":forced, "data_dir":ready.data_dir, "version":ready.bin}))
 }
@@ -1641,6 +1649,8 @@ pub(crate) fn health_body() -> Value {
         "exe": exe,
         "data_dir": respire::service::data_dir().display().to_string(),
         "store_ready": STORE_READY.load(Ordering::Acquire),
+        "installation_root": respire::service::main_data_dir().display().to_string(),
+        "managed_id": crate::autostart::managed_id(),
         "snapshot_restore_id": SNAPSHOT_BOOT_ID.lock().ok().and_then(|slot|slot.clone()),
         "recall_statistics": recall_stats_status(),
         "retrieval_index": index_status(),
@@ -2342,6 +2352,7 @@ pub(crate) fn ensure_daemon_locked() -> Result<()> {
         stop_occupant(health.pid)?;
     }
     let executable = crate::mcp::materialize_bin().map_err(anyhow::Error::msg)?;
+    crate::autostart::authorize_detached_boot_locked()?;
     let mut child =
         respire_spawn::spawn_runtime_with_boot_token(&executable, crate::autostart::lifecycle_boot_token().as_deref()).context("failed to start host runtime")?;
     let result = wait_daemon_ready(&mut child, &executable);

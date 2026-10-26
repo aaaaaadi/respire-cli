@@ -36,6 +36,8 @@ struct Marker {
     phase: Phase,
     expected_profile: Option<PathBuf>,
     expected_version: String,
+    owner_pid: u32,
+    owner_birth: String,
 }
 
 fn marker_path(root: &Path) -> PathBuf {
@@ -58,6 +60,10 @@ fn marker(root: &Path) -> Result<Option<Marker>> {
         "invalid runtime maintenance marker"
     );
     Ok(Some(value))
+}
+
+fn controller_alive(value: &Marker) -> Result<bool> {
+    Ok(manager::process_birth(value.owner_pid)?.as_deref() == Some(value.owner_birth.as_str()))
 }
 
 fn save(config: &mut Registration) -> Result<()> {
@@ -126,6 +132,10 @@ pub(crate) fn verify_managed_boot() -> Result<()> {
         );
     }
     if let Some(value) = marker(&root)? {
+        anyhow::ensure!(
+            controller_alive(&value)?,
+            "maintenance controller exited; explicit host runtime restart is required"
+        );
         let token = std::env::var("RSRS_RUNTIME_BOOT_TOKEN").ok();
         let permitted = managed_id() == Some(value.id.as_str())
             || token.as_deref() == Some(value.token.as_str());
@@ -184,6 +194,9 @@ impl Maintenance {
             phase: Phase::Paused,
             expected_profile: None,
             expected_version: env!("CARGO_PKG_VERSION").into(),
+            owner_pid: std::process::id(),
+            owner_birth: manager::process_birth(std::process::id())?
+                .context("controller process identity unavailable")?,
         };
         if let Some(previous) = previous {
             anyhow::ensure!(
@@ -290,6 +303,41 @@ pub(crate) fn begin_maintenance_locked() -> Result<Maintenance> {
     }
 }
 
+/// Explicit host restart is the recovery operation for an interrupted transition.
+/// The caller holds the same installation takeover lock as profile changes.
+pub(crate) fn restart_maintenance_locked() -> Result<Maintenance> {
+    let Some(mut config) = read_registration(&respire::service::main_data_dir())? else {
+        return Ok(Maintenance::inactive());
+    };
+    owned(&config)?;
+    config.manually_stopped = false;
+    save(&mut config)?;
+    Maintenance::begin(config, true)
+}
+
+/// Legacy detached mode may be used after an explicitly disabled registration.
+/// It still needs the active controller's phase/token before opening the store.
+pub(crate) fn authorize_detached_boot_locked() -> Result<()> {
+    let Some(token) = current_boot_token() else {
+        return Ok(());
+    };
+    let root = respire::service::main_data_dir();
+    let Some(mut value) = marker(&root)? else {
+        bail!("active maintenance marker missing");
+    };
+    anyhow::ensure!(value.token == token, "maintenance owner changed");
+    let path = marker_path(&root);
+    let previous = fs::read(&path)?;
+    value.phase = Phase::Starting;
+    value.expected_profile = Some(respire::service::data_dir().canonicalize()?);
+    private_write(&path, &serde_json::to_vec(&value)?, Some(&hash(&previous)))
+}
+
+pub(crate) fn background_paused() -> bool {
+    // Malformed/unreadable control state also fences background mutations.
+    !matches!(marker(&respire::service::main_data_dir()), Ok(None))
+}
+
 fn raw_stop_owned(config: &Registration) -> Result<()> {
     manager::inspect(config)?;
     if let Some(health) = crate::rpc::probe_runtime()? {
@@ -312,6 +360,10 @@ fn wait_ready(config: &Registration) -> Result<()> {
                     && crate::mcp::exe_matches_dest(&health.exe, &config.executable)
                     && health.data_dir == respire::service::data_dir().display().to_string(),
                 "managed runtime version/executable/profile mismatch"
+            );
+            anyhow::ensure!(
+                health.managed_id.as_deref() == Some(config.id.as_str()),
+                "runtime is not owned by this startup registration"
             );
             if health.store_ready || respire::service::off_mode() {
                 return Ok(());
@@ -381,8 +433,11 @@ pub(crate) fn ensure_managed_locked() -> Result<bool> {
         result?;
         return Ok(true);
     }
+    check_direct_access()?;
     if let Some(health) = crate::rpc::probe_runtime()? {
-        if crate::rpc::runtime_matches_current(&health)? {
+        if crate::rpc::runtime_matches_current(&health)?
+            && health.managed_id.as_deref() == Some(config.id.as_str())
+        {
             return Ok(true);
         }
     }
@@ -469,11 +524,18 @@ fn status() -> Result<Value> {
     let root = respire::service::main_data_dir();
     if let Some(config) = read_registration(&root)? {
         owned(&config)?;
-        value["registration"] = serde_json::to_value(manager::inspect(&config)?)?;
+        let actual = manager::inspect(&config)?;
+        value["registered"] = json!(actual.registered);
+        value["enabled"] = json!(config.enabled && actual.enabled);
+        value["registration"] = serde_json::to_value(actual)?;
         value["maintenance"] = json!(marker(&root)?.is_some());
     }
     match crate::rpc::probe_runtime() {
         Ok(Some(health)) => {
+            anyhow::ensure!(
+                Path::new(&health.installation_root) == root,
+                "runtime belongs to another installation"
+            );
             value["runtime"] = json!({"running":true,"pid":health.pid,"version":health.bin,"data_dir":health.data_dir,"store_ready":health.store_ready,"inference":health.inference,"credential_state":"unknown"});
         }
         Ok(None) => value["runtime"] = json!({"running":false}),
@@ -584,7 +646,11 @@ fn disable(stop: bool, remove: bool) -> Result<()> {
         return emit("runtime.autostart.disable", status()?);
     };
     owned(&config)?;
-    manager::inspect(&config)?;
+    let actual = manager::inspect(&config)?;
+    anyhow::ensure!(
+        !remove || stop || !actual.running,
+        "stop the owned runtime before removing its startup registration"
+    );
     if stop {
         config.manually_stopped = true;
         save(&mut config)?;
@@ -630,6 +696,11 @@ fn run_foreground(id: Option<&str>, root: Option<&Path>) -> Result<()> {
         }
         std::env::set_var("HOME", &config.user_home);
         std::env::set_var("USERPROFILE", &config.user_home);
+        if let Some(value) = marker(&config.installation)? {
+            if !controller_alive(&value)? {
+                return Ok(());
+            }
+        }
         MANAGED_ID
             .set(id.to_owned())
             .map_err(|_| anyhow::anyhow!("managed runtime already initialized"))?;
@@ -665,6 +736,60 @@ fn run_foreground(id: Option<&str>, root: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn every_unfinished_phase_fences_requests_and_background_work() -> Result<()> {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("test environment lock poisoned"))?;
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                ACTIVE.with(|slot| *slot.borrow_mut() = None);
+                match &self.0 {
+                    Some(v) => std::env::set_var("RSRS_DATA_DIR", v),
+                    None => std::env::remove_var("RSRS_DATA_DIR"),
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os("RSRS_DATA_DIR"));
+        let dir = tempfile::tempdir()?;
+        std::env::set_var("RSRS_DATA_DIR", dir.path());
+        anyhow::ensure!(!background_paused());
+        for phase in [Phase::Paused, Phase::Starting, Phase::Verified] {
+            let mut value = Marker {
+                schema: 1,
+                id: "synthetic-installation".into(),
+                token: uuid::Uuid::new_v4().to_string(),
+                phase,
+                expected_profile: None,
+                expected_version: env!("CARGO_PKG_VERSION").into(),
+                owner_pid: std::process::id(),
+                owner_birth: manager::process_birth(std::process::id())?
+                    .context("test process birth missing")?,
+            };
+            let path = marker_path(&respire::service::main_data_dir());
+            fs::create_dir_all(path.parent().context("test marker parent")?)?;
+            fs::write(&path, serde_json::to_vec(&value)?)?;
+            anyhow::ensure!(controller_alive(&value)?);
+            anyhow::ensure!(background_paused() && check_direct_access().is_err());
+            ACTIVE.with(|slot| *slot.borrow_mut() = Some(value.token.clone()));
+            check_direct_access()?;
+            // Owning the controller token never authorizes background threads.
+            anyhow::ensure!(background_paused());
+            ACTIVE.with(|slot| *slot.borrow_mut() = None);
+            value.owner_birth.push_str("-reused-pid");
+            anyhow::ensure!(!controller_alive(&value)?);
+            fs::remove_file(path)?;
+        }
+        let path = marker_path(&respire::service::main_data_dir());
+        fs::write(&path, b"malformed")?;
+        anyhow::ensure!(background_paused() && check_direct_access().is_err());
+        fs::remove_file(path)?;
+        anyhow::ensure!(!background_paused());
+        check_direct_access()?;
+        Ok(())
+    }
+
     #[test]
     fn private_configuration_refuses_unknown_files_links_and_unplanned_changes() -> Result<()> {
         let directory = tempfile::tempdir()?;

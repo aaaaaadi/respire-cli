@@ -14,8 +14,9 @@ mod lifecycle;
 mod manager;
 pub(crate) use lifecycle::current_boot_token as lifecycle_boot_token;
 pub(crate) use lifecycle::{
-    begin_maintenance_locked, check_direct_access, check_managed_request, ensure_managed_locked,
-    execute, managed_id, stop_managed_locked, verify_managed_boot,
+    authorize_detached_boot_locked, background_paused, begin_maintenance_locked,
+    check_direct_access, check_managed_request, ensure_managed_locked, execute, managed_id,
+    restart_maintenance_locked, stop_managed_locked, verify_managed_boot,
 };
 
 #[derive(Debug, Subcommand)]
@@ -264,6 +265,21 @@ fn systemd_quote(raw: &str) -> Result<String> {
     ))
 }
 
+// Path-valued systemd directives are not ExecStart argv. Escape whitespace as
+// C-style bytes, without introducing literal quote characters into the path.
+fn systemd_path(raw: &str) -> Result<String> {
+    plain_value(raw)?;
+    anyhow::ensure!(
+        raw.starts_with('/'),
+        "systemd working directory must be absolute"
+    );
+    Ok(raw
+        .replace('\\', "\\\\")
+        .replace('%', "%%")
+        .replace(' ', "\\x20")
+        .replace('"', "\\x22"))
+}
+
 fn xml(raw: &str) -> Result<String> {
     plain_value(raw)?;
     Ok(raw
@@ -285,7 +301,7 @@ fn render(config: &Registration) -> Result<String> {
         .context("installation path is not UTF-8")?;
     match config.platform {
         Platform::Linux => Ok(format!("# Respire user runtime {}\n[Unit]\nDescription=Respire current-user runtime\nStartLimitIntervalSec=120\nStartLimitBurst=3\n[Service]\nType=simple\nExecStart={} runtime run --managed {} --installation-root {}\nWorkingDirectory={}\nRestart=on-failure\nRestartSec=10\nTimeoutStopSec=60\nKillMode=control-group\nStandardOutput=null\nStandardError=null\n[Install]\nWantedBy=default.target\n",
-            config.id, systemd_quote(executable)?, config.id, systemd_quote(root)?, systemd_quote(root)?)),
+            config.id, systemd_quote(executable)?, config.id, systemd_quote(root)?, systemd_path(root)?)),
         Platform::Macos => Ok(format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>ai.risense.respire.runtime.{}</string><key>ProgramArguments</key><array><string>{}</string><string>runtime</string><string>run</string><string>--managed</string><string>{}</string><string>--installation-root</string><string>{}</string></array><key>WorkingDirectory</key><string>{}</string><key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict><key>ThrottleInterval</key><integer>10</integer><key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>/dev/null</string></dict></plist>\n",
             config.id, xml(executable)?, config.id, xml(root)?, xml(root)?)),
         Platform::Windows => {
