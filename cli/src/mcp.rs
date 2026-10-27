@@ -99,7 +99,7 @@ impl ToolPolicy {
         if access.off && name != "memory_status" {
             return "MCP tool disabled: memory is paused; ALLOW cannot override service mode. Ask the host operator to review the intended service mode".to_owned();
         }
-        if access.readonly && !matches!(name,"memory_status"|"memory_recall"|"memory_list"|"memory_show"|"memory_tree"|"memory_history"|"memory_diary"|"memory_chain"|"memory_taxonomy") {
+        if access.readonly && !matches!(name,"memory_status"|"memory_recall"|"memory_list"|"memory_show"|"memory_tree"|"memory_history"|"memory_diary"|"memory_diary_search"|"memory_diary_fragment"|"memory_chain"|"memory_taxonomy") {
             return "MCP tool disabled: read-only service mode forbids this write; ALLOW cannot grant write access".to_owned();
         }
         if self.deny_all || self.deny.contains(name) {
@@ -125,6 +125,8 @@ impl ToolPolicy {
                     | "memory_tree"
                     | "memory_history"
                     | "memory_diary"
+                    | "memory_diary_search"
+                    | "memory_diary_fragment"
                     | "memory_chain"
                     | "memory_taxonomy"
             )
@@ -423,6 +425,22 @@ fn tools() -> Vec<(&'static str, &'static str, serde_json::Value)> {
             }),
         ),
         (
+            "memory_diary_search",
+            "Explicit cross-date diary fragments, bounded output; scores are relevance, not credibility",
+            serde_json::json!({"type":"object","properties":{
+                "query":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":20},
+                "max_chars":{"type":"integer","minimum":512,"maximum":12000},
+                "mode":{"type":"string","enum":["lexical","hybrid"]}},"required":["query"]}),
+        ),
+        (
+            "memory_diary_fragment",
+            "Bounded read of a diary fragment; rejects changed or missing locators",
+            serde_json::json!({"type":"object","properties":{
+                "source_id":{"type":"string"},"fragment_id":{"type":"string"},
+                "neighbors":{"type":"integer","minimum":0,"maximum":1},
+                "max_chars":{"type":"integer","minimum":512,"maximum":12000}},"required":["source_id","fragment_id"]}),
+        ),
+        (
             "memory_diary",
             "Diary time chain (trivial zone included)",
             serde_json::json!({
@@ -627,6 +645,24 @@ fn tool_argv(name: &str, args: &serde_json::Value) -> Result<Vec<String>, String
             }
             if let Some(limit) = opt_u64("limit") {
                 cmd.extend(["--limit".to_owned(), limit.to_string()]);
+            }
+            Ok(cmd)
+        }
+        "memory_diary_search" => {
+            let query = opt_str("query").ok_or("missing query")?;
+            let mut cmd = vec!["diary-search".to_owned(), query.to_owned()];
+            for (key, flag) in [("limit", "--limit"), ("max_chars", "--max-chars")] {
+                if let Some(value) = opt_u64(key) { cmd.extend([flag.to_owned(), value.to_string()]); }
+            }
+            if let Some(mode) = opt_str("mode") { cmd.extend(["--mode".to_owned(), mode.to_owned()]); }
+            Ok(cmd)
+        }
+        "memory_diary_fragment" => {
+            let source = opt_str("source_id").ok_or("missing source_id")?;
+            let fragment = opt_str("fragment_id").ok_or("missing fragment_id")?;
+            let mut cmd = vec!["diary-fragment".to_owned(), source.to_owned(), fragment.to_owned()];
+            for (key, flag) in [("neighbors", "--neighbors"), ("max_chars", "--max-chars")] {
+                if let Some(value) = opt_u64(key) { cmd.extend([flag.to_owned(), value.to_string()]); }
             }
             Ok(cmd)
         }

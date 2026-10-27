@@ -402,12 +402,13 @@ fn index_loop_inner() -> Result<()> {
             let model = store.retrieval_model()?;
             let prepare_requested = INDEX_WORK.lock().map_err(|_| anyhow::anyhow!("index work lock poisoned"))?.prepare_mirror.is_some();
             let pending = store.index_missing(&model)?;
+            let diary_pending = respire::diary::needs_rebuild(&store)?;
             // An indexed library still needs the CPU container for its next query.
             // Empty libraries wait for a write or explicit preparation instead of
             // starting an unsolicited model download during status/restart.
             let cpu_upgrade = model == "m3" && respire::MemoryTransport::count(&store)? > 0
                 && respire::model_install::cpu_model_preparation_needed()?;
-            if !pending && !prepare_requested && !cpu_upgrade {
+            if !pending && !diary_pending && !prepare_requested && !cpu_upgrade {
                 return Ok(true);
             }
             let Some(_operation) = respire::model_progress::Operation::try_begin_background_index()? else {
@@ -422,10 +423,10 @@ fn index_loop_inner() -> Result<()> {
                 respire::model_install::prepare_m3_for_index()?;
                 check_sync_context(generation)?;
             }
-            if !pending { return Ok(true); }
+            if !pending && !diary_pending { return Ok(true); }
             let keys = crate::build_session()?;
             let embedder = respire::memory::bge::BgeEmbedder::load_model(&model)?;
-            loop {
+            while pending {
                 let rebuilt = store.rebuild_index_with_progress(&keys, &embedder, &model, |done, total| {
                     index_yield_to_foreground(generation)?;
                     respire::model_progress::update("index", &model, done as u64, Some(total as u64))
@@ -448,6 +449,10 @@ fn index_loop_inner() -> Result<()> {
                     Err(error) => return Err(error),
                 }
             }
+            respire::diary::rebuild(&store, &keys, &embedder, || {
+                index_yield_to_foreground(generation)?;
+                respire::model_progress::check()
+            })?;
             check_sync_context(generation)?;
             Ok(true)
         })();
@@ -2184,6 +2189,9 @@ fn command_name(args: &[String]) -> Option<&str> {
 
 fn needs_inference(args: &[String]) -> bool {
     matches!(command_name(args), Some("remember" | "recall" | "related" | "reembed" | "classify" | "update"))
+        || (command_name(args) == Some("diary-search")
+            && !args.windows(2).any(|pair| pair[0] == "--mode" && pair[1] == "lexical")
+            && !args.iter().any(|arg| arg == "--mode=lexical"))
         || (command_name(args) == Some("model") && args.iter().any(|arg| arg == "probe"))
 }
 
