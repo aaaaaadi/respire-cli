@@ -486,3 +486,35 @@ fn rebuild_progress_counts_committed_and_cached_fragments() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn account_and_library_sources_remain_isolated_with_a_shared_disposable_cache() -> Result<()> {
+    let (isolate, first, first_keys) = fixture("private first-account needle".into())?;
+    let provider = core_sdk::search::HashingEmbedder::new(8);
+    rebuild(&first, &first_keys, &provider, || Ok(()), |action| action())?;
+    let other = LocalStore::open(&isolate.path().join("other-account.db"))?;
+    let other_keys = SessionKeys::from_urk([83; 32])?;
+    assert!(search(&other, &other_keys, "needle", 5, 4000, true)?
+        .items
+        .is_empty());
+    let mut entry = MemoryEngine::open(&first_keys, &first.all(false)?[0])?;
+    // Even coincident IDs in another account cannot select the old account's text.
+    entry.content = "independent other-account pineapple".into();
+    assert!(other.put(&MemoryEngine::seal(
+        &other_keys,
+        &provider,
+        &entry,
+        "other"
+    )?)?);
+    assert!(search(&other, &other_keys, "needle", 5, 4000, false)?
+        .items
+        .is_empty());
+    rebuild(&other, &other_keys, &provider, || Ok(()), |action| action())?;
+    assert!(search(&first, &first_keys, "pineapple", 5, 4000, false)?
+        .items
+        .is_empty());
+    let result = search(&first, &first_keys, "needle", 5, 4000, false)?;
+    assert_eq!(result.items.len(), 1);
+    assert!(result.items[0].text.contains("first-account"));
+    Ok(())
+}

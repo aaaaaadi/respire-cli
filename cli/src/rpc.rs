@@ -3066,4 +3066,41 @@ mod tests {
         }
         Ok(())
     }
+    #[test]
+    fn diary_commit_rechecks_mode_generation_shutdown_and_lifecycle_ownership() -> Result<()> {
+        let _guard = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let root = tempfile::tempdir()?;
+        let previous = std::env::var_os("RSRS_DATA_DIR");
+        std::env::set_var("RSRS_DATA_DIR", root.path());
+        let generation = GENERATION.load(Ordering::Acquire);
+        let previous_stopping = STOPPING.swap(false, Ordering::AcqRel);
+        let result = (|| -> Result<()> {
+            let _operation = respire::model_progress::Operation::begin("index")?;
+            let mut writes = 0;
+            respire::service::set_workspace_mode("normal")?;
+            diary_commit(generation, &mut || { writes += 1; Ok(()) })?;
+            assert_eq!(writes, 1);
+            for mode in ["readonly", "off"] {
+                respire::service::set_workspace_mode(mode)?;
+                assert!(diary_commit(generation, &mut || { writes += 1; Ok(()) }).is_err());
+                assert_eq!(writes, 1);
+            }
+            respire::service::set_workspace_mode("normal")?;
+            assert!(diary_commit(generation.wrapping_add(1), &mut || { writes += 1; Ok(()) }).is_err());
+            STOPPING.store(true, Ordering::Release);
+            assert!(diary_commit(generation, &mut || { writes += 1; Ok(()) }).is_err());
+            STOPPING.store(false, Ordering::Release);
+            let lifecycle = crate::runtime_policy::takeover_lock()?;
+            assert!(diary_commit(generation, &mut || { writes += 1; Ok(()) }).is_err());
+            assert_eq!(writes, 1);
+            drop(lifecycle);
+            diary_commit(generation, &mut || { writes += 1; Ok(()) })?;
+            assert_eq!(writes, 2);
+            Ok(())
+        })();
+        STOPPING.store(previous_stopping, Ordering::Release);
+        match previous { Some(value) => std::env::set_var("RSRS_DATA_DIR", value), None => std::env::remove_var("RSRS_DATA_DIR") }
+        result
+    }
+
 }
