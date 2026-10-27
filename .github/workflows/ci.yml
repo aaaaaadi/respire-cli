@@ -215,6 +215,7 @@ jobs:
           $parseTokens = $null; $parseErrors = $null
           [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD 'scripts/dev-release-sweep.ps1'), [ref]$parseTokens, [ref]$parseErrors) | Out-Null
           if ($parseErrors.Count -ne 0) { throw ($parseErrors | Out-String) }
+          & ./scripts/test-reembed-progress-contract.ps1
       - run: python3 scripts/test-core-payload-lifetime.py
 
   native-published-m3:
