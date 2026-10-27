@@ -55,7 +55,12 @@ fn digest(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
 }
 fn cache_path() -> std::path::PathBuf {
-    crate::service::data_dir().join("diary-fragments-v1.db")
+    let root = crate::service::data_dir();
+    // Existing library directories may have legitimate aliases (macOS /var).
+    // Resolve only the directory; SQLite NOFOLLOW still protects the cache file.
+    root.canonicalize()
+        .unwrap_or(root)
+        .join("diary-fragments-v1.db")
 }
 #[derive(Debug)]
 struct DamagedCache;

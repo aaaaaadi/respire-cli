@@ -518,3 +518,30 @@ fn account_and_library_sources_remain_isolated_with_a_shared_disposable_cache() 
     assert!(result.items[0].text.contains("first-account"));
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn existing_library_directory_alias_does_not_disable_cache_file_link_protection() -> Result<()> {
+    let (isolate, store, keys) = fixture("existing library through a directory alias".into())?;
+    let alias = isolate.path().join("library-alias");
+    std::os::unix::fs::symlink(isolate.path(), &alias)?;
+    std::env::set_var("RSRS_DATA_DIR", &alias);
+    let provider = core_sdk::search::HashingEmbedder::new(8);
+    rebuild(&store, &keys, &provider, || Ok(()), |action| action())?;
+    // This path test uses the explicit test-hash generation, not m3 readiness.
+    let db = cache(true)?.context("canonical directory cache must open read-only")?;
+    assert!(
+        db.query_row("SELECT count(*) FROM diary_artifacts", [], |row| row
+            .get::<_, i64>(0))?
+            > 0
+    );
+    drop(db);
+    assert!(isolate.path().join("diary-fragments-v1.db").is_file());
+    std::fs::remove_file(isolate.path().join("diary-fragments-v1.db"))?;
+    let unrelated = isolate.path().join("untouched.db");
+    std::fs::write(&unrelated, b"unrelated cache target")?;
+    std::os::unix::fs::symlink(&unrelated, isolate.path().join("diary-fragments-v1.db"))?;
+    assert!(rebuild(&store, &keys, &provider, || Ok(()), |action| action()).is_err());
+    assert_eq!(std::fs::read(&unrelated)?, b"unrelated cache target");
+    Ok(())
+}
