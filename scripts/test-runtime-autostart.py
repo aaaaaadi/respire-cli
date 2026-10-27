@@ -198,7 +198,7 @@ def main():
                     assert not profile.is_symlink() and profile.stat().st_size <= 64 * 1024 * 1024
                     shutil.copyfile(profile, destination / f"autostart-managed-{uuid.uuid4().hex}.profraw")
 
-            from contextlib import contextmanager
+            from contextlib import contextmanager, nullcontext
 
             @contextmanager
             def owned_windows_pair(expected_root):
@@ -265,7 +265,7 @@ def main():
                     assert parent_pid != current["pid"]
                     parent,parent_birth=checked_process(parent_pid)
                     assert parent_birth <= child_birth, "supervisor PID was reused after the owned child started"
-                    yield {"kernel":kernel,"parent":parent,"child":child,"parent_pid":parent_pid,"child_pid":current["pid"],"parent_birth":parent_birth}
+                    yield {"kernel":kernel,"parent":parent,"child":child,"parent_pid":parent_pid,"child_pid":current["pid"],"parent_birth":parent_birth,"child_birth":child_birth}
                 finally:
                     for handle in handles:
                         kernel.CloseHandle(handle)
@@ -487,18 +487,26 @@ $s=[Activator]::CreateInstance([Type]::GetTypeFromProgID('Schedule.Service'));$s
                             assert pair["parent_birth"]!=supervisor_before[1]
                             first_pid=pair["child_pid"]
                         print("PASS: actual supervisor kill removes its owned child; explicit restart verifies a new store-ready pair without an orphan")
-                if os.name == "nt":
-                    with owned_windows_pair(root) as pair:
-                        run("runtime", "stop")
-                        require_pair_exited(pair)
-                else:
+                # Keep the exited Windows process objects referenced until the
+                # replacement exists. Otherwise a legitimate numeric PID reuse
+                # can invalidate a PID-only comparison after handles are closed.
+                stopped_owner=owned_windows_pair(root) if os.name=="nt" else nullcontext(None)
+                with stopped_owner as pair:
+                    if pair is not None:
+                        first_pid=pair["child_pid"]
                     run("runtime", "stop")
-                time.sleep(1)
-                stopped = run("runtime", "status")
-                assert stopped["runtime"]["running"] is False, "manual stop was automatically resurrected"
-                run("runtime", "restart")
-                restarted = run("runtime", "status")
-                assert restarted["runtime"]["running"] and restarted["runtime"]["pid"] != first_pid, restarted
+                    if pair is not None:
+                        require_pair_exited(pair)
+                    time.sleep(1)
+                    stopped = run("runtime", "status")
+                    assert stopped["runtime"]["running"] is False, "manual stop was automatically resurrected"
+                    run("runtime", "restart")
+                    restarted = run("runtime", "status")
+                    assert restarted["runtime"]["running"] and restarted["runtime"]["pid"] != first_pid, restarted
+                    if pair is not None:
+                        with owned_windows_pair(root) as replacement:
+                            assert replacement["child_pid"]==restarted["runtime"]["pid"]
+                            assert replacement["child_birth"]!=pair["child_birth"] and replacement["parent_birth"]!=pair["parent_birth"], "restart reused the old process instances"
                 secondary = root / "accounts/secondary profile"
                 secondary.mkdir(parents=True)
                 if os.name == "nt":
