@@ -216,18 +216,20 @@ pub fn run(exe: &std::path::Path) -> Result<Value> {
     // Observe real diary inference before pausing it through the normal RPC mode gate.
     diary.content = body.repeat(320);
     diary.updated_at = "2026-10-27T12:00:00Z".into();
-    {
-        let _deferred = respire::core_sdk::defer_indexing();
-        anyhow::ensure!(
-            store.put(&MemoryEngine::seal(
-                &keys,
-                &embedder,
-                &diary,
-                "synthetic-diary"
-            )?)?,
-            "pending long diary"
-        );
-    }
+    // Prepare the ordinary memory artifact synchronously. The runtime rebuilds
+    // that index before diary fragments; including it in the observation window
+    // makes this diary cancellation probe depend on unrelated full-body work.
+    anyhow::ensure!(
+        store.put(&MemoryEngine::seal(
+            &keys,
+            &embedder,
+            &diary,
+            "synthetic-diary"
+        )?)?,
+        "pending long diary"
+    );
+    anyhow::ensure!(!store.index_missing("m3")?, "ordinary index fixture not ready");
+    anyhow::ensure!(respire::diary::needs_rebuild(&store)?, "diary fixture not pending");
     drop(store);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
@@ -237,7 +239,9 @@ pub fn run(exe: &std::path::Path) -> Result<Value> {
         }
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
-            "did not observe actual background diary work"
+            "did not observe actual background diary work: model_operation={}, retrieval_index={}",
+            status["summary"]["model_operation"],
+            status["summary"]["retrieval_index"]
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
