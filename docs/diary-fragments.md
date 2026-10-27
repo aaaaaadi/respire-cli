@@ -37,3 +37,25 @@ JSON 信封中的 `details.items` 是结果。每项包含：
 公开源码可以修改分段、CLI/MCP、返回边界、缓存和 SDK 调用编排；不可编辑闭源 Core 内部的向量算法与模型实现。构建必须提供仓库锁定的匹配 SDK，不能绕过 manifest 校验。
 
 仓库内 `crates/app/src/diary_tests.rs`、MCP 工具测试和运行时路由测试覆盖全文匹配、Unicode 位置、JSON 预算、来源失效、缓存损坏/重建及取消提交边界。词面与提交故障测试使用显式测试 provider，不能冒充真实语义检索成绩。匹配 SDK 的真实 BGE-M3、CLI/Runtime/MCP 往返、后台并发/重启和跨账号隔离须另外执行；完整发布还保留已有自启、真实模型、升级与迁移门禁。规模测量采用脱敏合成日记，只说明对应夹具的耗时与内存，不代表真实用户年度库性能或检索收益。
+
+## 可复跑验收
+
+在已按锁文件准备匹配 SDK 和已校验 CPU 模型的隔离测试环境中，构建当前 `rsrs` 与探针，运行真实模型用例（不设置 `RSRS_CORE_TEST_MODE`）：
+
+```sh
+cargo build --locked -p respire --bin rsrs --example feedback_contract_probe --example ablation_bench
+RSRS_ENGINE=cpu RSRS_M3_DIR=/path/to/verified/model \
+  target/debug/examples/feedback_contract_probe --diary-only
+```
+
+探针拒绝测试 provider，复用 CPU 模型大小和 SHA-256 校验，使用临时库、合成会话和合成日记，覆盖缺索引词面回退、无词面命中的语义查询、CLI/runtime/MCP stdio 往返、重启、readonly 读取、off 拒绝、追加后旧定位失效和删除清理。完整 `feedback_contract_probe` 在已有反馈及两种 benchmark 路径验收后也运行这些日记检查，因此现有四平台无令牌模型验收会覆盖新增入口。单个同义句命中只是功能检查，不代表日记检索题集收益；较宽泛的 `cycling equipment maintenance` 在当前合成夹具和既有 Core 阈值下没有返回候选，此结果未通过降低阈值掩盖。
+
+`diary_scale_probe <每篇字符数> <篇数>` 使用显式合成测试 provider，只测词面扫描，不包含建模质量。2026-10-27 云端 debug 构建的单次测量如下，耗时是建库后的连续三次搜索总和，RSS 为整个夹具进程的峰值：
+
+| 合成规模 | 原 PR `611b4da`：耗时 / RSS | 修复版：耗时 / RSS |
+| --- | --- | --- |
+| 单篇 10 万字符 | 194.7 ms / 15,120 KiB | 195.6 ms / 15,300 KiB |
+| 单篇 100 万字符 | 2,078.7 ms / 31,212 KiB | 1,881.9 ms / 31,084 KiB |
+| 365 篇，各 5,000 字符 | 4,028.2 ms / 21,196 KiB | 3,748.5 ms / 19,212 KiB |
+
+测试机有并行任务，尚无多轮置信区间；两版边界/去重/预算结果也有变化（多日夹具原版返回 4 条，修复版 5 条）。这些数据只证明对应规模已实际运行，不能据此宣称稳定提速，更不是原科研题集复现。修复版仍须全文解密和线性扫描；避免逐片克隆全年正文、逐篇重复读取全库不等于消除了全部大库成本。
