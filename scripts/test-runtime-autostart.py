@@ -265,7 +265,7 @@ def main():
                     assert parent_pid != current["pid"]
                     parent,parent_birth=checked_process(parent_pid)
                     assert parent_birth <= child_birth, "supervisor PID was reused after the owned child started"
-                    yield {"kernel":kernel,"parent":parent,"child":child,"parent_pid":parent_pid,"child_pid":current["pid"],"parent_birth":parent_birth,"child_birth":child_birth}
+                    yield {"kernel":kernel,"parent":parent,"child":child,"parent_pid":parent_pid,"child_pid":current["pid"],"parent_birth":parent_birth,"child_birth":child_birth,"data_dir":current["data_dir"],"store_ready":current.get("store_ready",False)}
                 finally:
                     for handle in handles:
                         kernel.CloseHandle(handle)
@@ -273,6 +273,13 @@ def main():
             def require_pair_exited(pair):
                 assert pair["kernel"].WaitForSingleObject(pair["child"],15000)==0, "owned runtime child survived its lifecycle owner"
                 assert pair["kernel"].WaitForSingleObject(pair["parent"],15000)==0, "owned supervisor remained alive after stop"
+
+            def require_replacement_pair(old, expected_profile):
+                require_pair_exited(old)
+                with owned_windows_pair(root) as fresh:
+                    assert (fresh["child_pid"],fresh["child_birth"])!=(old["child_pid"],old["child_birth"])
+                    assert (fresh["parent_pid"],fresh["parent_birth"])!=(old["parent_pid"],old["parent_birth"])
+                    assert Path(fresh["data_dir"]).resolve()==expected_profile.resolve() and fresh["store_ready"]
 
             def diagnose_crash_restart():
                 # Only this hosted fixture's fixed-field lifecycle state and
@@ -448,33 +455,39 @@ $s=[Activator]::CreateInstance([Type]::GetTypeFromProgID('Schedule.Service'));$s
                         owned_health=json.load(response)
                     assert owned_health["pid"] == first_pid and Path(owned_health["installation_root"]).resolve() == root.resolve()
                     assert owned_health["managed_id"] == json.loads(config_path.read_text())["id"]
-                    if os.name == "nt":
-                        with owned_windows_pair(root) as pair:
+                    failed_owner=owned_windows_pair(root) if os.name=="nt" else nullcontext(None)
+                    with failed_owner as pair:
+                        if pair is not None:
                             assert pair["child_pid"]==first_pid
                             supervisor_before=(pair["parent_pid"],pair["parent_birth"])
                             assert pair["kernel"].TerminateProcess(pair["child"],1), "failed to inject owned child failure"
                             assert pair["kernel"].WaitForSingleObject(pair["child"],15000)==0
-                    else:
-                        os.kill(first_pid,signal.SIGKILL)
-                    restart_deadline=time.monotonic()+140
-                    recovered_health=None
-                    while time.monotonic() < restart_deadline:
-                        try:
-                            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health",timeout=1) as response:
-                                candidate=json.load(response)
-                            if candidate["pid"] != first_pid and candidate.get("store_ready"):
-                                recovered_health=candidate
-                                break
-                        except (OSError,ValueError):
-                            pass
-                        time.sleep(0.25)
-                    if recovered_health is None:
-                        diagnose_crash_restart()
-                    assert recovered_health is not None, "OS supervisor did not restart its failed native owner"
-                    assert recovered_health["managed_id"] == owned_health["managed_id"] and recovered_health["bin"] == health["bin"]
-                    assert Path(recovered_health["installation_root"]).resolve() == root.resolve()
-                    first_pid=recovered_health["pid"]
-                    print("PASS: actual abnormal process exit followed by supervised store-ready restart, without a CLI start request")
+                        else:
+                            os.kill(first_pid,signal.SIGKILL)
+                        restart_deadline=time.monotonic()+140
+                        recovered_health=None
+                        while time.monotonic() < restart_deadline:
+                            try:
+                                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health",timeout=1) as response:
+                                    candidate=json.load(response)
+                                if candidate["pid"] != first_pid and candidate.get("store_ready"):
+                                    recovered_health=candidate
+                                    break
+                            except (OSError,ValueError):
+                                pass
+                            time.sleep(0.25)
+                        if recovered_health is None:
+                            diagnose_crash_restart()
+                        assert recovered_health is not None, "OS supervisor did not restart its failed native owner"
+                        assert recovered_health["managed_id"] == owned_health["managed_id"] and recovered_health["bin"] == health["bin"]
+                        assert Path(recovered_health["installation_root"]).resolve() == root.resolve()
+                        first_pid=recovered_health["pid"]
+                        print("PASS: actual abnormal process exit followed by supervised store-ready restart, without a CLI start request")
+                        if pair is not None:
+                            with owned_windows_pair(root) as fresh:
+                                assert fresh["child_pid"]==recovered_health["pid"] and fresh["child_birth"]!=pair["child_birth"]
+                                assert (fresh["parent_pid"],fresh["parent_birth"])==supervisor_before
+                                assert fresh["store_ready"] and Path(fresh["data_dir"]).resolve()==root.resolve()
                     if os.name == "nt":
                         with owned_windows_pair(root) as pair:
                             assert (pair["parent_pid"],pair["parent_birth"])==supervisor_before, "child recovery unexpectedly replaced its supervisor"
@@ -512,13 +525,18 @@ $s=[Activator]::CreateInstance([Type]::GetTypeFromProgID('Schedule.Service'));$s
                 if os.name == "nt":
                     with owned_windows_pair(root) as pair:
                         run("config", "--data-dir", str(secondary))
-                        require_pair_exited(pair)
+                        require_replacement_pair(pair,secondary)
                 else:
                     run("config", "--data-dir", str(secondary))
                 switched = run("runtime", "status")
                 assert Path(switched["runtime"]["data_dir"]).resolve() == secondary.resolve(), switched
                 assert switched["runtime"]["pid"] != restarted["runtime"]["pid"]
-                run("config", "--data-dir", str(root))
+                if os.name=="nt":
+                    with owned_windows_pair(root) as pair:
+                        run("config", "--data-dir", str(root))
+                        require_replacement_pair(pair,root)
+                else:
+                    run("config", "--data-dir", str(root))
                 restored = run("runtime", "status")
                 assert Path(restored["runtime"]["data_dir"]).resolve() == root.resolve(), restored
                 assert restored["runtime"]["pid"] != switched["runtime"]["pid"]
