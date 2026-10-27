@@ -29,7 +29,82 @@ Client-only mode forbids lifecycle changes, binary copies, upgrades, CPU recover
 `--direct` execution. MCP stdio does not copy the executable. A failed request never
 triggers sandbox takeover. An idle runtime stays running until the host stops it.
 
-## Windows sign-in startup
+## Opt-in current-user supervision
+
+Startup is **off by default**. Installing or updating the CLI never registers a
+service. A host user can opt in explicitly:
+
+```sh
+rsrs runtime autostart status --json
+rsrs runtime autostart enable          # future sign-ins; does not start a stopped runtime
+rsrs runtime autostart enable --now    # also start now
+rsrs runtime stop                     # stays stopped until explicit start/restart
+rsrs runtime start
+rsrs runtime restart
+rsrs runtime autostart disable --stop
+rsrs runtime autostart remove --stop   # remove registration, retain libraries and keys
+```
+
+`runtime run` serves in the foreground. The adapters supervise that process:
+Linux uses the existing systemd **user** session, macOS uses the current user's
+LaunchAgent, and Windows uses a Limited, interactive current-user logon task.
+The Windows task keeps a native foreground supervisor alive; it retries a failed
+foreground runtime child after 60 seconds, with at most three consecutive failed
+children before explicit start/restart is needed. A child that ran for two minutes
+resets that consecutive-failure budget. Maintenance or manual stop prevents retry.
+A non-inheritable, process-owned Windows job also removes the child tree if the
+supervisor itself exits unexpectedly; automatic parent recovery is not promised,
+and an explicit host restart may be needed. Normal CLI stop drains the runtime
+before stopping the supervisor or replacing its executable.
+They do not install a system service, enable linger, elevate privileges, store a
+Windows password, or start before anyone signs in. Missing user service-manager
+support is an error, without an automatic system-wide fallback.
+Systemd itself rejects quotes/backslashes in an executable pathname. Such a data
+root remains usable with a separate safe absolute `RSRS_BIN_DIR`; enable rejects
+an unsupported native path before creating lifecycle/registration state.
+
+Status is read-only and does not create a profile, download a model, start a
+runtime or change a registration. It reports configuration separately from the
+actual OS registration and runtime/store readiness. Store readiness does not
+prove that the OS keyring is unlocked, a model is installed or the network is
+available. Unlock/login and model preparation remain host operations; a service
+must not generate replacement recovery material to bypass an unavailable keyring.
+
+The registration belongs to one installation root and OS user. Its native path,
+arguments, owner and service-file hash must match before changing it. Unknown
+units, task actions and loaded systemd drop-ins are refused, including removal.
+Existing manually created startup tasks are not adopted or deleted automatically;
+remove an old task yourself after checking its ownership to avoid competing owners.
+
+Host binary/profile changes use the same installation coordinator as normal
+runtime lifecycle operations. A durable maintenance marker blocks queued/direct
+access and background indexing/sync until the replacement store is verified.
+An interrupted change stays paused; explicit `runtime restart` recovers the
+lifecycle marker, while a snapshot/login interruption still requires its own
+indicated recovery command. The control marker is not proof that a snapshot or
+login transaction completed.
+
+Startup settings are captured when registering. To change the saved port/native
+location or environment, first `remove --stop` using the old registered settings,
+then explicitly enable again with the new settings. A mismatched caller port is
+refused before stopping a service, so an unreachable old endpoint cannot silently
+turn into a forced shutdown. Status reports `configured_rpc_port`.
+
+Only non-secret allowlisted runtime settings are saved, including explicit
+`RSRS_NO_AUTOSYNC` and `RSRS_UPDATE_CHECK` opt-outs (legacy prefixes are read and
+saved under their canonical names). Credentials and recovery
+material are never stored in a service command line or registration. Managed
+launches have a persistent limit of three attempts per 120 seconds, plus the OS
+restart delay. Explicit start/restart resets the owned unit's launch budget.
+Fixed-field lifecycle events are kept under `runtime/autostart/events.jsonl`,
+with a 64 KiB limit and one previous file; they contain no raw errors, command
+arguments or account content. Disabling/removing startup preserves data and keys.
+
+The platform acceptance workflow uses disposable GitHub-hosted runner profiles;
+passing it does not establish physical reboot, logout/login, real-account keyring
+or model readiness on every machine.
+
+## Existing manual Windows sign-in setup
 
 For client-only tools after a restart, configure one host-owned Windows Task
 Scheduler task. It runs after the same Windows user signs in, so the user's

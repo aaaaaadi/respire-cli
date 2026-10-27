@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 mod admission;
 mod app_version;
+mod autostart;
 mod bench;
 mod classify;
 mod classify_config;
@@ -35,6 +36,7 @@ mod runtime_error;
 mod runtime_http;
 mod runtime_policy;
 mod shell;
+mod skill;
 mod web;
 
 use respire::auth;
@@ -600,6 +602,11 @@ enum ModelAction {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Host-owned foreground runtime and opt-in current-user sign-in startup.
+    Runtime {
+        #[command(subcommand)]
+        command: autostart::RuntimeCommand,
+    },
     /// Restart the resident runtime; kill the verified process if graceful shutdown times out.
     Restart {
         /// Seconds to wait for graceful shutdown before force termination.
@@ -691,6 +698,9 @@ enum Command {
         /// Disable associations for this request (original recall results only).
         #[arg(long)]
         no_related: bool,
+        /// Recall intent: auto (keyword), howto (extra skill pass, keeps one procedure visible), fact (single pass)
+        #[arg(long, value_parser = ["auto", "howto", "fact"], default_value = "auto")]
+        intent: String,
     },
     /// Query log: each recall's candidates + adoption + model self-grade (local DPO/SFT raw material)
     QueryLog {
@@ -710,6 +720,17 @@ enum Command {
     Bench {
         #[command(subcommand)]
         cmd: BenchCmd,
+    },
+    /// Record a procedure run verdict (ok|fail|confounded|no_effect) for a skill/knowledge entry; local-only, feeds how-to ordering and audit
+    RunLog {
+        /// Skill/knowledge entry id (full id or unique prefix)
+        id: String,
+        /// Outcome: ok | fail (plain success/failure) | confounded (other changes interfered, cannot attribute) | no_effect (worked, but changed nothing observable)
+        #[arg(long, value_parser = ["ok", "fail", "confounded", "no_effect"], default_value = "ok")]
+        status: String,
+        /// Short note: what deviated or which command failed (local-only, never synced)
+        #[arg(long, default_value = "")]
+        note: String,
     },
     /// Batch classify via JEV (TypeSafe): ask which top-level category each entry belongs to, compare with the current parent (read-only)
     Classify {
@@ -1832,6 +1853,12 @@ fn build_session() -> Result<SessionKeys> {
 /// Preserve only the owner alias from the local snapshot that supplied these keys.
 /// Environment-key fallback must never inherit identity from an unrelated profile.
 fn build_session_with_owner() -> Result<(SessionKeys, Option<String>)> {
+    let result = build_session_with_owner_inner();
+    autostart::note_credential_access(result.is_ok());
+    result
+}
+
+fn build_session_with_owner_inner() -> Result<(SessionKeys, Option<String>)> {
     if let Ok(session) = auth::load_local_session_with_owner() {
         return Ok(session);
     }
@@ -2572,6 +2599,70 @@ fn report_orphans(store: &respire::transport::local::LocalStore, action: &str) {
             m.local_parent_id
         );
     }
+}
+
+/// Record a procedure run outcome. Local-only (same contract as query_log):
+/// the row never enters the encrypted payload and never syncs.
+fn run_run_log(id: &str, status: &str, note: &str) -> Result<()> {
+    let store = build_local()?;
+    let all = store.all(false)?;
+    let full = respire::service::resolve_prefix(&all, id)?;
+    let target = all
+        .iter()
+        .find(|m| m.id == full)
+        .ok_or_else(|| anyhow!("no live entry {}", respire::service::short_id(&full)))?;
+    if !skill::is_procedure(&target.local_kind) {
+        // A refusal is a business state, not a crash: the runtime turns `bail`
+        // into an opaque runtime_error, so answer with a Skip envelope instead.
+        let short = respire::service::short_id(&full);
+        let kind = if target.local_kind.trim().is_empty() {
+            "untyped"
+        } else {
+            target.local_kind.as_str()
+        };
+        let mut result = ResultEnvelope::new(
+            "run-log",
+            OutputStatus::Skip,
+            serde_json::json!({"id": full, "kind": kind, "reason": "not a procedure"}),
+            vec![OutputItem::new(
+                short.clone(),
+                OutputStatus::Skip,
+                "not a procedure",
+            )],
+        );
+        result.actions.push(format!(
+            "{short} is {kind}; convert it with `rsrs update {short} --kind skill` if it is a procedure"
+        ));
+        emit_result(result)?;
+        return Ok(());
+    }
+    store.log_skill_run(&full, status, note)?;
+    let stats = store
+        .skill_run_stats(std::slice::from_ref(&full))?
+        .remove(&full)
+        .unwrap_or_default();
+    emit_result(ResultEnvelope::new(
+        "run-log",
+        OutputStatus::Ok,
+        serde_json::json!({
+            "id": full,
+            "title": target.local_title,
+            "status": status,
+            "ok": stats.ok,
+            "fail": stats.fail,
+            "confounded": stats.confounded,
+            "no_effect": stats.no_effect,
+            "last_status": stats.last_status,
+        }),
+        vec![OutputItem::new(
+            respire::service::short_id(&full),
+            OutputStatus::Ok,
+            format!(
+                "{status} · ok {} / fail {} / confounded {} / no_effect {}",
+                stats.ok, stats.fail, stats.confounded, stats.no_effect
+            ),
+        )],
+    ))
 }
 
 /// Whole-store health audit: orphans / illegal importance / duplicate titles / truncated titles / deep chains - a structured report for an AI to patch after.
@@ -3530,6 +3621,52 @@ fn run_audit(json_flag: bool) -> Result<()> {
         d
     };
     let max_depth = active.iter().map(|m| depth(&m.id)).max().unwrap_or(0);
+    // 6. Procedure template gaps: skill entries should read as a manual, not an essay.
+    //    Needs the body, so decryption is best-effort: a locked store reports `skipped` instead of failing audit.
+    let skills: Vec<&&respire::StoredMemory> = active
+        .iter()
+        .filter(|m| m.local_kind == "skill")
+        .collect();
+    // 7. Hot but untyped: frequently recalled, not a skill, and reads like a manual.
+    //    Advisory for tidy only - the AI decides whether it is worth an upgrade.
+    let hot_candidates: Vec<&&respire::StoredMemory> = active
+        .iter()
+        .filter(|m| {
+            m.local_kind != "skill" && m.local_recall_count >= skill::HOT_RECALL_THRESHOLD
+        })
+        .collect();
+    let bodies = if skills.is_empty() && hot_candidates.is_empty() {
+        None
+    } else {
+        build_session().ok()
+    };
+    let mut skill_gaps: Vec<(String, String, Vec<&'static str>)> = Vec::new();
+    let mut hot_untyped: Vec<(String, String, i64)> = Vec::new();
+    if let Some(session) = &bodies {
+        for m in &skills {
+            if let Ok(full) = MemoryEngine::open(session, m) {
+                let missing = skill::missing_sections(&full.content);
+                if !missing.is_empty() {
+                    skill_gaps.push((m.id.clone(), m.local_title.clone(), missing));
+                }
+            }
+        }
+        for m in &hot_candidates {
+            if let Ok(full) = MemoryEngine::open(session, m) {
+                if skill::looks_operational(&full.content) {
+                    hot_untyped.push((
+                        m.id.clone(),
+                        m.local_title.clone(),
+                        m.local_recall_count,
+                    ));
+                }
+            }
+        }
+    }
+    let skill_gaps_skipped = !skills.is_empty() && bodies.is_none();
+    let hot_untyped_skipped = !hot_candidates.is_empty() && bodies.is_none();
+    // 8. Procedures whose latest three runs all failed: doc says "keep it" but it is broken.
+    let failing_skills = store.failing_skills(3)?;
 
     // M2 (2026-09-20 audit): previously only the local --json flag was honored;
     // RSRS_JSON=1 (what the GUI bridge sets) still printed prose, breaking cli-api.md "equivalent" output.
@@ -3539,10 +3676,20 @@ fn run_audit(json_flag: bool) -> Result<()> {
             "orphans": orphans.len(), "invalid_importance": bad_imp.len(),
             "same_title_groups": same_title.len(), "truncated_titles": truncated.len(),
             "max_depth": max_depth,
+            "skill_template_gaps": skill_gaps.len(),
+            "skill_template_gaps_skipped": skill_gaps_skipped,
+            "failing_skills": failing_skills.len(),
+            "hot_untyped": hot_untyped.len(),
+            "hot_untyped_skipped": hot_untyped_skipped,
         });
         let mut result = ResultEnvelope::new(
             "audit",
-            if orphans.is_empty() && bad_imp.is_empty() && truncated.is_empty() {
+            if orphans.is_empty()
+                && bad_imp.is_empty()
+                && truncated.is_empty()
+                && skill_gaps.is_empty()
+                && failing_skills.is_empty()
+            {
                 OutputStatus::Ok
             } else {
                 OutputStatus::Warn
@@ -3556,12 +3703,20 @@ fn run_audit(json_flag: bool) -> Result<()> {
             "invalid_importance": bad_imp.iter().map(|m| serde_json::json!({"id": m.id, "title": m.local_title, "importance": m.local_importance})).collect::<Vec<_>>(),
             "same_title_groups": same_title.iter().map(|(t, n)| serde_json::json!({"title": t, "count": n})).collect::<Vec<_>>(),
             "truncated_titles": truncated.iter().map(|m| serde_json::json!({"id": m.id, "title": m.local_title})).collect::<Vec<_>>(),
+            "skill_template_missing": skill_gaps.iter().map(|(id, title, missing)| serde_json::json!({"id": id, "title": title, "missing": missing})).collect::<Vec<_>>(),
+            "failing_skills": failing_skills.iter().map(|(id, streak)| serde_json::json!({"id": id, "fail_streak": streak})).collect::<Vec<_>>(),
+            "hot_untyped": hot_untyped.iter().map(|(id, title, count)| serde_json::json!({"id": id, "title": title, "recall_count": count})).collect::<Vec<_>>(),
         });
         result.details = details;
         emit_result(result)?;
         return Ok(());
     }
-    let status = if orphans.is_empty() && bad_imp.is_empty() && truncated.is_empty() {
+    let status = if orphans.is_empty()
+        && bad_imp.is_empty()
+        && truncated.is_empty()
+        && skill_gaps.is_empty()
+        && failing_skills.is_empty()
+    {
         OutputStatus::Ok
     } else {
         OutputStatus::Warn
@@ -3605,6 +3760,37 @@ fn run_audit(json_flag: bool) -> Result<()> {
             truncated.len().to_string(),
         ),
         OutputItem::new("max depth", OutputStatus::Ok, max_depth.to_string()),
+        OutputItem::new(
+            "skill template gaps",
+            if skill_gaps.is_empty() {
+                OutputStatus::Ok
+            } else {
+                OutputStatus::Warn
+            },
+            if skill_gaps_skipped {
+                "skipped (locked)".to_owned()
+            } else {
+                skill_gaps.len().to_string()
+            },
+        ),
+        OutputItem::new(
+            "failing skills",
+            if failing_skills.is_empty() {
+                OutputStatus::Ok
+            } else {
+                OutputStatus::Warn
+            },
+            failing_skills.len().to_string(),
+        ),
+        OutputItem::new(
+            "hot untyped",
+            OutputStatus::Ok,
+            if hot_untyped_skipped {
+                "skipped (locked)".to_owned()
+            } else {
+                hot_untyped.len().to_string()
+            },
+        ),
     ];
     items.extend(orphans.iter().map(|m| {
         OutputItem::new(
@@ -3636,10 +3822,43 @@ fn run_audit(json_flag: bool) -> Result<()> {
             format!("{} count {}", t, n),
         )
     }));
+    items.extend(skill_gaps.iter().map(|(id, title, missing)| {
+        OutputItem::new(
+            "skill template gap",
+            OutputStatus::Warn,
+            format!(
+                "{} {} missing {}",
+                respire::service::short_id(id),
+                title,
+                missing.join("/")
+            ),
+        )
+        .action("update")
+    }));
+    items.extend(failing_skills.iter().map(|(id, streak)| {
+        OutputItem::new(
+            "failing skill",
+            OutputStatus::Warn,
+            format!("{} {} consecutive fail", respire::service::short_id(id), streak),
+        )
+        .action("run-log")
+    }));
+    items.extend(hot_untyped.iter().map(|(id, title, count)| {
+        OutputItem::new(
+            "hot untyped",
+            OutputStatus::Ok,
+            format!(
+                "{} {} {count} hits",
+                respire::service::short_id(id),
+                title
+            ),
+        )
+        .action("review: upgrade to skill only with evidence (run-log ok or user sign-off); keeping it as-is is a valid verdict")
+    }));
     let mut result = ResultEnvelope::new(
         "audit",
         status,
-        serde_json::json!({"total_active":active.len(),"orphans":orphans.len(),"invalid_importance":bad_imp.len(),"same_title_groups":same_title.len(),"truncated_titles":truncated.len(),"max_depth":max_depth}),
+        serde_json::json!({"total_active":active.len(),"orphans":orphans.len(),"invalid_importance":bad_imp.len(),"same_title_groups":same_title.len(),"truncated_titles":truncated.len(),"max_depth":max_depth,"skill_template_gaps":skill_gaps.len(),"skill_template_gaps_skipped":skill_gaps_skipped,"failing_skills":failing_skills.len()}),
         items,
     );
     result.actions.push("audit --json".into());
@@ -5898,7 +6117,7 @@ fn main_body() -> i32 {
             match Cli::try_parse_from(
                 std::iter::once(std::ffi::OsString::from("rsrs")).chain(args),
             ) {
-                Ok(cli) if matches!(cli.command, Some(Command::MemoryRevision | Command::Capabilities)) => run(cli),
+                Ok(cli) if matches!(cli.command, Some(Command::MemoryRevision | Command::Capabilities | Command::Runtime { .. })) => run(cli),
                 Ok(cli) => prepare_command_runtime().and_then(|()| run(cli)),
                 Err(error) if error.exit_code() == 0 => error.print().map_err(Into::into),
                 Err(error) => {
@@ -6089,6 +6308,7 @@ fn run_classify_config(
 }
 
 fn run_memory_revision() -> Result<()> {
+    autostart::check_direct_access()?;
     emit_result(ResultEnvelope::new(
         "memory-revision",
         OutputStatus::Ok,
@@ -6119,11 +6339,15 @@ fn changes_profile(command: Option<&Command>) -> bool {
 }
 
 fn run(args: Cli) -> Result<()> {
+    if let Some(Command::Runtime { command }) = args.command.as_ref() {
+        return autostart::execute(command);
+    }
     // Static CLI support is safe to inspect even on a fresh or inaccessible
     // profile. It makes no statement about account rights or model readiness.
     if matches!(args.command, Some(Command::Capabilities)) {
         return run_capabilities();
     }
+    autostart::check_managed_request()?;
     if let Some(Command::Snapshot {
         cmd: SnapshotCmd::Restore { id, confirm },
     }) = args.command.as_ref()
@@ -6195,13 +6419,13 @@ fn run(args: Cli) -> Result<()> {
         anyhow::ensure!(*confirm,"snapshot recover requires --confirm");
         respire::service::ensure_writable()?;
         let root=respire::service::data_dir();let account=respire::service::session_user_of_dir(&root);
-        rpc::change_profile_with_verification(|| {
+        autostart::with_explicit_recovery(|| rpc::change_profile_with_verification(|| {
             let ownership=respire::lock::LibraryLock::acquire(&root,std::time::Duration::from_secs(15))?;
             respire_app::snapshot::recover_locked(&root,&account,&ownership)
         },||Ok(()),||{
             if !respire::service::off_mode(){rpc::verify_open_store(&root)?;}
             Ok(())
-        })?;
+        }))?;
         return emit_result(ResultEnvelope::new("snapshot",OutputStatus::Ok,serde_json::json!({"action":"recovered","runtime_verified":true}),Vec::new()));
     }
     respire_app::snapshot::ensure_no_incomplete_restore(&respire::service::data_dir())?;
@@ -6304,6 +6528,11 @@ fn run(args: Cli) -> Result<()> {
         })
     ) {
         runtime_policy::require_host("CPU recovery and runtime shutdown")?;
+        if autostart::managed_enabled()? {
+            rpc::change_profile(respire::memory::onnx::reset_cpu_config)?;
+            return emit_result(ResultEnvelope::new("model", OutputStatus::Ok,
+                serde_json::json!({"engine":"cpu","force_cpu":true,"runtime_restarted":true}),Vec::new()));
+        }
         let _takeover = runtime_policy::takeover_lock()?;
         respire::memory::onnx::reset_cpu_config()?;
         let stopped_pid = rpc::force_stop_for_reset()?;
@@ -6462,6 +6691,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
     // pre-dispatch check cannot authorize a mutation after that ownership wait.
     respire_app::snapshot::ensure_no_incomplete_restore(&respire::service::data_dir())?;
     progress::phase("执行本地操作", "Executing local operation");
+    autostart::check_direct_access()?;
     // -- Read-only gate (added 2026-09-20; same-day audit moved it) --
     // When this space's agent.json has readonly=true, every write command is refused.
     //
@@ -6845,6 +7075,9 @@ fn run_local_inner(args: Cli) -> Result<()> {
             cmd,
         }) => return run_query_log(*limit, *stats, *json, cmd.as_ref()),
         Some(Command::Bench { cmd }) => return run_bench(cmd),
+        Some(Command::RunLog { id, status, note }) => {
+            return run_run_log(id, status, note);
+        }
         Some(Command::Classify {
             limit,
             all,
@@ -7135,6 +7368,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
         }};
     }
     match command {
+        Command::Runtime { command } => return autostart::execute(&command),
         Command::Remember {
             content,
             r#type,
@@ -7155,6 +7389,17 @@ fn run_local_inner(args: Cli) -> Result<()> {
             // 2026-09-19 two-tier: normal is retired - new writes are important/trivial only (stock normal still reads)
             if !matches!(importance.as_str(), "important" | "trivial") {
                 anyhow::bail!("importance must be important/trivial (normal is retired; normal is logged as diary trivia), got \"{}\"", importance);
+            }
+            // Procedure template: a skill is a manual, not an essay. Warn at write time; `rsrs audit` lists the gaps.
+            if r#type == "skill" && importance == "important" {
+                let missing = skill::missing_sections(&content);
+                if !missing.is_empty() {
+                    eprintln!(
+                        "WARN skill template missing {} - add {} (see `rsrs audit`)",
+                        missing.join("/"),
+                        skill::SECTIONS.join("/")
+                    );
+                }
             }
             // -- Plugin hook pre-remember: may veto the write (sensitive scan etc.). Veto is a normal business state, exit 0 --
             {
@@ -7516,6 +7761,19 @@ fn run_local_inner(args: Cli) -> Result<()> {
                 device: respire::service::device_tag(),
                 modified_by: respire::service::device_tag(),
             };
+            let skill_missing = if entry.kind == Kind::Skill && entry.importance == "important" {
+                let missing = skill::missing_sections(&entry.content);
+                if !missing.is_empty() {
+                    issues.push(format!(
+                        "skill template missing {}; add {}",
+                        missing.join("/"),
+                        skill::SECTIONS.join("/")
+                    ));
+                }
+                missing
+            } else {
+                Vec::new()
+            };
             let stored = if supersedes.is_some() || !see_also.is_empty() {
                 respire::service::store_related(&session,&store,embedder!(),&mut entry,supersedes.as_deref(),&see_also)?
             } else {
@@ -7554,6 +7812,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
                     "id": entry.id,
                     "parent": parent_id,
                     "maintenance_hint": hint,
+                    "skill_template_missing": skill_missing,
                 }),
                 vec![OutputItem::new(
                     "write",
@@ -7625,6 +7884,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
             trace,
             titles,
             no_related,
+            intent,
         } => {
             let recall_generation = rpc::sync_generation();
             let session = build_session()?;
@@ -7646,18 +7906,63 @@ fn run_local_inner(args: Cli) -> Result<()> {
                 std::env::set_var("RSRS_DEBUG_SCORE", "1");
             }
             let mut q = MemoryQuery::new(&query).limit(limit);
-            if let Some(k) = r#type {
-                q = q.of_kind(Kind::from_str(&k));
+            if let Some(k) = &r#type {
+                q = q.of_kind(Kind::from_str(k));
             }
             if let Some(p) = &project {
                 q = q.of_project(p);
             }
             // 3. small-to-big: hit body + ancestor bodies (budget is built-in; RSRS_ANCESTOR_BUDGET=0 turns it off)
-            let (ranked, recall_mode, selection_fallback, routing) = match mode {
+            let (mut ranked, recall_mode, selection_fallback, routing) = match mode {
                 Some(mode) => {
                     recall_select::recall_with_mode(&session, embedder!(), &candidates, &q, &store, &mode)?
                 }
                 None => recall_select::recall(&session, embedder!(), &candidates, &q, &store)?,
+            };
+            // Procedural-memory routing (P1/P2): a how-to question gets a second,
+            // skill-only pass; the union keeps one procedure inside the top three.
+            // Facts keep Core's order and score; run history only ranks procedures.
+            let howto = match intent.as_str() {
+                "howto" => true,
+                "fact" => false,
+                _ => r#type.is_none() && skill::howto_intent(&query),
+            };
+            let mut procedure_pass = 0usize;
+            let mut procedure_promoted = false;
+            if howto && r#type.is_none() {
+                let mut q_skill = q.clone().of_kind(Kind::Skill);
+                q_skill.limit = limit;
+                let (skills, _, _, _) = recall_select::recall_with_mode(
+                    &session,
+                    embedder!(),
+                    &candidates,
+                    &q_skill,
+                    &store,
+                    &recall_mode,
+                )?;
+                procedure_pass = skills.len();
+                if !skills.is_empty() {
+                    let ids: Vec<String> = ranked
+                        .iter()
+                        .chain(skills.iter())
+                        .map(|r| r.entry.id.clone())
+                        .collect();
+                    let runs = store
+                        .skill_run_stats(&ids)?
+                        .into_iter()
+                        .map(|(id, st)| (id, skill::RunScore { ok: st.ok, fail: st.fail }))
+                        .collect();
+                    let (merged, promoted) = skill::merge_howto(ranked, skills, limit, &runs);
+                    ranked = merged;
+                    procedure_promoted = promoted;
+                }
+            }
+            let intent_label = if r#type.is_some() {
+                "typed"
+            } else if howto {
+                "howto"
+            } else {
+                "fact"
             };
             let hit_ids: Vec<String> = ranked.iter().map(|r| r.entry.id.clone()).collect();
             let associations: respire::memory::model::RelatedResult = if no_related {
@@ -7707,6 +8012,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
                     OutputStatus::Skip,
                     serde_json::json!({"query":query,"query_log_id":query_log_id,"count":0,"recall_mode":recall_mode,
                         "selection_fallback":selection_fallback,"embedding_model":store.retrieval_model()?,"routing":routing,
+                        "intent": intent_label,"procedure_pass":procedure_pass,
                         "index_pending":index_pending,"indexed_candidates":candidates.len().saturating_sub(index_pending),"lexical_candidates":index_pending}),
                     vec![OutputItem::new("results", OutputStatus::Skip, "0")],
                 ))?;
@@ -7738,6 +8044,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
                 OutputStatus::Ok,
                 serde_json::json!({"query":query,"query_log_id":query_log_id,"count":ranked.len(),"limit":limit,"project":project,
                     "recall_mode":recall_mode,"selection_fallback":selection_fallback,"embedding_model":store.retrieval_model()?,"related":associations.related.len(),"routing":routing,
+                    "intent": intent_label,"procedure_pass":procedure_pass,"procedure_promoted":procedure_promoted,
                     "index_pending":index_pending,"indexed_candidates":candidates.len().saturating_sub(index_pending),"lexical_candidates":index_pending}),
                 items,
             );
@@ -7952,8 +8259,8 @@ fn run_local_inner(args: Cli) -> Result<()> {
                         serde_json::json!({"id":e.id,"title":e.title}),
                         vec![OutputItem::new("entry", OutputStatus::Ok, short_id(&e.id))],
                     );
-                    result.details =
-                        serde_json::json!({"entry":e,"ancestors":ancestors,"children":children});
+                    result.details = serde_json::json!({"entry":e,"ancestors":ancestors,"children":children,
+                        "recall_count": s.local_recall_count});
                     emit_result(result)?;
                 }
                 None => emit_result(ResultEnvelope::new(
@@ -7984,13 +8291,17 @@ fn run_local_inner(args: Cli) -> Result<()> {
             }
             candidates.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
             candidates.truncate(limit);
-            let out: Vec<respire::MemoryEntry> = candidates
+            let out: Vec<(respire::MemoryEntry, i64)> = candidates
                 .iter()
-                .filter_map(|s| MemoryEngine::open(&session, s).ok())
+                .filter_map(|s| {
+                    MemoryEngine::open(&session, s)
+                        .ok()
+                        .map(|e| (e, s.local_recall_count))
+                })
                 .collect();
             let items = out
                 .iter()
-                .map(|e| OutputItem::new(short_id(&e.id), OutputStatus::Ok, e.title.clone()))
+                .map(|(e, _)| OutputItem::new(short_id(&e.id), OutputStatus::Ok, e.title.clone()))
                 .collect();
             let mut result = ResultEnvelope::new(
                 "list",
@@ -8000,7 +8311,13 @@ fn run_local_inner(args: Cli) -> Result<()> {
             );
             result.details = serde_json::Value::Array(
                 out.into_iter()
-                    .filter_map(|e| serde_json::to_value(e).ok())
+                    .filter_map(|(e, recall_count)| {
+                        let mut row = serde_json::to_value(e).ok()?;
+                        if let Some(obj) = row.as_object_mut() {
+                            obj.insert("recall_count".into(), serde_json::json!(recall_count));
+                        }
+                        Some(row)
+                    })
                     .collect(),
             );
             emit_result(result)?;
@@ -9081,6 +9398,19 @@ fn run_local_inner(args: Cli) -> Result<()> {
                 }
                 entry.importance = imp;
             }
+            let skill_missing = if entry.kind == Kind::Skill && entry.importance == "important" {
+                let missing = skill::missing_sections(&entry.content);
+                if !missing.is_empty() {
+                    eprintln!(
+                        "WARN skill template missing {} - add {} (see `rsrs audit`)",
+                        missing.join("/"),
+                        skill::SECTIONS.join("/")
+                    );
+                }
+                missing
+            } else {
+                Vec::new()
+            };
             entry.updated_at = store.edit_stamp(&stored.id)?;
             entry.modified_by = respire::service::device_tag();
             let user = entry.user.clone();
@@ -9096,8 +9426,13 @@ fn run_local_inner(args: Cli) -> Result<()> {
             let hint = note_write_maintenance();
             let mut result = ResultEnvelope::new(
                 "update",
-                OutputStatus::Ok,
+                if skill_missing.is_empty() {
+                    OutputStatus::Ok
+                } else {
+                    OutputStatus::Warn
+                },
                 serde_json::json!({"action":"written", "id": stored.id, "maintenance_hint": hint,
+                    "skill_template_missing": skill_missing,
                     "index_state": if new_stored.local_artifact.is_empty() { "pending" } else { "ready" }}),
                 vec![OutputItem::new(
                     "entry",
@@ -9109,6 +9444,13 @@ fn run_local_inner(args: Cli) -> Result<()> {
                     ),
                 )],
             );
+            if !skill_missing.is_empty() {
+                result.actions.push(format!(
+                    "skill template missing {}; add {}",
+                    skill_missing.join("/"),
+                    skill::SECTIONS.join("/")
+                ));
+            }
             result.details = serde_json::to_value(entry)?;
             emit_result(result)?;
             schedule_autosync(&session, &store);
@@ -9161,6 +9503,7 @@ fn run_local_inner(args: Cli) -> Result<()> {
         | Command::Prompt
         | Command::QueryLog { .. }
         | Command::Bench { .. }
+        | Command::RunLog { .. }
         | Command::Classify { .. }
         | Command::Web { .. }
         | Command::Restart { .. }

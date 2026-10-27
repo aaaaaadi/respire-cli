@@ -1006,7 +1006,7 @@ $entryBeforeReembed = $beforeReembed.Envelope.details.entry | ConvertTo-Json -De
 $reembedTask = [Guid]::NewGuid().ToString('N')
 $reembed = Invoke-Om -Name 'reembed' -ArgList @('--json', 'reembed') -DataDir $DirA -TimeoutSec 300 -ModelTaskId $reembedTask
 $invalidProgress = @($reembed.Progress | Where-Object {
-    [string]$_.id -cne $reembedTask -or $_.phase -notin @('load', 'index') -or $_.cancelled -ne $false `
+    [string]$_.id -cne $reembedTask -or $_.phase -notin @('load', 'index-load', 'index') -or $_.cancelled -ne $false `
         -or ($_.done -isnot [long] -and $_.done -isnot [int]) -or $_.done -lt 0 `
         -or ($null -ne $_.total -and (($_.total -isnot [long] -and $_.total -isnot [int]) -or $_.total -lt $_.done))
 })
@@ -1017,7 +1017,7 @@ $script:ModelProgressEvidence.contract = @{
     return_object_count = @($reembed).Count
     returned_sample_count = @($reembed.Progress).Count
     invalid_id_count = @($reembed.Progress | Where-Object { [string]$_.id -cne $reembedTask }).Count
-    invalid_phase_count = @($reembed.Progress | Where-Object { $_.phase -notin @('load', 'index') }).Count
+    invalid_phase_count = @($reembed.Progress | Where-Object { $_.phase -notin @('load', 'index-load', 'index') }).Count
     invalid_cancelled_count = @($reembed.Progress | Where-Object { $_.cancelled -ne $false }).Count
     invalid_done_count = @($reembed.Progress | Where-Object { ($_.done -isnot [long] -and $_.done -isnot [int]) -or $_.done -lt 0 }).Count
     invalid_total_count = @($reembed.Progress | Where-Object { $null -ne $_.total -and (($_.total -isnot [long] -and $_.total -isnot [int]) -or $_.total -lt $_.done) }).Count

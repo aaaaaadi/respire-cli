@@ -13,6 +13,25 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 export class PackageNotVisibleError extends Error {}
 
+class RegistryTransientError extends Error {}
+const temporaryTransportCodes = new Set([
+  'ETIMEDOUT', 'ECONNRESET', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET',
+]);
+
+// Classify failures only at the read boundary, never validation errors or npm
+// submission. Generic fetch/TLS/redirect failures remain fatal.
+async function registryRead(read) {
+  try { return await read(); }
+  catch (error) {
+    if (error?.name === 'TimeoutError' || temporaryTransportCodes.has(error?.code)
+        || temporaryTransportCodes.has(error?.cause?.code)) {
+      throw new RegistryTransientError('Temporary registry transport failure', {cause: error});
+    }
+    throw error;
+  }
+}
+
 function identity(expected) {
   if (!expected || !packageName.test(expected.name) || !versionPattern.test(expected.version)) {
     throw new Error('Invalid expected npm package identity');
@@ -101,14 +120,20 @@ async function get(raw, options, tarball = false) {
   const requestTimeoutMs = options.deadline === undefined ? requestedTimeout
     : Math.min(requestedTimeout, Math.max(1, options.deadline - (options.now || Date.now)()));
   if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0) throw new Error('Invalid registry request timeout');
-  const response = await (options.fetchImpl || globalThis.fetch)(url, {
+  const response = await registryRead(() => (options.fetchImpl || globalThis.fetch)(url, {
     method: 'GET', headers: {'Accept': options.accept || 'application/json', 'Cache-Control': 'no-cache'},
     credentials: 'omit', redirect: 'error', cache: 'no-store',
     signal: AbortSignal.timeout(Math.max(1, Math.ceil(requestTimeoutMs))),
-  });
+  }));
   // fetchImpl is injectable for offline tests; native fetch supplies response.url.
   if (response.url && registryUrl(response.url) !== url) throw new Error('Unexpected registry redirect');
   if (response.status !== 200 && response.status !== 404) {
+    if ([408, 429, 500, 502, 503, 504].includes(response.status)) {
+      const message = `Registry HTTP ${response.status}: ${url}`;
+      try { await response.body?.cancel(); }
+      catch (cause) { throw new RegistryTransientError(message, {cause}); }
+      throw new RegistryTransientError(message);
+    }
     throw new Error(`Registry HTTP ${response.status}: ${url}`);
   }
   return response;
@@ -127,7 +152,9 @@ async function verifyTarball(metadata, expected, options) {
     sha512.update(bytes); sha1.update(bytes);
   };
   if (response.body?.[Symbol.asyncIterator]) {
-    for await (const chunk of response.body) add(chunk);
+    await registryRead(async () => {
+      for await (const chunk of response.body) add(chunk);
+    });
   } else {
     throw new Error('Registry tarball response must provide a streaming body');
   }
@@ -140,7 +167,10 @@ export async function checkPackage(expected, options = {}) {
   const label = identity(expected);
   const response = await get(`${REGISTRY}/${encodeURIComponent(expected.name)}/${encodeURIComponent(expected.version)}`, options);
   if (response.status === 404) return null;
-  const metadata = await response.json();
+  // Once an exact version responds 200, later propagation misses may never
+  // authorize a second submission, even if this response body times out.
+  options.onVersionVisible?.();
+  const metadata = await registryRead(() => response.json());
   if (metadata.name !== expected.name || metadata.version !== expected.version) throw new Error(`Registry identity mismatch: ${label}`);
   for (const dependencyField of ['dependencies', 'optionalDependencies']) {
     if (!expected[dependencyField]) continue;
@@ -156,7 +186,7 @@ export async function checkPackage(expected, options = {}) {
       ...options, accept: 'application/vnd.npm.install-v1+json',
     });
     if (indexResponse.status === 404) throw new PackageNotVisibleError(`Registry install index is not visible: ${label}`);
-    const index = await indexResponse.json();
+    const index = await registryRead(() => indexResponse.json());
     if (index.name !== expected.name || !index.versions || typeof index.versions !== 'object' || Array.isArray(index.versions)) {
       throw new Error(`Registry install index is invalid: ${label}`);
     }
@@ -185,7 +215,7 @@ export async function checkPackage(expected, options = {}) {
   return metadata;
 }
 
-export async function waitForPackage(expected, options = {}) {
+async function pollRegistryRead(expected, options, read) {
   identity(expected);
   const timeoutMs = options.timeoutMs ?? 600000;
   const pollMs = options.pollMs ?? 3000;
@@ -193,18 +223,27 @@ export async function waitForPackage(expected, options = {}) {
     throw new Error('Invalid registry propagation timeout/poll interval');
   }
   const now = options.now || Date.now;
-  const deadline = now() + timeoutMs;
+  const deadline = Math.min(now() + timeoutMs, options.deadline ?? Infinity);
+  let lastError;
   while (true) {
     try {
-      const metadata = await checkPackage(expected, {...options, deadline});
-      if (metadata) return metadata;
+      return await read({...options, deadline});
     } catch (error) {
-      if (!(error instanceof PackageNotVisibleError)) throw error;
+      if (!(error instanceof PackageNotVisibleError) && !(error instanceof RegistryTransientError)) throw error;
+      lastError = error;
     }
     const remaining = deadline - now();
-    if (remaining <= 0) throw new PackageNotVisibleError(`Registry propagation timed out: ${identity(expected)}`);
+    if (remaining <= 0) throw new PackageNotVisibleError(`Registry propagation timed out: ${identity(expected)}; ${lastError.message}`, {cause: lastError});
     await (options.sleep || pause)(Math.min(pollMs, remaining));
   }
+}
+
+export async function waitForPackage(expected, options = {}) {
+  return pollRegistryRead(expected, options, async bounded => {
+    const metadata = await checkPackage(expected, bounded);
+    if (!metadata) throw new PackageNotVisibleError(`Registry package is not visible: ${identity(expected)}`);
+    return metadata;
+  });
 }
 
 // SemVer precedence, including numeric prerelease identifiers (dev.10 > dev.9).
@@ -237,7 +276,7 @@ export async function assertTagSafe(expected, tag, options = {}) {
   if (expected.version.includes('-dev') && tag === 'latest') throw new Error('Refusing to publish a dev version under latest');
   const response = await get(`${REGISTRY}/-/package/${encodeURIComponent(expected.name)}/dist-tags`, options);
   if (response.status === 404) return;
-  const tags = await response.json();
+  const tags = await registryRead(() => response.json());
   if (!tags || typeof tags !== 'object' || Array.isArray(tags)) throw new Error('Invalid npm distribution tags response');
   if (Object.hasOwn(tags, tag) && compareVersions(tags[tag], expected.version) > 0) {
     throw new Error(`Refusing npm tag rollback: ${expected.name} ${tag}=${tags[tag]} > ${expected.version}`);
@@ -253,14 +292,18 @@ export async function publishPackage(dir, expected, tag, options = {}) {
   try {
     const packed = packPackage(dir, temp, options);
     assertPackMatches(packed, expected);
-    let existing;
-    try { existing = await checkPackage(expected, options); }
-    catch (error) {
-      if (!(error instanceof PackageNotVisibleError)) throw error;
-      existing = await waitForPackage(expected, options);
-    }
+    // Preflight, tag checks and post-submission confirmation share one budget;
+    // adding a read retry must not multiply the publication wait by stages.
+    const readOptions = {...options, deadline: Math.min(options.deadline ?? Infinity,
+      (options.now || Date.now)() + (options.timeoutMs ?? 600000))};
+    let versionSeen = false;
+    const existing = await pollRegistryRead(expected, readOptions, async bounded => {
+      const metadata = await checkPackage(expected, {...bounded, onVersionVisible: () => {versionSeen = true;}});
+      if (!metadata && versionSeen) throw new PackageNotVisibleError(`Previously visible registry version is pending: ${identity(expected)}`);
+      return metadata;
+    });
     if (existing) return {status: 'existing', metadata: existing};
-    await assertTagSafe(expected, tag, options);
+    await pollRegistryRead(expected, readOptions, bounded => assertTagSafe(expected, tag, bounded));
     // Publish the checked bytes, never repack a mutable directory inside npm publish.
     // A failed/uncertain submission is never repeated here: only visibility is retried.
     let result;
@@ -271,7 +314,7 @@ export async function publishPackage(dir, expected, tag, options = {}) {
     } catch (error) { result = {status: null, error}; }
     const accepted = result.status === 0 && !result.error;
     try {
-      const metadata = await waitForPackage(expected, options);
+      const metadata = await waitForPackage(expected, readOptions);
       return {status: accepted ? 'published' : 'recovered', metadata};
     } catch (error) {
       if (!accepted) throw new Error(`npm publish failed or was uncertain for ${identity(expected)}; registry did not confirm matching bytes: ${error.message}`, {cause: error});

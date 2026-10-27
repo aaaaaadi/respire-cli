@@ -75,6 +75,24 @@ test('404 may become visible within the bounded propagation wait', async () => {
   const mock = registry({absent: 2});
   assert.equal((await waitForPackage(expected, {...mock, ...fastClock()})).name, expected.name);
   assert.equal(mock.calls.filter(call => !call.url.endsWith('.tgz')).length, 3);
+  let cancelled = 0;
+  const transientStatuses = [408, 429, 500, 502, 503, 504];
+  for (const failure of [
+    () => {throw new DOMException('request timed out', 'TimeoutError');},
+    () => {throw new TypeError('fetch failed', {cause: {code: 'ECONNRESET'}});},
+    () => {throw Object.assign(new Error('body stalled'), {code: 'UND_ERR_BODY_TIMEOUT'});},
+    ...transientStatuses.map(status => () => ({status, body: {cancel: async () => {cancelled++;}}})),
+  ]) {
+    const mock = registry();
+    let attempts = 0;
+    const fetchImpl = (url, options) => attempts++ === 0 ? failure() : mock.fetchImpl(url, options);
+    assert.equal((await waitForPackage(expected, {...fastClock(), fetchImpl})).name, expected.name);
+    assert.equal(attempts, 3, 'retry metadata, then verify matching tarball');
+    let polls = 0;
+    await assert.rejects(waitForPackage(expected, {...fastClock(), fetchImpl: () => {polls++; return failure();}}), /timed out/);
+    assert.equal(polls, 4, 'temporary failures retain the original total deadline');
+  }
+  assert.equal(cancelled, transientStatuses.length * 5, 'every transient HTTP response releases its unread body');
 });
 
 test('only HTTP 404 is absence; errors and invalid identity fail closed', async () => {
@@ -84,6 +102,18 @@ test('only HTTP 404 is absence; errors and invalid identity fail closed', async 
   await assert.rejects(checkPackage(expected, {fetchImpl: async () => {throw new Error('network failed');}}), /network failed/);
   assert.equal(await checkPackage(expected, {fetchImpl: async () => missing()}), null);
   await assert.rejects(checkPackage(expected, registry({meta: metadata({name: 'wrong-package'})})), /identity mismatch/);
+  for (const fetchImpl of [
+    async () => new Response('', {status: 401}),
+    async () => new Response('', {status: 403}),
+    async () => {throw new TypeError('fetch failed', {cause: {code: 'CERT_HAS_EXPIRED'}});},
+    async () => {throw new TypeError('fetch failed', {cause: {code: 'ENOTFOUND'}});},
+    async () => {throw new TypeError('fetch failed', {cause: {code: 'UND_ERR_REDIRECT'}});},
+    async () => new Response('invalid JSON'),
+  ]) {
+    let attempts = 0;
+    await assert.rejects(waitForPackage(expected, {...fastClock(), fetchImpl: (...args) => {attempts++; return fetchImpl(...args);}}));
+    assert.equal(attempts, 1, 'authentication, TLS, configuration and malformed metadata are not retried');
+  }
 });
 
 test('same version with different metadata hashes fails without fetching tarball', async () => {
@@ -135,6 +165,15 @@ test('existing identical package skips publish and makes no tag read/change', as
   assert.equal(result.status, 'existing');
   assert.equal(npm.calls.length, 1);
   assert(!mock.calls.some(call => call.url.includes('/dist-tags')));
+  const flaky = registry();
+  let reads = 0;
+  const resultAfterTimeout = await publishPackage(dir, expected, 'dev', {...npm, ...fastClock(),
+    fetchImpl: (url, options) => {
+      if (reads++ === 0) throw new DOMException('preflight timed out', 'TimeoutError');
+      return flaky.fetchImpl(url, options);
+    }});
+  assert.equal(resultAfterTimeout.status, 'existing');
+  assert.equal(npm.calls.filter(call => call.args[0] === 'publish').length, 0);
 });
 
 test('missing package publishes checked tarball exactly once, then waits', async t => {
@@ -142,6 +181,33 @@ test('missing package publishes checked tarball exactly once, then waits', async
   const result = await publishPackage(dir, expected, 'dev', {...npm, ...mock, ...fastClock()});
   assert.equal(result.status, 'published');
   assert.equal(npm.calls.filter(call => call.args[0] === 'publish').length, 1);
+  for (const publishStatus of [0, 1]) {
+    let submitted = false, interrupted = false;
+    const npm = mockNpm({publishStatus, onPublish: () => {submitted = true;}});
+    const mock = registry({absent: 1});
+    const fetchImpl = (url, options) => {
+      if (submitted && !interrupted) {
+        interrupted = true;
+        throw new DOMException('accepted submission read timed out', 'TimeoutError');
+      }
+      return mock.fetchImpl(url, options);
+    };
+    const result = await publishPackage(dir, expected, 'dev', {...npm, fetchImpl, ...fastClock()});
+    assert.equal(result.status, publishStatus === 0 ? 'published' : 'recovered');
+    assert.equal(npm.calls.filter(call => call.args[0] === 'publish').length, 1);
+  }
+  const delayedTag = registry({absent: 1});
+  let tagFailed = false;
+  const tagNpm = mockNpm();
+  await publishPackage(dir, expected, 'dev', {...tagNpm, ...fastClock(), fetchImpl: (url, options) => {
+    if (url.endsWith('/dist-tags') && !tagFailed) {
+      tagFailed = true;
+      throw new DOMException('tag read timed out', 'TimeoutError');
+    }
+    return delayedTag.fetchImpl(url, options);
+  }});
+  assert(tagFailed);
+  assert.equal(tagNpm.calls.filter(call => call.args[0] === 'publish').length, 1);
 });
 
 test('uncertain publish failure recovers only via matching registry bytes, never republish', async t => {
@@ -158,6 +224,18 @@ test('uncertain publish never reattempts after propagation timeout or different 
     await assert.rejects(publishPackage(dir, expected, 'dev', {...npm, ...mock, ...fastClock()}), /failed or was uncertain/);
     assert.equal(npm.calls.filter(call => call.args[0] === 'publish').length, 1);
   }
+  const clock = fastClock(), mock = registry({absent: 1});
+  let preflightFailed = false, tagFailed = false, submitted = false;
+  const npm = mockNpm({onPublish: () => {submitted = true;}});
+  await assert.rejects(publishPackage(dir, expected, 'dev', {...npm, ...clock, fetchImpl: (url, options) => {
+    if (submitted) throw new DOMException('confirmation timeout', 'TimeoutError');
+    if (url.endsWith('/dist-tags')) {
+      if (!tagFailed) {tagFailed = true; throw new DOMException('tag timeout', 'TimeoutError');}
+    } else if (!preflightFailed) {preflightFailed = true; throw new DOMException('preflight timeout', 'TimeoutError');}
+    return mock.fetchImpl(url, options);
+  }}), /timed out/);
+  assert.equal(clock.now(), clock.timeoutMs, 'all read stages share one deadline');
+  assert.equal(npm.calls.filter(call => call.args[0] === 'publish').length, 1);
 });
 
 test('registry permission/network error never triggers npm publish', async t => {
@@ -167,6 +245,14 @@ test('registry permission/network error never triggers npm publish', async t => 
     await assert.rejects(publishPackage(dir, expected, 'dev', {...npm, fetchImpl}));
     assert.equal(npm.calls.filter(call => call.args[0] === 'publish').length, 0);
   }
+  const npm = mockNpm();
+  let polls = 0;
+  await assert.rejects(publishPackage(dir, expected, 'dev', {...npm, ...fastClock(), fetchImpl: async () => {
+    polls++;
+    throw new DOMException('preflight permanently stalled', 'TimeoutError');
+  }}), /timed out/);
+  assert.equal(polls, 4);
+  assert.equal(npm.calls.filter(call => call.args[0] === 'publish').length, 0);
 });
 
 test('tag rollback is blocked including dev.10 versus dev.9; DEV cannot touch latest', async t => {
@@ -224,6 +310,17 @@ test('tarballs are hashed as chunks without buffering the whole response', async
   await checkPackage(expected, {fetchImpl});
   assert(streamed);
   await assert.rejects(checkPackage(expected, {...registry(), maxTarballBytes: 1}), /size limit/);
+  let tarballs = 0;
+  await waitForPackage(expected, {...fastClock(), fetchImpl: async url => {
+    if (!url.endsWith('.tgz')) return json(metadata());
+    const attempt = ++tarballs;
+    return {status: 200, body: (async function* () {
+      yield bytes.subarray(0, 5);
+      if (attempt === 1) throw new DOMException('stream timed out', 'TimeoutError');
+      yield bytes.subarray(5);
+    })()};
+  }});
+  assert.equal(tarballs, 2, 'partial failed downloads restart both hash accumulators');
 });
 
 test('already visible metadata with delayed tarball cannot trigger publication', async t => {
@@ -234,6 +331,40 @@ test('already visible metadata with delayed tarball cannot trigger publication',
   const result = await publishPackage(dir, expected, 'dev', {...npm, fetchImpl, ...fastClock()});
   assert.equal(result.status, 'existing');
   assert.equal(npm.calls.filter(call => call.args[0] === 'publish').length, 0);
+  const exactUrl = `https://registry.npmjs.org/${encodeURIComponent(expected.name)}/${expected.version}`;
+  const indexUrl = `https://registry.npmjs.org/${encodeURIComponent(expected.name)}`;
+  for (const pendingAt of ['tarball-404', 'tarball-timeout', 'index-404', 'index-timeout', 'metadata-body-timeout']) {
+    for (const recovers of [true, false]) {
+      const npm = mockNpm(), clock = fastClock();
+      let exactReads = 0, interrupted = false;
+      const fetchImpl = async url => {
+        if (url === exactUrl) {
+          exactReads++;
+          if (exactReads > 1 && (!recovers || exactReads === 2)) return missing();
+          if (pendingAt === 'metadata-body-timeout' && !interrupted) {
+            interrupted = true;
+            return {status: 200, json: async () => {throw new DOMException('metadata body timed out', 'TimeoutError');}};
+          }
+          return json(metadata());
+        }
+        if (!interrupted && ((url.endsWith('.tgz') && pendingAt.startsWith('tarball'))
+            || (url === indexUrl && pendingAt.startsWith('index')))) {
+          interrupted = true;
+          if (pendingAt.endsWith('timeout')) throw new DOMException('propagation read timed out', 'TimeoutError');
+          return missing();
+        }
+        if (url === indexUrl) return json({name: expected.name, versions: {[expected.version]: metadata()}});
+        if (url.endsWith('/dist-tags')) return json({});
+        assert(url.endsWith('.tgz'));
+        return new Response(bytes);
+      };
+      const publication = publishPackage(dir, expected, 'dev', {...npm, ...clock, fetchImpl, requireInstallIndex: true});
+      const result = recovers ? await publication : await assert.rejects(publication, /timed out/);
+      assert(interrupted);
+      assert.equal(npm.calls.filter(c => c.args[0] === 'publish').length, 0, `${pendingAt} then metadata404 must never submit`);
+      if (recovers) assert.equal(result.status, 'existing');
+    }
+  }
 });
 
 test('missing verified receipt blocks pack --publish without clearing dist', t => {
@@ -317,6 +448,22 @@ test('install index may lag exact metadata; wait finishes before downloading byt
     assert.equal(result.version, expected.version);
     assert.equal(mock.calls.filter(c => c.options.headers.Accept.includes('install-v1')).length, 3);
     assert.equal(mock.calls.filter(c => c.url.endsWith('.tgz')).length, 1);
+  }
+  for (const failAt of ['metadata-json', 'index-fetch', 'index-json']) {
+    const mock = installRegistry();
+    let failed = false;
+    const root = `https://registry.npmjs.org/${encodeURIComponent(expected.name)}`;
+    await waitForPackage(expected, {...fastClock(), requireInstallIndex: true,
+      fetchImpl: async (url, options) => {
+        if (!failed && ((failAt.startsWith('index') && url === root)
+            || (failAt === 'metadata-json' && url === `${root}/${expected.version}`))) {
+          failed = true;
+          if (failAt === 'index-fetch') throw new DOMException('index timed out', 'TimeoutError');
+          return {status: 200, json: async () => {throw new DOMException('JSON body timed out', 'TimeoutError');}};
+        }
+        return mock.fetchImpl(url, options);
+      }});
+    assert(failed);
   }
 });
 

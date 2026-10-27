@@ -38,6 +38,12 @@ pub struct Health {
     pub store_ready: bool,
     #[serde(default)]
     pub snapshot_restore_id: Option<String>,
+    #[serde(default)]
+    pub installation_root: String,
+    #[serde(default)]
+    pub managed_id: Option<String>,
+    #[serde(default)]
+    pub credential_state: String,
 }
 
 impl Health {
@@ -165,14 +171,9 @@ pub fn pid_is_respire(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        let out = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-            .output();
-        let Ok(out) = out else {
-            return false;
-        };
-        let text = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
-        text.contains("rsrs.exe")
+        respire_spawn::process_identity(pid).ok().flatten()
+            .and_then(|value| value.executable.file_name().map(|name|name.to_owned()))
+            .is_some_and(|name|name.to_str().is_some_and(|name|name.eq_ignore_ascii_case("rsrs.exe")))
     }
     #[cfg(target_os = "linux")]
     {
@@ -315,7 +316,7 @@ pub fn request_stop() -> Result<()> {
 pub(crate) fn request_stop_with_timeout(timeout: Duration) -> Result<()> {
     crate::runtime_policy::require_host("runtime shutdown")?;
     let url = format!("{}/api/runtime/stop", rpc_base_url());
-    send_loopback(agent().post(&url).timeout(timeout), |request| request.send_string("{}"))?;
+    send_loopback(agent().post(&url).timeout(timeout).set("X-Respire-Lifecycle", "coordinator-v1"), |request| request.send_string("{}"))?;
     Ok(())
 }
 
@@ -335,6 +336,7 @@ pub(crate) fn rpc_method_with_timeout(method: &str, args: Vec<String>, test_time
         "id": uuid::Uuid::new_v4().to_string(),
         "method": method,
         "args": args,
+        "lifecycle": if method == "runtime.stop" { Some("coordinator-v1") } else { None },
     });
     // Downloading M3 or rebuilding a library can legitimately exceed the normal RPC budget.
     // Native inference runs inside the runtime; a request is never replayed here.
@@ -415,33 +417,23 @@ pub(crate) fn process_is_running(pid: u32) -> Result<bool> {
             Err(error) => Err(error).context("runtime process inspection failed"),
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
     {
-        #[cfg(windows)]
-        let output = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-            .output().context("cannot check stopped runtime process")?;
-        #[cfg(unix)]
+        // Query-limited kernel handles avoid spawning tasklist on every drain
+        // poll and retain fail-closed errors for inaccessible process identity.
+        Ok(respire_spawn::process_birth(pid)?.is_some())
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
         let output = std::process::Command::new("ps")
             .args(["-p", &pid.to_string(), "-o", "pid=", "-o", "stat="])
             .output().context("cannot check stopped runtime process")?;
         let text = String::from_utf8_lossy(&output.stdout);
-        #[cfg(windows)]
-        let alive = {
-            anyhow::ensure!(output.status.success(), "runtime process inspection failed");
-            text.lines().any(|line| line.split(',').nth(1)
-                .is_some_and(|value| value.trim_matches('"') == pid.to_string()))
-        };
-        #[cfg(unix)]
-        let alive = {
-            anyhow::ensure!(output.status.success() || output.stderr.is_empty(), "runtime process inspection failed");
-            let mut fields = text.split_whitespace();
-            // An unreaped child still has a PID, but has exited and released its
-            // listener, native session and database locks. Do not wait for its parent.
-            fields.next() == Some(pid.to_string().as_str())
-                && fields.next().is_some_and(|state| !state.starts_with('Z'))
-        };
-        Ok(alive)
+        anyhow::ensure!(output.status.success() || output.stderr.is_empty(), "runtime process inspection failed");
+        let mut fields = text.split_whitespace();
+        // Zombies have released their listener, native session and database locks.
+        Ok(fields.next() == Some(pid.to_string().as_str())
+            && fields.next().is_some_and(|state| !state.starts_with('Z')))
     }
 }
 
@@ -464,20 +456,25 @@ pub(crate) struct RuntimeProcessIdentity {
 
 /// An endpoint PID is only a locator. Verify runtime arguments and creation time
 /// before waiting, then compare again before forcefully terminating the process.
+fn foreground_runtime_arguments(args: &[&str]) -> bool {
+    let mut args = args.iter().copied().skip(1);
+    let command = loop {
+        match args.next() {
+            Some("--json" | "--direct") => continue,
+            other => break other,
+        }
+    };
+    command == Some("runtime") && args.next() == Some("run")
+}
+
 pub(crate) fn runtime_process_identity(pid: u32) -> Result<RuntimeProcessIdentity> {
     anyhow::ensure!(pid != std::process::id() && pid_is_respire(pid), "cannot verify runtime process {pid}");
     #[cfg(windows)]
     {
-        let script = format!(r#"$ErrorActionPreference='Stop'; $runtimeProc=Get-CimInstance Win32_Process -Filter 'ProcessId={pid}'; if ($null -eq $runtimeProc) {{ exit 0 }}; $runtimeArgs=$runtimeProc.CommandLine -split '\s+'; $isRuntime=($runtimeArgs -contains '--runtime-internal') -or (($runtimeArgs -contains 'web') -and ($runtimeArgs -contains '--internal')); [pscustomobject]@{{started_at=$runtimeProc.CreationDate.ToUniversalTime().Ticks.ToString(); executable=$runtimeProc.ExecutablePath; runtime=$isRuntime}} | ConvertTo-Json -Compress"#);
-        let output = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script]).output()?;
-        anyhow::ensure!(output.status.success(), "cannot inspect runtime process {pid}");
-        #[derive(serde::Deserialize)]
-        struct Process { started_at: String, executable: String, runtime: bool }
-        let process: Process = serde_json::from_slice(&output.stdout)
+        let process = respire_spawn::runtime_process_identity(pid)?
             .context("runtime process disappeared or could not be identified")?;
-        anyhow::ensure!(process.runtime, "process {pid} is not a runtime; restart refused");
-        Ok(RuntimeProcessIdentity { started_at: process.started_at, executable: process.executable })
+        let executable = process.executable.to_str().context("runtime process image is not UTF-8")?.to_owned();
+        Ok(RuntimeProcessIdentity { started_at: process.birth.to_string(), executable })
     }
     #[cfg(target_os = "linux")]
     {
@@ -485,7 +482,7 @@ pub(crate) fn runtime_process_identity(pid: u32) -> Result<RuntimeProcessIdentit
         let command = std::fs::read(directory.join("cmdline"))?;
         let args: Vec<_> = command.split(|byte| *byte == 0)
             .filter_map(|arg| std::str::from_utf8(arg).ok()).collect();
-        anyhow::ensure!(args.contains(&"--runtime-internal") || (args.contains(&"web") && args.contains(&"--internal")),
+        anyhow::ensure!(args.contains(&"--runtime-internal") || (args.contains(&"web") && args.contains(&"--internal")) || foreground_runtime_arguments(&args),
             "process {pid} is not a runtime; restart refused");
         let stat = std::fs::read_to_string(directory.join("stat"))?;
         let started_at = stat.rsplit_once(')').and_then(|(_, fields)| fields.split_whitespace().nth(19))
@@ -503,8 +500,11 @@ pub(crate) fn runtime_process_identity(pid: u32) -> Result<RuntimeProcessIdentit
         let text = text.trim_end();
         let started_at = text.get(..24).context("runtime process creation time missing")?.to_owned();
         let command = text.get(24..).context("runtime process command missing")?.trim();
+        let stable = crate::mcp::stable_bin_path();
+        let foreground = command.strip_prefix(stable.to_string_lossy().as_ref())
+            .is_some_and(|tail| { let mut args = vec!["rsrs"]; args.extend(tail.split_whitespace()); foreground_runtime_arguments(&args) });
         let args: Vec<_> = command.split_whitespace().collect();
-        anyhow::ensure!(args.contains(&"--runtime-internal") || (args.contains(&"web") && args.contains(&"--internal")),
+        anyhow::ensure!(args.contains(&"--runtime-internal") || (args.contains(&"web") && args.contains(&"--internal")) || foreground || foreground_runtime_arguments(&args),
             "process {pid} is not a runtime; restart refused");
         Ok(RuntimeProcessIdentity { started_at, executable: command.to_owned() })
     }
@@ -517,12 +517,18 @@ pub(crate) fn kill_runtime(pid: u32, identity: &RuntimeProcessIdentity) -> Resul
     anyhow::ensure!(&runtime_process_identity(pid)? == identity,
         "runtime process {pid} changed during shutdown; termination refused");
     #[cfg(windows)]
-    let status = std::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/F"])
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status()?;
+    {
+        let expected = respire_spawn::ProcessIdentity {
+            birth: identity.started_at.parse().context("invalid verified process creation time")?,
+            executable: std::path::PathBuf::from(&identity.executable),
+        };
+        respire_spawn::terminate_runtime(pid, &expected)?;
+    }
     #[cfg(unix)]
-    let status = std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status()?;
-    anyhow::ensure!(status.success(), "failed to terminate runtime process {pid}");
+    {
+        let status = std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status()?;
+        anyhow::ensure!(status.success(), "failed to terminate runtime process {pid}");
+    }
     Ok(())
 }
 
