@@ -168,6 +168,16 @@ pub fn check() -> Result<()> {
     Ok(())
 }
 
+/// Linearize a short durable commit with cancellation acknowledgement. The
+/// expensive model call runs before this guard, never while CURRENT is held.
+#[doc(hidden)]
+pub fn commit<T>(action: impl FnOnce() -> Result<T>) -> Result<T> {
+    let slot = CURRENT.lock().map_err(|_| anyhow!("model progress lock poisoned"))?;
+    anyhow::ensure!(TRACKED.get(), "diary commit requires an active model operation");
+    check_progress(slot.as_ref().ok_or_else(|| anyhow!("model operation already ended"))?)?;
+    action()
+}
+
 pub fn control(task_id: &str, cancel: bool) -> Result<Value> {
     let mut slot = CURRENT
         .lock()

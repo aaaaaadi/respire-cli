@@ -356,6 +356,19 @@ fn index_yield_to_foreground(generation: usize) -> Result<()> {
     respire::model_progress::check()
 }
 
+fn diary_commit(generation: usize, action: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+    let gate = shared_exclusive();
+    let _write = gate.acquire(false);
+    // Account/mode transitions use the write gate; lifecycle transitions use
+    // takeover. Never block on takeover while its owner waits for INDEX_RUNNING.
+    let _lifecycle = crate::runtime_policy::try_takeover_lock()?;
+    respire::model_progress::commit(|| {
+        check_sync_context(generation)?;
+        anyhow::ensure!(!respire::service::service_paused(), "background index paused by service mode");
+        action()
+    })
+}
+
 /// The database's source-checked missing artifacts are the resumable work queue.
 /// Model preparation runs on this thread without taking the foreground write gate.
 fn index_loop() {
@@ -457,7 +470,7 @@ fn index_loop_inner() -> Result<()> {
             respire::diary::rebuild(&store, &keys, &embedder, || {
                 index_yield_to_foreground(generation)?;
                 respire::model_progress::check()
-            })?;
+            }, |action| diary_commit(generation, action))?;
             check_sync_context(generation)?;
             Ok(true)
         })();

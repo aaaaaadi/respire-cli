@@ -9,6 +9,10 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
+#[cfg(test)]
+#[path = "diary_tests.rs"]
+mod tests;
+
 #[path = "diary_fragments.rs"]
 mod fragments;
 const LIMIT_MAX: usize = 20;
@@ -33,6 +37,8 @@ pub struct Fragment {
     pub truncated: bool,
     #[serde(skip)]
     anchor: usize,
+    #[serde(skip)]
+    index_id: String,
 }
 
 #[derive(Serialize)]
@@ -51,25 +57,104 @@ fn digest(value: &str) -> String {
 fn cache_path() -> std::path::PathBuf {
     crate::service::data_dir().join("diary-fragments-v1.db")
 }
-fn cache(readonly: bool) -> Result<Option<Connection>> {
-    let path = cache_path();
-    if readonly && !path.is_file() {
-        return Ok(None);
+#[derive(Debug)]
+struct DamagedCache;
+impl std::fmt::Display for DamagedCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("derived diary cache needs reconstruction")
+    }
+}
+impl std::error::Error for DamagedCache {}
+fn schema_error(error: rusqlite::Error) -> anyhow::Error {
+    match &error {
+        rusqlite::Error::SqliteFailure(code, _) if code.extended_code == 1 => DamagedCache.into(),
+        _ => error.into(),
+    }
+}
+fn cache_at(path: &std::path::Path, readonly: bool) -> Result<Option<Connection>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                "unsafe diary cache path"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                anyhow::ensure!(
+                    metadata.nlink() == 1,
+                    "linked diary cache is not writable derived state"
+                );
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if readonly {
+                return Ok(None);
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options.open(path)?;
+        }
+        Err(error) => return Err(error.into()),
     }
     let db = Connection::open_with_flags(
         path,
-        if readonly {
-            OpenFlags::SQLITE_OPEN_READ_ONLY
-        } else {
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE
-        },
+        OpenFlags::SQLITE_OPEN_NOFOLLOW
+            | if readonly {
+                OpenFlags::SQLITE_OPEN_READ_ONLY
+            } else {
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+            },
     )?;
-    db.busy_timeout(std::time::Duration::from_secs(5))?;
+    db.busy_timeout(std::time::Duration::from_millis(200))?;
+    // Refuse an unrelated database before any schema write, even at this name.
+    let unknown:i64=db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('diary_sources','diary_artifacts')",[],|r|r.get(0))?;
+    anyhow::ensure!(
+        unknown == 0,
+        "unexpected database at diary cache path; refusing mutation"
+    );
     if !readonly {
         db.execute_batch(CACHE_SCHEMA)?;
     }
+    db.prepare("SELECT id,source FROM diary_sources LIMIT 0")
+        .map_err(schema_error)?;
+    db.prepare("SELECT id,source_id,generation,artifact FROM diary_artifacts LIMIT 0")
+        .map_err(schema_error)?;
+    let invalid:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM diary_sources WHERE typeof(id)!='text' OR typeof(source)!='text') OR EXISTS(SELECT 1 FROM diary_artifacts WHERE typeof(id)!='text' OR typeof(source_id)!='text' OR typeof(generation)!='text' OR typeof(artifact)!='blob')",[],|r|r.get(0))?;
+    if invalid {
+        return Err(DamagedCache.into());
+    }
     Ok(Some(db))
 }
+fn cache(readonly: bool) -> Result<Option<Connection>> {
+    cache_at(&cache_path(), readonly)
+}
+fn writable_cache(path: &std::path::Path) -> Result<Connection> {
+    match cache_at(path, false) {
+        Ok(Some(db)) => Ok(db),
+        Ok(None) => bail!("derived diary cache unavailable"),
+        Err(error) => {
+            let damaged=error.is::<DamagedCache>() || error.downcast_ref::<rusqlite::Error>().is_some_and(|error|
+                matches!(error,rusqlite::Error::SqliteFailure(code,_) if matches!(code.code,rusqlite::ErrorCode::DatabaseCorrupt|rusqlite::ErrorCode::NotADatabase)));
+            if !damaged {
+                return Err(error);
+            }
+            // Only discardable derived state is moved; original bytes remain for diagnosis.
+            let quarantine = path.with_file_name(format!(
+                "diary-fragments-corrupt-{}.db",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::rename(path, quarantine)?;
+            cache_at(path, false)?.context("cannot reconstruct diary cache")
+        }
+    }
+}
+
 fn diaries(store: &LocalStore) -> Result<Vec<StoredMemory>> {
     Ok(store
         .all(false)?
@@ -89,102 +174,233 @@ fn day(entry: &MemoryEntry) -> String {
         })
         .unwrap_or_else(|_| entry.created_at.chars().take(10).collect())
 }
+fn piece(
+    entry: &MemoryEntry,
+    source_version: &str,
+    chars: &[char],
+    start: usize,
+    end: usize,
+) -> Fragment {
+    let text: String = chars[start..end].iter().collect();
+    // Embedding identity is stable for unchanged text/metadata after an append.
+    let key = digest(&format!(
+        "{}:{start}:{text}:{}:{}:{:?}:{}:{:?}",
+        entry.id, entry.title, entry.project, entry.tags, entry.computer, entry.kind
+    ));
+    // A public locator additionally binds the exact source revision and range.
+    let locator = digest(&format!("{key}:{source_version}:{end}"));
+    Fragment {
+        source_kind: "diary",
+        evidence_state: "reference",
+        source_id: entry.id.clone(),
+        fragment_id: format!("d1.{start}.{end}.{}", &locator[..32]),
+        index_id: key[..32].into(),
+        source_version: source_version.into(),
+        date: day(entry),
+        title: entry.title.chars().take(80).collect(),
+        project: entry.project.chars().take(80).collect(),
+        start,
+        end,
+        text,
+        score: 0.0,
+        truncated: false,
+        anchor: 0,
+    }
+}
 fn split(entry: &MemoryEntry, source_version: &str) -> Vec<Fragment> {
     let chars: Vec<char> = entry.content.chars().collect();
     fragments::ranges(&entry.content)
         .into_iter()
-        .map(|(start, end)| {
-            let text: String = chars[start..end].iter().collect();
-            let key = digest(&format!(
-                "{}:{start}:{text}:{}:{}:{:?}:{}:{:?}",
-                entry.id, entry.title, entry.project, entry.tags, entry.computer, entry.kind
-            ));
-            Fragment {
-                source_kind: "diary",
-                evidence_state: "reference",
-                source_id: entry.id.clone(),
-                fragment_id: key[..32].to_owned(),
-                source_version: source_version.into(),
-                date: day(entry),
-                title: entry.title.chars().take(80).collect(),
-                project: entry.project.chars().take(80).collect(),
-                start,
-                end,
-                text,
-                score: 0.0,
-                truncated: false,
-                anchor: 0,
-            }
-        })
+        .map(|(start, end)| piece(entry, source_version, &chars, start, end))
         .collect()
 }
 fn indexed_entry(source: &MemoryEntry, fragment: &Fragment) -> MemoryEntry {
-    let mut entry = source.clone();
-    // A derived locator, never an ID written to the user's memory table.
-    entry.id = format!("diary-fragment:{}", fragment.fragment_id);
-    entry.content = fragment.text.clone();
-    entry.parent_id.clear();
-    entry.supersedes.clear();
-    entry.superseded_by.clear();
-    entry.see_also.clear();
-    entry
+    // Never clone a whole day's plaintext to immediately replace its content.
+    MemoryEntry {
+        id: format!("diary-fragment:{}", fragment.index_id),
+        content: fragment.text.clone(),
+        kind: source.kind,
+        tags: source.tags.clone(),
+        title: source.title.clone(),
+        user: source.user.clone(),
+        computer: source.computer.clone(),
+        project: source.project.clone(),
+        created_at: source.created_at.clone(),
+        updated_at: source.updated_at.clone(),
+        emotion: source.emotion,
+        importance: source.importance.clone(),
+        device: source.device.clone(),
+        modified_by: source.modified_by.clone(),
+        parent_id: String::new(),
+        supersedes: String::new(),
+        superseded_by: String::new(),
+        see_also: Vec::new(),
+    }
+}
+
+/// Match the authoritative full text, not the lossy indexing windows. Map folded
+/// UTF-8 positions back to original Unicode scalars, including expanded casing.
+fn lexical(entry: &MemoryEntry, revision: &str, terms: &[String]) -> Vec<Fragment> {
+    let folded = entry.content.to_lowercase();
+    let title = entry.title.to_lowercase();
+    let project = entry.project.to_lowercase();
+    if !terms
+        .iter()
+        .all(|term| title.contains(term) || project.contains(term) || folded.contains(term))
+    {
+        return Vec::new();
+    }
+    let spans: Vec<_> = terms
+        .iter()
+        .flat_map(|term| {
+            folded
+                .match_indices(term.as_str())
+                .take(LIMIT_MAX)
+                .map(|(at, _)| (at, at + term.len()))
+        })
+        .collect();
+    let mut mapped = vec![(0, 0); spans.len()];
+    let mut points: Vec<_> = spans
+        .iter()
+        .enumerate()
+        .flat_map(|(i, &(a, b))| [(a, i, false), (b - 1, i, true)])
+        .collect();
+    points.sort_unstable();
+    let chars: Vec<char> = entry.content.chars().collect();
+    let (mut cursor, mut next) = (0, 0);
+    for (original, ch) in chars.iter().enumerate() {
+        cursor += ch.to_lowercase().map(char::len_utf8).sum::<usize>();
+        while next < points.len() && points[next].0 < cursor {
+            let (_, i, end) = points[next];
+            if end {
+                mapped[i].1 = original + 1;
+            } else {
+                mapped[i].0 = original;
+            }
+            next += 1;
+        }
+    }
+    mapped.sort_unstable();
+    mapped.dedup();
+    if mapped.is_empty() {
+        mapped.push((0, 0));
+    }
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in mapped {
+        if let Some(last) = groups
+            .last_mut()
+            .filter(|last| end.max(last.1) - last.0 <= fragments::CHUNK_CHARS)
+        {
+            last.1 = last.1.max(end);
+        } else {
+            groups.push((start, end));
+        }
+    }
+    groups
+        .into_iter()
+        .take(LIMIT_MAX)
+        .map(|(at, end)| {
+            let start = at.saturating_sub((fragments::CHUNK_CHARS - (end - at)) / 3);
+            let stop = (start + fragments::CHUNK_CHARS).min(chars.len());
+            let mut hit = piece(entry, revision, &chars, start, stop);
+            hit.anchor = at - start;
+            hit.score = 2.0;
+            hit
+        })
+        .collect()
+}
+
+fn select(mut hits: Vec<Fragment>, limit: usize) -> Vec<Fragment> {
+    hits.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| b.date.cmp(&a.date))
+            .then_with(|| a.source_id.cmp(&b.source_id))
+            .then_with(|| a.start.cmp(&b.start))
+    });
+    let mut selected: Vec<Fragment> = Vec::new();
+    for hit in hits {
+        if !selected.iter().any(|other| {
+            other.source_id == hit.source_id && hit.start < other.end && other.start < hit.end
+        }) {
+            selected.push(hit);
+            if selected.len() == limit {
+                break;
+            }
+        }
+    }
+    selected
 }
 
 pub fn needs_rebuild(store: &LocalStore) -> Result<bool> {
     let sources = diaries(store)?;
-    let Some(db) = cache(true)? else {
-        return Ok(!sources.is_empty());
-    };
-    if db.query_row("SELECT count(*) FROM diary_sources", [], |r| {
-        r.get::<_, usize>(0)
-    })? != sources.len()
-    {
-        return Ok(true);
+    if sources.is_empty() {
+        return Ok(false);
     }
-    let generation = core_sdk::generation_key("m3")?;
-    let artifacts = {
-        let mut stmt = db.prepare("SELECT generation, artifact FROM diary_artifacts")?;
-        let rows = stmt
+    let result = (|| -> Result<bool> {
+        let Some(db) = cache(true)? else {
+            return Ok(true);
+        };
+        if db.query_row("SELECT count(*) FROM diary_sources", [], |r| {
+            r.get::<_, usize>(0)
+        })? != sources.len()
+        {
+            return Ok(true);
+        }
+        let generation = core_sdk::generation_key("m3")?;
+        let mut stmt = db.prepare("SELECT generation,artifact FROM diary_artifacts")?;
+        let artifacts = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows
-    };
-    if artifacts.iter().any(|(key, _)| key != &generation) {
-        return Ok(true);
-    }
-    if !artifacts.is_empty()
-        && !core_sdk::index_ready(&artifacts.into_iter().map(|(_, a)| a).collect::<Vec<_>>())?
-    {
-        return Ok(true);
-    }
-    for source in sources {
-        let old: Option<String> = db
-            .query_row(
-                "SELECT source FROM diary_sources WHERE id=?1",
-                [&source.id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if old.as_deref() != Some(version(&source).as_str()) {
+        if artifacts.iter().any(|(key, _)| key != &generation) {
             return Ok(true);
         }
-    }
-    Ok(false)
+        if !artifacts.is_empty()
+            && !core_sdk::index_ready(&artifacts.into_iter().map(|(_, a)| a).collect::<Vec<_>>())?
+        {
+            return Ok(true);
+        }
+        for source in sources {
+            let old: Option<String> = db
+                .query_row(
+                    "SELECT source FROM diary_sources WHERE id=?1",
+                    [&source.id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if old.as_deref() != Some(version(&source).as_str()) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })();
+    // Broken or incompatible derived state requests rebuild, never blocks original text.
+    Ok(result.unwrap_or(true))
 }
 
-/// Called by the existing account-aware background index worker, with its cancellation/yield callback.
+/// Core preparation stays outside locks. Every durable cache mutation must be
+/// executed exactly once by the runtime's short context/cancellation commit guard.
 pub fn rebuild<E: Embedder>(
     store: &LocalStore,
     keys: &SessionKeys,
     provider: &E,
     mut check: impl FnMut() -> Result<()>,
+    mut commit: impl FnMut(&mut dyn FnMut() -> Result<()>) -> Result<()>,
 ) -> Result<()> {
+    let revision = store
+        .meta_get("memory_revision_v1")?
+        .context("memory snapshot token unavailable")?;
     let sources = diaries(store)?;
-    let Some(mut db) = cache(false)? else {
-        bail!("diary index unavailable");
-    };
+    let path = cache_path();
+    let mut db = None;
+    check()?;
+    guarded(store, &revision, &mut commit, || {
+        db = Some(writable_cache(&path)?);
+        Ok(())
+    })?;
+    let mut db = db.context("diary commit guard did not initialize cache")?;
     let generation = core_sdk::generation_key(provider.model_name())?;
     let mut live_sources = HashSet::new();
     for source in sources {
@@ -195,67 +411,100 @@ pub fn rebuild<E: Embedder>(
             .with_context(|| format!("cannot decode diary {}", source.id))?;
         let cached = {
             let mut stmt = db.prepare(
-                "SELECT id, artifact FROM diary_artifacts WHERE source_id=?1 AND generation=?2",
+                "SELECT id,artifact FROM diary_artifacts WHERE source_id=?1 AND generation=?2",
             )?;
             let rows = stmt
-                .query_map(params![source.id, generation], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                .query_map(params![source.id, generation], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
                 })?
                 .collect::<rusqlite::Result<HashMap<_, _>>>()?;
             rows
         };
-        let cache_ready = cached.is_empty()
-            || core_sdk::index_ready(&cached.values().cloned().collect::<Vec<_>>())?;
+        let ready = cached.is_empty()
+            || core_sdk::index_ready(&cached.values().cloned().collect::<Vec<_>>())
+                .unwrap_or(false);
         let mut live = HashSet::new();
         for fragment in split(&entry, &current_version) {
             check()?;
-            live.insert(fragment.fragment_id.clone());
-            if !(cache_ready && cached.contains_key(&fragment.fragment_id)) {
+            live.insert(fragment.index_id.clone());
+            if !(ready && cached.contains_key(&fragment.index_id)) {
                 let prepared = provider.prepare(&indexed_entry(&entry, &fragment))?;
-                db.execute("INSERT OR REPLACE INTO diary_artifacts(id,source_id,generation,artifact) VALUES(?1,?2,?3,?4)", params![fragment.fragment_id, source.id, generation, prepared.artifact])?;
+                guarded(store, &revision, &mut commit, || {
+                    db.execute("INSERT OR REPLACE INTO diary_artifacts(id,source_id,generation,artifact) VALUES(?1,?2,?3,?4)",params![fragment.index_id,source.id,generation,prepared.artifact])?;
+                    Ok(())
+                })?;
             }
         }
         check()?;
-        let fresh = store.all(false)?.into_iter().find(|m| m.id == source.id);
-        if fresh.as_ref().map(version).as_deref() != Some(current_version.as_str()) {
-            bail!("diary source changed while indexing; background index must retry");
-        }
+        guarded(store, &revision, &mut commit, || {
+            let tx = db.transaction()?;
+            let ids = {
+                let mut stmt = tx.prepare("SELECT id FROM diary_artifacts WHERE source_id=?1")?;
+                let rows = stmt
+                    .query_map([&source.id], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            };
+            for id in ids {
+                if !live.contains(&id) {
+                    tx.execute("DELETE FROM diary_artifacts WHERE id=?1", [id])?;
+                }
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO diary_sources(id,source) VALUES(?1,?2)",
+                params![source.id, current_version],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })?;
+    }
+    check()?;
+    guarded(store, &revision, &mut commit, || {
         let tx = db.transaction()?;
         let ids = {
-            let mut stmt = tx.prepare("SELECT id FROM diary_artifacts WHERE source_id=?1")?;
+            let mut stmt = tx.prepare(
+                "SELECT id FROM diary_sources UNION SELECT source_id FROM diary_artifacts",
+            )?;
             let rows = stmt
-                .query_map([&source.id], |r| r.get::<_, String>(0))?
+                .query_map([], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             rows
         };
         for id in ids {
-            if !live.contains(&id) {
-                tx.execute("DELETE FROM diary_artifacts WHERE id=?1", [id])?;
+            if !live_sources.contains(&id) {
+                tx.execute("DELETE FROM diary_artifacts WHERE source_id=?1", [&id])?;
+                tx.execute("DELETE FROM diary_sources WHERE id=?1", [&id])?;
             }
         }
-        tx.execute(
-            "INSERT OR REPLACE INTO diary_sources(id,source) VALUES(?1,?2)",
-            params![source.id, current_version],
-        )?;
         tx.commit()?;
-    }
-    check()?;
-    let ids = {
-        let mut stmt =
-            db.prepare("SELECT id FROM diary_sources UNION SELECT source_id FROM diary_artifacts")?;
-        let rows = stmt
-            .query_map([], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows
-    };
-    for id in ids {
-        if !live_sources.contains(&id) {
-            let tx = db.transaction()?;
-            tx.execute("DELETE FROM diary_artifacts WHERE source_id=?1", [&id])?;
-            tx.execute("DELETE FROM diary_sources WHERE id=?1", [&id])?;
-            tx.commit()?;
-        }
-    }
+        Ok(())
+    })
+}
+fn guarded(
+    store: &LocalStore,
+    revision: &str,
+    commit: &mut impl FnMut(&mut dyn FnMut() -> Result<()>) -> Result<()>,
+    action: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let mut action = Some(action);
+    commit(&mut || {
+        let action = action
+            .take()
+            .context("diary commit executed more than once")?;
+        // Existing SQLite writer reservation serializes source changes with the
+        // derived commit. O(1) revision check replaces per-source full-catalog reads.
+        store.write_transaction(|| {
+            anyhow::ensure!(
+                store.meta_get("memory_revision_v1")?.as_deref() == Some(revision),
+                "diary source changed while indexing; retry"
+            );
+            action()
+        })
+    })?;
+    anyhow::ensure!(
+        action.is_none(),
+        "diary commit guard did not execute its action"
+    );
     Ok(())
 }
 
@@ -335,73 +584,65 @@ pub fn search(
         "max-chars must be 512..=12000"
     );
     let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
-    let db = cache(true)?;
+    // Lexical mode does not even open the disposable semantic cache.
+    let db = if hybrid {
+        cache(true).ok().flatten()
+    } else {
+        None
+    };
     let mut all = HashMap::new();
     let mut snapshots = Vec::new();
+    let mut hits = Vec::new();
     let mut pending = 0;
-    let mut generation = None;
-    if hybrid && db.is_some() {
-        generation = Some(core_sdk::generation_key("m3")?);
-    }
+    let generation = if hybrid && db.is_some() {
+        Some(core_sdk::generation_key("m3")?)
+    } else {
+        None
+    };
     for source in diaries(store)? {
         let entry = MemoryEngine::open(keys, &source)
             .with_context(|| format!("cannot decode diary {}", source.id))?;
-        for mut hit in split(&entry, &version(&source)) {
-            let text = format!("{}\n{}\n{}", hit.title, hit.project, hit.text).to_lowercase();
-            if terms.iter().all(|term| text.contains(term)) {
-                hit.score = 2.0;
-                if let Some(byte) = terms
-                    .iter()
-                    .filter_map(|term| hit.text.to_lowercase().find(term))
-                    .min()
-                {
-                    let mut folded = 0;
-                    hit.anchor = hit
-                        .text
-                        .chars()
-                        .take_while(|ch| {
-                            let before = folded;
-                            folded += ch.to_lowercase().map(char::len_utf8).sum::<usize>();
-                            before < byte
-                        })
-                        .count();
-                }
+        let revision = version(&source);
+        hits.extend(lexical(&entry, &revision, &terms));
+        hits = select(hits, LIMIT_MAX);
+        if !hybrid {
+            continue;
+        }
+        for hit in split(&entry, &revision) {
+            let artifact = if let (Some(db), Some(generation)) = (&db, &generation) {
+                db.query_row(
+                    "SELECT artifact FROM diary_artifacts WHERE id=?1 AND generation=?2",
+                    params![hit.index_id, generation],
+                    |r| r.get::<_, Vec<u8>>(0),
+                )
+                .optional()
+                .unwrap_or(None)
+            } else {
+                None
+            };
+            if let Some(artifact) = artifact.filter(|value| !value.is_empty()) {
+                let indexed = indexed_entry(&entry, &hit);
+                snapshots.push(Snapshot {
+                    id: indexed.id.clone(),
+                    deleted: false,
+                    updated_at: indexed.updated_at.clone(),
+                    kind: source.local_kind.clone(),
+                    tags: source.local_tags.clone(),
+                    title: indexed.title.clone(),
+                    project: indexed.project.clone(),
+                    computer: indexed.computer.clone(),
+                    parent_id: String::new(),
+                    created_at: indexed.created_at.clone(),
+                    content_head: indexed.content.clone(),
+                    recall_count: 0,
+                    importance: indexed.importance.clone(),
+                    entry: Some(indexed.clone()),
+                    features: Some(core_sdk::Prepared { artifact }),
+                });
+                all.insert(indexed.id, hit);
+            } else {
+                pending += 1;
             }
-            let indexed = indexed_entry(&entry, &hit);
-            if hybrid {
-                let artifact = if let (Some(db), Some(generation)) = (&db, &generation) {
-                    db.query_row(
-                        "SELECT artifact FROM diary_artifacts WHERE id=?1 AND generation=?2",
-                        params![hit.fragment_id, generation],
-                        |r| r.get::<_, Vec<u8>>(0),
-                    )
-                    .optional()?
-                } else {
-                    None
-                };
-                if let Some(artifact) = artifact.filter(|value| !value.is_empty()) {
-                    snapshots.push(Snapshot {
-                        id: indexed.id.clone(),
-                        deleted: false,
-                        updated_at: indexed.updated_at.clone(),
-                        kind: source.local_kind.clone(),
-                        tags: source.local_tags.clone(),
-                        title: indexed.title.clone(),
-                        project: indexed.project.clone(),
-                        computer: indexed.computer.clone(),
-                        parent_id: String::new(),
-                        created_at: indexed.created_at.clone(),
-                        content_head: indexed.content.clone(),
-                        recall_count: 0,
-                        importance: indexed.importance.clone(),
-                        entry: Some(indexed.clone()),
-                        features: Some(core_sdk::Prepared { artifact }),
-                    });
-                } else {
-                    pending += 1;
-                }
-            }
-            all.insert(indexed.id, hit);
         }
     }
     if !snapshots.is_empty()
@@ -410,44 +651,39 @@ pub fn search(
                 .iter()
                 .filter_map(|s| s.features.as_ref().map(|f| f.artifact.clone()))
                 .collect::<Vec<_>>(),
-        )?
+        )
+        .unwrap_or(false)
     {
         pending += snapshots.len();
         snapshots.clear();
     }
-    let ready = hybrid && pending == 0;
+    let mut ready = false;
     if hybrid && !snapshots.is_empty() {
-        let provider = crate::memory::bge::BgeEmbedder::load_model("m3")?;
-        let results: Vec<(f32, MemoryEntry)> = core_sdk::query(
-            &provider,
-            &snapshots,
-            &MemoryQuery::new(query).limit(LIMIT_MAX),
-            "scored",
-        )?;
-        for (score, entry) in results {
-            if let Some(hit) = all.get_mut(&entry.id) {
-                hit.score += score.clamp(0.0, 1.0);
+        let semantic = (|| -> Result<Vec<(f32, MemoryEntry)>> {
+            let provider = crate::memory::bge::BgeEmbedder::load_model("m3")?;
+            core_sdk::query(
+                &provider,
+                &snapshots,
+                &MemoryQuery::new(query).limit(LIMIT_MAX),
+                "scored",
+            )
+        })();
+        match semantic {
+            Ok(results) => {
+                ready = pending == 0;
+                for (score, entry) in results {
+                    if score.is_finite() && score > 0.0 {
+                        if let Some(mut hit) = all.remove(&entry.id) {
+                            hit.score = score.min(1.0);
+                            hits.push(hit);
+                        }
+                    }
+                }
             }
+            Err(_) => pending += snapshots.len(),
         }
     }
-    let mut hits: Vec<_> = all.into_values().filter(|hit| hit.score > 0.0).collect();
-    hits.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then_with(|| b.date.cmp(&a.date))
-            .then_with(|| a.source_id.cmp(&b.source_id))
-            .then_with(|| a.start.cmp(&b.start))
-    });
-    // Overlap windows only contribute one hit unless genuinely disjoint.
-    let mut selected: Vec<Fragment> = Vec::new();
-    for hit in hits {
-        if !selected.iter().any(|other| {
-            other.source_id == hit.source_id && hit.start < other.end && other.start < hit.end
-        }) {
-            selected.push(hit);
-        }
-    }
-    budget(selected, limit, max_chars, ready, pending)
+    budget(select(hits, limit), limit, max_chars, ready, pending)
 }
 
 pub fn read_fragment(
@@ -464,19 +700,46 @@ pub fn read_fragment(
         .find(|m| m.id == source_id)
         .context("diary source not found or no longer active")?;
     let entry = MemoryEngine::open(keys, &source)?;
-    let pieces = split(&entry, &version(&source));
-    let index = pieces
-        .iter()
-        .position(|f| f.fragment_id == fragment_id)
-        .context("stale or unknown fragment; search again before reading")?;
-    // The requested locator owns the budget. Context must never displace it.
-    let mut selected = vec![pieces[index].clone()];
+    let revision = version(&source);
+    let mut locator = fragment_id.split('.');
+    anyhow::ensure!(
+        locator.next() == Some("d1"),
+        "stale or unknown fragment; search again before reading"
+    );
+    let start = locator
+        .next()
+        .and_then(|v| v.parse::<usize>().ok())
+        .context("invalid fragment start")?;
+    let end = locator
+        .next()
+        .and_then(|v| v.parse::<usize>().ok())
+        .context("invalid fragment end")?;
+    let chars: Vec<char> = entry.content.chars().collect();
+    anyhow::ensure!(
+        start < end && end <= chars.len() && end - start <= fragments::CHUNK_CHARS,
+        "stale or unknown fragment; search again before reading"
+    );
+    let target = piece(&entry, &revision, &chars, start, end);
+    anyhow::ensure!(
+        target.fragment_id == fragment_id,
+        "stale or unknown fragment; search again before reading"
+    );
+    let mut selected = vec![target];
     if neighbors == 1 {
-        if index > 0 {
-            selected.push(pieces[index - 1].clone());
+        let pieces = split(&entry, &revision);
+        if let Some(previous) = pieces
+            .iter()
+            .filter(|f| f.end <= start)
+            .max_by_key(|f| f.end)
+        {
+            selected.push(previous.clone());
         }
-        if index + 1 < pieces.len() {
-            selected.push(pieces[index + 1].clone());
+        if let Some(next) = pieces
+            .iter()
+            .filter(|f| f.start >= end)
+            .min_by_key(|f| f.start)
+        {
+            selected.push(next.clone());
         }
     }
     let mut result = budget(selected, 3, max_chars, false, 0)?;
