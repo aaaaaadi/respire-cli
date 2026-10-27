@@ -171,14 +171,9 @@ pub fn pid_is_respire(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        let out = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-            .output();
-        let Ok(out) = out else {
-            return false;
-        };
-        let text = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
-        text.contains("rsrs.exe")
+        respire_spawn::process_identity(pid).ok().flatten()
+            .and_then(|value| value.executable.file_name().map(|name|name.to_owned()))
+            .is_some_and(|name|name.to_str().is_some_and(|name|name.eq_ignore_ascii_case("rsrs.exe")))
     }
     #[cfg(target_os = "linux")]
     {
@@ -476,14 +471,10 @@ pub(crate) fn runtime_process_identity(pid: u32) -> Result<RuntimeProcessIdentit
     anyhow::ensure!(pid != std::process::id() && pid_is_respire(pid), "cannot verify runtime process {pid}");
     #[cfg(windows)]
     {
-        let script = format!(r#"$ErrorActionPreference='Stop'; $runtimeProc=Get-CimInstance Win32_Process -Filter 'ProcessId={pid}'; if ($null -eq $runtimeProc) {{ exit 0 }}; $runtimeArgs=$runtimeProc.CommandLine -split '\s+'; $isRuntime=($runtimeArgs -contains '--runtime-internal') -or (($runtimeArgs -contains 'web') -and ($runtimeArgs -contains '--internal')) -or ($runtimeProc.CommandLine -cmatch '^\s*(?:"[^"]+"|\S+)(?:\s+--(?:json|direct))*\s+runtime\s+run(?:\s|$)'); [pscustomobject]@{{started_at=$runtimeProc.CreationDate.ToUniversalTime().Ticks.ToString(); executable=$runtimeProc.ExecutablePath; runtime=$isRuntime}} | ConvertTo-Json -Compress"#);
-        let output = crate::autostart::windows_process_inspection(script)?;
-        #[derive(serde::Deserialize)]
-        struct Process { started_at: String, executable: String, runtime: bool }
-        let process: Process = serde_json::from_str(&output)
+        let process = respire_spawn::runtime_process_identity(pid)?
             .context("runtime process disappeared or could not be identified")?;
-        anyhow::ensure!(process.runtime, "process {pid} is not a runtime; restart refused");
-        Ok(RuntimeProcessIdentity { started_at: process.started_at, executable: process.executable })
+        let executable = process.executable.to_str().context("runtime process image is not UTF-8")?.to_owned();
+        Ok(RuntimeProcessIdentity { started_at: process.birth.to_string(), executable })
     }
     #[cfg(target_os = "linux")]
     {
@@ -526,12 +517,18 @@ pub(crate) fn kill_runtime(pid: u32, identity: &RuntimeProcessIdentity) -> Resul
     anyhow::ensure!(&runtime_process_identity(pid)? == identity,
         "runtime process {pid} changed during shutdown; termination refused");
     #[cfg(windows)]
-    let status = std::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/F"])
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status()?;
+    {
+        let expected = respire_spawn::ProcessIdentity {
+            birth: identity.started_at.parse().context("invalid verified process creation time")?,
+            executable: std::path::PathBuf::from(&identity.executable),
+        };
+        respire_spawn::terminate_runtime(pid, &expected)?;
+    }
     #[cfg(unix)]
-    let status = std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status()?;
-    anyhow::ensure!(status.success(), "failed to terminate runtime process {pid}");
+    {
+        let status = std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status()?;
+        anyhow::ensure!(status.success(), "failed to terminate runtime process {pid}");
+    }
     Ok(())
 }
 

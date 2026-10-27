@@ -130,6 +130,46 @@ def main():
                 result = subprocess.run([binary,"--json",*argv],env=off_env,capture_output=True,text=True,timeout=45)
                 assert result.returncode == 0, f"off mode {argv}: {result.stdout} {result.stderr}"
                 assert not (off_root/"rsrs.db").exists() and not (off_root/"onememory.db").exists(), "off restart created a database"
+            if os.name == "nt":
+                # Reproduce the real upgrade failure without an account/model:
+                # suspend only this fixture's verified unmanaged native owner.
+                import ctypes
+                from ctypes import wintypes
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health",timeout=5) as response:
+                    frozen=json.load(response)
+                assert Path(frozen["data_dir"]).resolve()==off_root.resolve()
+                kernel=ctypes.WinDLL("kernel32",use_last_error=True)
+                kernel.OpenProcess.argtypes=[wintypes.DWORD,wintypes.BOOL,wintypes.DWORD];kernel.OpenProcess.restype=wintypes.HANDLE
+                kernel.GetProcessId.argtypes=[wintypes.HANDLE];kernel.GetProcessId.restype=wintypes.DWORD
+                kernel.QueryFullProcessImageNameW.argtypes=[wintypes.HANDLE,wintypes.DWORD,wintypes.LPWSTR,ctypes.POINTER(wintypes.DWORD)];kernel.QueryFullProcessImageNameW.restype=wintypes.BOOL
+                kernel.WaitForSingleObject.argtypes=[wintypes.HANDLE,wintypes.DWORD];kernel.WaitForSingleObject.restype=wintypes.DWORD
+                kernel.CloseHandle.argtypes=[wintypes.HANDLE];kernel.CloseHandle.restype=wintypes.BOOL
+                ntdll=ctypes.WinDLL("ntdll")
+                ntdll.NtSuspendProcess.argtypes=[wintypes.HANDLE];ntdll.NtSuspendProcess.restype=wintypes.LONG
+                ntdll.NtResumeProcess.argtypes=[wintypes.HANDLE];ntdll.NtResumeProcess.restype=wintypes.LONG
+                owned=kernel.OpenProcess(0x101800,False,frozen["pid"]) # synchronize/query/suspend, never an arbitrary PID
+                assert owned and kernel.GetProcessId(owned)==frozen["pid"]
+                suspended=False
+                try:
+                    image=ctypes.create_unicode_buffer(32768);length=wintypes.DWORD(len(image))
+                    assert kernel.QueryFullProcessImageNameW(owned,0,image,ctypes.byref(length))
+                    assert os.path.samefile(image.value,Path(off_env["RSRS_BIN_DIR"])/"rsrs.exe")
+                    assert kernel.WaitForSingleObject(owned,0)==258
+                    assert ntdll.NtSuspendProcess(owned)>=0
+                    suspended=True
+                    recovered=subprocess.run([binary,"--json","runtime","restart"],env=off_env,capture_output=True,text=True,timeout=45)
+                    assert recovered.returncode==0, f"suspended owner recovery: {recovered.stdout} {recovered.stderr}"
+                    envelope=json.loads(recovered.stdout)
+                    assert envelope["command"]=="runtime.restart" and envelope["status"]=="ok", envelope
+                    summary=envelope["summary"]
+                    assert summary["forced"] is True and summary["stopped_pid"]==frozen["pid"] and summary["pid"]!=frozen["pid"]
+                    assert kernel.WaitForSingleObject(owned,15000)==0, "the inspected suspended process survived forced recovery"
+                    assert not (off_root/"rsrs.db").exists() and not (off_root/"onememory.db").exists()
+                    print("PASS: actual suspended unmanaged Windows runtime recovered with verified native identity, no WMI, and no database")
+                finally:
+                    if suspended and kernel.WaitForSingleObject(owned,0)==258:
+                        assert ntdll.NtResumeProcess(owned)>=0, "owned failed fixture could not be resumed"
+                    kernel.CloseHandle(owned)
         finally:
             result = subprocess.run([binary,"--json","runtime","stop"],env=off_env,capture_output=True,text=True,timeout=45)
             assert result.returncode == 0, f"off-mode child cleanup failed: {result.stdout} {result.stderr}"
@@ -158,7 +198,7 @@ def main():
                     assert not profile.is_symlink() and profile.stat().st_size <= 64 * 1024 * 1024
                     shutil.copyfile(profile, destination / f"autostart-managed-{uuid.uuid4().hex}.profraw")
 
-            from contextlib import contextmanager
+            from contextlib import contextmanager, nullcontext
 
             @contextmanager
             def owned_windows_pair(expected_root):
@@ -225,7 +265,7 @@ def main():
                     assert parent_pid != current["pid"]
                     parent,parent_birth=checked_process(parent_pid)
                     assert parent_birth <= child_birth, "supervisor PID was reused after the owned child started"
-                    yield {"kernel":kernel,"parent":parent,"child":child,"parent_pid":parent_pid,"child_pid":current["pid"],"parent_birth":parent_birth}
+                    yield {"kernel":kernel,"parent":parent,"child":child,"parent_pid":parent_pid,"child_pid":current["pid"],"parent_birth":parent_birth,"child_birth":child_birth,"data_dir":current["data_dir"],"store_ready":current.get("store_ready",False)}
                 finally:
                     for handle in handles:
                         kernel.CloseHandle(handle)
@@ -233,6 +273,13 @@ def main():
             def require_pair_exited(pair):
                 assert pair["kernel"].WaitForSingleObject(pair["child"],15000)==0, "owned runtime child survived its lifecycle owner"
                 assert pair["kernel"].WaitForSingleObject(pair["parent"],15000)==0, "owned supervisor remained alive after stop"
+
+            def require_replacement_pair(old, expected_profile):
+                require_pair_exited(old)
+                with owned_windows_pair(root) as fresh:
+                    assert (fresh["child_pid"],fresh["child_birth"])!=(old["child_pid"],old["child_birth"])
+                    assert (fresh["parent_pid"],fresh["parent_birth"])!=(old["parent_pid"],old["parent_birth"])
+                    assert Path(fresh["data_dir"]).resolve()==expected_profile.resolve() and fresh["store_ready"]
 
             def diagnose_crash_restart():
                 # Only this hosted fixture's fixed-field lifecycle state and
@@ -408,33 +455,39 @@ $s=[Activator]::CreateInstance([Type]::GetTypeFromProgID('Schedule.Service'));$s
                         owned_health=json.load(response)
                     assert owned_health["pid"] == first_pid and Path(owned_health["installation_root"]).resolve() == root.resolve()
                     assert owned_health["managed_id"] == json.loads(config_path.read_text())["id"]
-                    if os.name == "nt":
-                        with owned_windows_pair(root) as pair:
+                    failed_owner=owned_windows_pair(root) if os.name=="nt" else nullcontext(None)
+                    with failed_owner as pair:
+                        if pair is not None:
                             assert pair["child_pid"]==first_pid
                             supervisor_before=(pair["parent_pid"],pair["parent_birth"])
                             assert pair["kernel"].TerminateProcess(pair["child"],1), "failed to inject owned child failure"
                             assert pair["kernel"].WaitForSingleObject(pair["child"],15000)==0
-                    else:
-                        os.kill(first_pid,signal.SIGKILL)
-                    restart_deadline=time.monotonic()+140
-                    recovered_health=None
-                    while time.monotonic() < restart_deadline:
-                        try:
-                            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health",timeout=1) as response:
-                                candidate=json.load(response)
-                            if candidate["pid"] != first_pid and candidate.get("store_ready"):
-                                recovered_health=candidate
-                                break
-                        except (OSError,ValueError):
-                            pass
-                        time.sleep(0.25)
-                    if recovered_health is None:
-                        diagnose_crash_restart()
-                    assert recovered_health is not None, "OS supervisor did not restart its failed native owner"
-                    assert recovered_health["managed_id"] == owned_health["managed_id"] and recovered_health["bin"] == health["bin"]
-                    assert Path(recovered_health["installation_root"]).resolve() == root.resolve()
-                    first_pid=recovered_health["pid"]
-                    print("PASS: actual abnormal process exit followed by supervised store-ready restart, without a CLI start request")
+                        else:
+                            os.kill(first_pid,signal.SIGKILL)
+                        restart_deadline=time.monotonic()+140
+                        recovered_health=None
+                        while time.monotonic() < restart_deadline:
+                            try:
+                                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health",timeout=1) as response:
+                                    candidate=json.load(response)
+                                if candidate["pid"] != first_pid and candidate.get("store_ready"):
+                                    recovered_health=candidate
+                                    break
+                            except (OSError,ValueError):
+                                pass
+                            time.sleep(0.25)
+                        if recovered_health is None:
+                            diagnose_crash_restart()
+                        assert recovered_health is not None, "OS supervisor did not restart its failed native owner"
+                        assert recovered_health["managed_id"] == owned_health["managed_id"] and recovered_health["bin"] == health["bin"]
+                        assert Path(recovered_health["installation_root"]).resolve() == root.resolve()
+                        first_pid=recovered_health["pid"]
+                        print("PASS: actual abnormal process exit followed by supervised store-ready restart, without a CLI start request")
+                        if pair is not None:
+                            with owned_windows_pair(root) as fresh:
+                                assert fresh["child_pid"]==recovered_health["pid"] and fresh["child_birth"]!=pair["child_birth"]
+                                assert (fresh["parent_pid"],fresh["parent_birth"])==supervisor_before
+                                assert fresh["store_ready"] and Path(fresh["data_dir"]).resolve()==root.resolve()
                     if os.name == "nt":
                         with owned_windows_pair(root) as pair:
                             assert (pair["parent_pid"],pair["parent_birth"])==supervisor_before, "child recovery unexpectedly replaced its supervisor"
@@ -447,30 +500,43 @@ $s=[Activator]::CreateInstance([Type]::GetTypeFromProgID('Schedule.Service'));$s
                             assert pair["parent_birth"]!=supervisor_before[1]
                             first_pid=pair["child_pid"]
                         print("PASS: actual supervisor kill removes its owned child; explicit restart verifies a new store-ready pair without an orphan")
-                if os.name == "nt":
-                    with owned_windows_pair(root) as pair:
-                        run("runtime", "stop")
-                        require_pair_exited(pair)
-                else:
+                # Keep the exited Windows process objects referenced until the
+                # replacement exists. Otherwise a legitimate numeric PID reuse
+                # can invalidate a PID-only comparison after handles are closed.
+                stopped_owner=owned_windows_pair(root) if os.name=="nt" else nullcontext(None)
+                with stopped_owner as pair:
+                    if pair is not None:
+                        first_pid=pair["child_pid"]
                     run("runtime", "stop")
-                time.sleep(1)
-                stopped = run("runtime", "status")
-                assert stopped["runtime"]["running"] is False, "manual stop was automatically resurrected"
-                run("runtime", "restart")
-                restarted = run("runtime", "status")
-                assert restarted["runtime"]["running"] and restarted["runtime"]["pid"] != first_pid, restarted
+                    if pair is not None:
+                        require_pair_exited(pair)
+                    time.sleep(1)
+                    stopped = run("runtime", "status")
+                    assert stopped["runtime"]["running"] is False, "manual stop was automatically resurrected"
+                    run("runtime", "restart")
+                    restarted = run("runtime", "status")
+                    assert restarted["runtime"]["running"] and restarted["runtime"]["pid"] != first_pid, restarted
+                    if pair is not None:
+                        with owned_windows_pair(root) as replacement:
+                            assert replacement["child_pid"]==restarted["runtime"]["pid"]
+                            assert replacement["child_birth"]!=pair["child_birth"] and replacement["parent_birth"]!=pair["parent_birth"], "restart reused the old process instances"
                 secondary = root / "accounts/secondary profile"
                 secondary.mkdir(parents=True)
                 if os.name == "nt":
                     with owned_windows_pair(root) as pair:
                         run("config", "--data-dir", str(secondary))
-                        require_pair_exited(pair)
+                        require_replacement_pair(pair,secondary)
                 else:
                     run("config", "--data-dir", str(secondary))
                 switched = run("runtime", "status")
                 assert Path(switched["runtime"]["data_dir"]).resolve() == secondary.resolve(), switched
                 assert switched["runtime"]["pid"] != restarted["runtime"]["pid"]
-                run("config", "--data-dir", str(root))
+                if os.name=="nt":
+                    with owned_windows_pair(root) as pair:
+                        run("config", "--data-dir", str(root))
+                        require_replacement_pair(pair,root)
+                else:
+                    run("config", "--data-dir", str(root))
                 restored = run("runtime", "status")
                 assert Path(restored["runtime"]["data_dir"]).resolve() == root.resolve(), restored
                 assert restored["runtime"]["pid"] != switched["runtime"]["pid"]
