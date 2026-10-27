@@ -433,6 +433,10 @@ fn index_loop_inner() -> Result<()> {
                 return Ok(false);
             };
             index_yield_to_foreground(generation)?;
+            if diary_pending && !pending && !prepare_requested && !cpu_upgrade
+                && respire::diary::clear_if_empty(&store, |action| diary_commit(generation,action))? {
+                return Ok(true);
+            }
             let mirror = INDEX_WORK.lock().map_err(|_| anyhow::anyhow!("index work lock poisoned"))?.prepare_mirror.take();
             if let Some(mirror) = mirror {
                 respire::model_install::prepare_m3_from_mirror(&mirror)?;
@@ -467,10 +471,12 @@ fn index_loop_inner() -> Result<()> {
                     Err(error) => return Err(error),
                 }
             }
-            respire::diary::rebuild(&store, &keys, &embedder, || {
+            respire::diary::rebuild_with_progress(&store, &keys, &embedder, || {
                 index_yield_to_foreground(generation)?;
                 respire::model_progress::check()
-            }, |action| diary_commit(generation, action))?;
+            }, |action| diary_commit(generation, action), |done| {
+                respire::model_progress::update("index", "diary-fragments", done as u64, None)
+            })?;
             check_sync_context(generation)?;
             Ok(true)
         })();
@@ -2262,11 +2268,19 @@ fn command_name(args: &[String]) -> Option<&str> {
     None
 }
 
+fn diary_lexical_mode(args: &[String]) -> bool {
+    // Values after -- are literal queries, never runtime routing flags.
+    let options=&args[..args.iter().position(|arg|arg=="--").unwrap_or(args.len())];
+    let modes:Vec<&str>=options.iter().enumerate().filter_map(|(index,arg)| {
+        if arg=="--mode" {Some(options.get(index+1).map(String::as_str).unwrap_or(""))}
+        else {arg.strip_prefix("--mode=")}
+    }).collect();
+    modes==["lexical"]
+}
+
 fn needs_inference(args: &[String]) -> bool {
     matches!(command_name(args), Some("remember" | "recall" | "related" | "reembed" | "classify" | "update"))
-        || (command_name(args) == Some("diary-search")
-            && !args.windows(2).any(|pair| pair[0] == "--mode" && pair[1] == "lexical")
-            && !args.iter().any(|arg| arg == "--mode=lexical"))
+        || (command_name(args) == Some("diary-search") && !diary_lexical_mode(args))
         || (command_name(args) == Some("model") && args.iter().any(|arg| arg == "probe"))
 }
 
@@ -2514,6 +2528,28 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn diary_inference_routing_honours_modes_and_literal_query_arguments() {
+        use clap::Parser;
+        for (args,inference) in [
+            (vec!["diary-search","q"],true),
+            (vec!["diary-search","q","--mode","lexical"],false),
+            (vec!["diary-search","--mode=lexical","q"],false),
+            (vec!["diary-search","--mode","hybrid","--","--mode=lexical"],true),
+            (vec!["diary-search","--","--mode=lexical"],true),
+            (vec!["diary-search","--mode","lexical","--","--mode=hybrid"],false),
+            (vec!["diary-fragment","--neighbors","1","--","s","f"],false),
+        ] {
+            let arguments:Vec<String>=args.iter().map(|s|(*s).to_owned()).collect();
+            assert_eq!(needs_inference(&arguments),inference,"{arguments:?}");
+            let parsed=crate::Cli::try_parse_from(std::iter::once("rsrs").chain(args)).unwrap();
+            if let Some(crate::Command::DiarySearch{query,mode,..})=parsed.command {
+                if query=="--mode=lexical" {assert_eq!(mode,"hybrid");}
+                if query=="--mode=hybrid" {assert_eq!(mode,"lexical");}
+            }
+        }
+    }
 
     #[test]
     fn shutdown_transport_requires_confirmed_exit_without_replay() {

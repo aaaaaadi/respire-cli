@@ -240,7 +240,7 @@ fn indexed_entry(source: &MemoryEntry, fragment: &Fragment) -> MemoryEntry {
 
 /// Match the authoritative full text, not the lossy indexing windows. Map folded
 /// UTF-8 positions back to original Unicode scalars, including expanded casing.
-fn lexical(entry: &MemoryEntry, revision: &str, terms: &[String]) -> Vec<Fragment> {
+fn lexical(entry: &MemoryEntry, revision: &str, terms: &[String]) -> (Vec<Fragment>, bool) {
     let folded = entry.content.to_lowercase();
     let title = entry.title.to_lowercase();
     let project = entry.project.to_lowercase();
@@ -248,15 +248,20 @@ fn lexical(entry: &MemoryEntry, revision: &str, terms: &[String]) -> Vec<Fragmen
         .iter()
         .all(|term| title.contains(term) || project.contains(term) || folded.contains(term))
     {
-        return Vec::new();
+        return (Vec::new(), false);
     }
+    let mut omitted = false;
     let spans: Vec<_> = terms
         .iter()
         .flat_map(|term| {
-            folded
+            let mut positions: Vec<_> = folded
                 .match_indices(term.as_str())
-                .take(LIMIT_MAX)
+                .take(LIMIT_MAX + 1)
                 .map(|(at, _)| (at, at + term.len()))
+                .collect();
+            omitted |= positions.len() > LIMIT_MAX;
+            positions.truncate(LIMIT_MAX);
+            positions
         })
         .collect();
     let mut mapped = vec![(0, 0); spans.len()];
@@ -296,7 +301,8 @@ fn lexical(entry: &MemoryEntry, revision: &str, terms: &[String]) -> Vec<Fragmen
             groups.push((start, end));
         }
     }
-    groups
+    omitted |= groups.len() > LIMIT_MAX;
+    let hits = groups
         .into_iter()
         .take(LIMIT_MAX)
         .map(|(at, end)| {
@@ -307,7 +313,8 @@ fn lexical(entry: &MemoryEntry, revision: &str, terms: &[String]) -> Vec<Fragmen
             hit.score = 2.0;
             hit
         })
-        .collect()
+        .collect();
+    (hits, omitted)
 }
 
 fn select(mut hits: Vec<Fragment>, limit: usize) -> Vec<Fragment> {
@@ -334,13 +341,13 @@ fn select(mut hits: Vec<Fragment>, limit: usize) -> Vec<Fragment> {
 
 pub fn needs_rebuild(store: &LocalStore) -> Result<bool> {
     let sources = diaries(store)?;
-    if sources.is_empty() {
-        return Ok(false);
-    }
     let result = (|| -> Result<bool> {
         let Some(db) = cache(true)? else {
-            return Ok(true);
+            return Ok(!sources.is_empty());
         };
+        if sources.is_empty() {
+            return Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM diary_sources) OR EXISTS(SELECT 1 FROM diary_artifacts)",[],|r|r.get::<_,bool>(0))?);
+        }
         if db.query_row("SELECT count(*) FROM diary_sources", [], |r| {
             r.get::<_, usize>(0)
         })? != sources.len()
@@ -380,15 +387,53 @@ pub fn needs_rebuild(store: &LocalStore) -> Result<bool> {
     Ok(result.unwrap_or(true))
 }
 
+/// Remove obsolete derived rows after the final diary is removed/promoted,
+/// without preparing or downloading an otherwise unused model.
+pub fn clear_if_empty(
+    store: &LocalStore,
+    mut commit: impl FnMut(&mut dyn FnMut() -> Result<()>) -> Result<()>,
+) -> Result<bool> {
+    let revision = store
+        .meta_get("memory_revision_v1")?
+        .context("memory snapshot token unavailable")?;
+    if !diaries(store)?.is_empty() {
+        return Ok(false);
+    }
+    let path = cache_path();
+    guarded(store, &revision, &mut commit, || {
+        let mut db = writable_cache(&path)?;
+        let tx = db.transaction()?;
+        tx.execute("DELETE FROM diary_artifacts", [])?;
+        tx.execute("DELETE FROM diary_sources", [])?;
+        tx.commit()?;
+        Ok(())
+    })?;
+    Ok(true)
+}
+
 /// Core preparation stays outside locks. Every durable cache mutation must be
 /// executed exactly once by the runtime's short context/cancellation commit guard.
 pub fn rebuild<E: Embedder>(
     store: &LocalStore,
     keys: &SessionKeys,
     provider: &E,
+    check: impl FnMut() -> Result<()>,
+    commit: impl FnMut(&mut dyn FnMut() -> Result<()>) -> Result<()>,
+) -> Result<()> {
+    rebuild_with_progress(store, keys, provider, check, commit, |_| Ok(()))
+}
+
+/// Report completed fragment work so cancellation/idle accounting reflects actual progress.
+pub fn rebuild_with_progress<E: Embedder>(
+    store: &LocalStore,
+    keys: &SessionKeys,
+    provider: &E,
     mut check: impl FnMut() -> Result<()>,
     mut commit: impl FnMut(&mut dyn FnMut() -> Result<()>) -> Result<()>,
+    mut progress: impl FnMut(usize) -> Result<()>,
 ) -> Result<()> {
+    let mut completed = 0;
+    progress(completed)?;
     let revision = store
         .meta_get("memory_revision_v1")?
         .context("memory snapshot token unavailable")?;
@@ -434,6 +479,8 @@ pub fn rebuild<E: Embedder>(
                     Ok(())
                 })?;
             }
+            completed += 1;
+            progress(completed)?;
         }
         check()?;
         guarded(store, &revision, &mut commit, || {
@@ -594,6 +641,7 @@ pub fn search(
     let mut snapshots = Vec::new();
     let mut hits = Vec::new();
     let mut pending = 0;
+    let mut omitted = false;
     let generation = if hybrid && db.is_some() {
         Some(core_sdk::generation_key("m3")?)
     } else {
@@ -603,8 +651,14 @@ pub fn search(
         let entry = MemoryEngine::open(keys, &source)
             .with_context(|| format!("cannot decode diary {}", source.id))?;
         let revision = version(&source);
-        hits.extend(lexical(&entry, &revision, &terms));
-        hits = select(hits, LIMIT_MAX);
+        let (lexical_hits, more) = lexical(&entry, &revision, &terms);
+        omitted |= more;
+        hits.extend(lexical_hits);
+        hits = select(hits, LIMIT_MAX + 1);
+        if hits.len() > LIMIT_MAX {
+            omitted = true;
+            hits.truncate(LIMIT_MAX);
+        }
         if !hybrid {
             continue;
         }
@@ -683,7 +737,9 @@ pub fn search(
             Err(_) => pending += snapshots.len(),
         }
     }
-    budget(select(hits, limit), limit, max_chars, ready, pending)
+    let mut result = budget(select(hits, limit + 1), limit, max_chars, ready, pending)?;
+    result.truncated |= omitted;
+    Ok(result)
 }
 
 pub fn read_fragment(
@@ -729,16 +785,12 @@ pub fn read_fragment(
         let pieces = split(&entry, &revision);
         if let Some(previous) = pieces
             .iter()
-            .filter(|f| f.end <= start)
-            .max_by_key(|f| f.end)
+            .filter(|f| f.start < start)
+            .max_by_key(|f| f.start)
         {
             selected.push(previous.clone());
         }
-        if let Some(next) = pieces
-            .iter()
-            .filter(|f| f.start >= end)
-            .min_by_key(|f| f.start)
-        {
+        if let Some(next) = pieces.iter().filter(|f| f.end > end).min_by_key(|f| f.end) {
             selected.push(next.clone());
         }
     }

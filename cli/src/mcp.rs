@@ -429,9 +429,9 @@ fn tools() -> Vec<(&'static str, &'static str, serde_json::Value)> {
             "memory_diary_search",
             "Explicit cross-date diary fragments, bounded output; scores are relevance, not credibility",
             serde_json::json!({"type":"object","properties":{
-                "query":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":20},
+                "query":{"type":"string","minLength":1,"maxLength":500},"limit":{"type":"integer","minimum":1,"maximum":20},
                 "max_chars":{"type":"integer","minimum":512,"maximum":12000},
-                "mode":{"type":"string","enum":["lexical","hybrid"]}},"required":["query"]}),
+                "mode":{"type":"string","enum":["lexical","hybrid"]}},"required":["query"],"additionalProperties":false}),
         ),
         (
             "memory_diary_fragment",
@@ -439,7 +439,7 @@ fn tools() -> Vec<(&'static str, &'static str, serde_json::Value)> {
             serde_json::json!({"type":"object","properties":{
                 "source_id":{"type":"string"},"fragment_id":{"type":"string"},
                 "neighbors":{"type":"integer","minimum":0,"maximum":1},
-                "max_chars":{"type":"integer","minimum":512,"maximum":12000}},"required":["source_id","fragment_id"]}),
+                "max_chars":{"type":"integer","minimum":512,"maximum":12000}},"required":["source_id","fragment_id"],"additionalProperties":false}),
         ),
         (
             "memory_diary",
@@ -514,6 +514,15 @@ fn tool_argv(name: &str, args: &serde_json::Value) -> Result<Vec<String>, String
     };
     let opt_u64 = |key: &str| args.get(key).and_then(|v| v.as_u64());
     let opt_bool = |key: &str| args.get(key).and_then(|v| v.as_bool());
+    let bounded = |key: &str, min: u64, max: u64| -> Result<Option<u64>,String> {
+        args.get(key).map(|v|v.as_u64().filter(|v|(min..=max).contains(v))
+            .ok_or_else(||format!("{key} must be an integer in {min}..={max}"))).transpose()
+    };
+    let only_fields = |allowed: &[&str]| -> Result<(),String> {
+        let fields=args.as_object().ok_or("diary arguments must be an object")?;
+        if fields.keys().any(|key|!allowed.contains(&key.as_str())) {return Err("unsupported diary tool argument".into());}
+        Ok(())
+    };
     match name {
         "memory_status" => Ok(vec!["status".to_owned()]),
         "memory_extract" => {
@@ -650,21 +659,29 @@ fn tool_argv(name: &str, args: &serde_json::Value) -> Result<Vec<String>, String
             Ok(cmd)
         }
         "memory_diary_search" => {
-            let query = opt_str("query").ok_or("missing query")?;
-            let mut cmd = vec!["diary-search".to_owned(), query.to_owned()];
-            for (key, flag) in [("limit", "--limit"), ("max_chars", "--max-chars")] {
-                if let Some(value) = opt_u64(key) { cmd.extend([flag.to_owned(), value.to_string()]); }
+            only_fields(&["query","mode","limit","max_chars"])?;
+            let query=opt_str("query").filter(|q|!q.trim().is_empty() && q.chars().count()<=500)
+                .ok_or("query must contain 1..=500 Unicode characters")?;
+            let mut cmd=vec!["diary-search".to_owned()];
+            for (key,flag,min,max) in [("limit","--limit",1,20),("max_chars","--max-chars",512,12000)] {
+                if let Some(value)=bounded(key,min,max)? {cmd.extend([flag.to_owned(),value.to_string()]);}
             }
-            if let Some(mode) = opt_str("mode") { cmd.extend(["--mode".to_owned(), mode.to_owned()]); }
+            if args.get("mode").is_some() {
+                let mode=opt_str("mode").filter(|m|matches!(*m,"lexical"|"hybrid")).ok_or("mode must be lexical or hybrid")?;
+                cmd.extend(["--mode".to_owned(),mode.to_owned()]);
+            }
+            cmd.extend(["--".to_owned(),query.to_owned()]);
             Ok(cmd)
         }
         "memory_diary_fragment" => {
-            let source = opt_str("source_id").ok_or("missing source_id")?;
-            let fragment = opt_str("fragment_id").ok_or("missing fragment_id")?;
-            let mut cmd = vec!["diary-fragment".to_owned(), source.to_owned(), fragment.to_owned()];
-            for (key, flag) in [("neighbors", "--neighbors"), ("max_chars", "--max-chars")] {
-                if let Some(value) = opt_u64(key) { cmd.extend([flag.to_owned(), value.to_string()]); }
+            only_fields(&["source_id","fragment_id","neighbors","max_chars"])?;
+            let source=opt_str("source_id").ok_or("missing source_id")?;
+            let fragment=opt_str("fragment_id").ok_or("missing fragment_id")?;
+            let mut cmd=vec!["diary-fragment".to_owned()];
+            for (key,flag,min,max) in [("neighbors","--neighbors",0,1),("max_chars","--max-chars",512,12000)] {
+                if let Some(value)=bounded(key,min,max)? {cmd.extend([flag.to_owned(),value.to_string()]);}
             }
+            cmd.extend(["--".to_owned(),source.to_owned(),fragment.to_owned()]);
             Ok(cmd)
         }
         "memory_diary" => {
@@ -1287,7 +1304,7 @@ mod tests {
                         .as_array()
                         .ok_or("tools")?
                         .len(),
-                    14
+                    TOOL_COUNT - 2
                 );
                 assert_eq!(frames[1]["result"]["isError"], true);
                 assert_eq!(frames[2]["result"]["isError"], true);
@@ -1792,3 +1809,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "mcp_diary_tests.rs"]
+mod diary_tests;
