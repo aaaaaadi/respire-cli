@@ -246,19 +246,41 @@ pub fn run(exe: &std::path::Path) -> Result<Value> {
         root.path().join("diary-fragments-v1.db"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
-    let count = || -> Result<i64> {
-        Ok(derived.query_row("SELECT count(*) FROM diary_artifacts", [], |row| row.get(0))?)
+    let snapshot = || -> Result<(i64, String)> {
+        use sha2::Digest;
+        let revision: i64 = derived.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        let sources = derived
+            .prepare("SELECT id,source FROM diary_sources ORDER BY id")?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let artifacts = derived
+            .prepare(
+                "SELECT id,source_id,generation,hex(artifact) FROM diary_artifacts ORDER BY id",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let digest = sha2::Sha256::digest(serde_json::to_vec(&(sources, artifacts))?);
+        Ok((revision, format!("{digest:x}")))
     };
-    let acknowledged = count()?;
+    let acknowledged = snapshot()?;
     eprintln!("diary probe: readonly acknowledged; checking durable cache and drain");
     std::thread::sleep(std::time::Duration::from_millis(300));
     anyhow::ensure!(
-        count()? == acknowledged,
+        snapshot()? == acknowledged,
         "derived commit after readonly acknowledgement"
     );
     let _ = cli.run(&["--json", "runtime", "stop"])?;
     anyhow::ensure!(
-        count()? == acknowledged,
+        snapshot()? == acknowledged,
         "derived commit while draining paused runtime"
     );
     drop(derived);
